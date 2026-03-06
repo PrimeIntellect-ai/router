@@ -524,6 +524,10 @@ pub struct ChatCompletionRequest {
     /// Structured outputs parameters
     #[serde(skip_serializing_if = "Option::is_none")]
     pub structured_outputs: Option<StructuredOutputsParams>,
+
+    /// Catch-all for extra fields (e.g. vLLM's return_token_ids)
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
 }
 
 impl GenerationRequest for ChatCompletionRequest {

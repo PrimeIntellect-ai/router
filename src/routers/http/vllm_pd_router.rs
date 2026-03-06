@@ -636,7 +636,8 @@ impl VllmPDRouter {
 
             Ok(response)
         } else {
-            // No logprobs merging needed - return decode response as-is
+            // No logprobs merging needed, but still merge prompt_token_ids
+            // from prefill since the decode worker doesn't have them in disagg mode
             debug!(
                 "No logprobs merging needed (streaming={}, needs_logprobs={})",
                 is_streaming, needs_logprobs
@@ -644,10 +645,31 @@ impl VllmPDRouter {
 
             let status = decode_response.status();
             let headers = decode_response.headers().clone();
-            let body = decode_response
+            let decode_body = decode_response
                 .bytes()
                 .await
                 .map_err(|e| format!("Failed to read decode response: {}", e))?;
+
+            let body = if let Some(prefill_prompt_token_ids) = prefill_response_json.get("prompt_token_ids") {
+                if !prefill_prompt_token_ids.is_null() {
+                    if let Ok(mut decode_json) = serde_json::from_slice::<Value>(&decode_body) {
+                        if let Some(decode_obj) = decode_json.as_object_mut() {
+                            decode_obj.insert(
+                                "prompt_token_ids".to_string(),
+                                prefill_prompt_token_ids.clone(),
+                            );
+                        }
+                        serde_json::to_vec(&decode_json)
+                            .unwrap_or_else(|_| decode_body.to_vec())
+                    } else {
+                        decode_body.to_vec()
+                    }
+                } else {
+                    decode_body.to_vec()
+                }
+            } else {
+                decode_body.to_vec()
+            };
 
             let mut response_builder = axum::http::Response::builder().status(status);
             for (name, value) in headers.iter() {
@@ -1021,11 +1043,44 @@ impl VllmPDRouter {
                 }
             })
         } else {
-            // No logprobs merging needed - return decode response as-is (streaming or no logprobs)
+            // No logprobs merging needed, but still merge prompt_token_ids
+            // from prefill since the decode worker doesn't have them in disagg mode
             debug!(
                 "No logprobs merging needed (streaming={}, needs_logprobs={})",
                 is_streaming, needs_logprobs
             );
+
+            let decode_body =
+                decode_response
+                    .bytes()
+                    .await
+                    .map_err(|e| PDRouterError::NetworkError {
+                        message: format!(
+                            "Failed to read decode response from {}: {}",
+                            decode_url, e
+                        ),
+                    })?;
+
+            let body = if let Some(prefill_prompt_token_ids) = prefill_response_json.get("prompt_token_ids") {
+                if !prefill_prompt_token_ids.is_null() {
+                    if let Ok(mut decode_json) = serde_json::from_slice::<Value>(&decode_body) {
+                        if let Some(decode_obj) = decode_json.as_object_mut() {
+                            decode_obj.insert(
+                                "prompt_token_ids".to_string(),
+                                prefill_prompt_token_ids.clone(),
+                            );
+                        }
+                        serde_json::to_vec(&decode_json)
+                            .unwrap_or_else(|_| decode_body.to_vec())
+                    } else {
+                        decode_body.to_vec()
+                    }
+                } else {
+                    decode_body.to_vec()
+                }
+            } else {
+                decode_body.to_vec()
+            };
 
             let mut response_builder = Response::builder().status(status);
             for (key, value) in headers.iter() {
@@ -1034,9 +1089,8 @@ impl VllmPDRouter {
                 }
             }
 
-            let body = Body::from_stream(decode_response.bytes_stream());
             response_builder
-                .body(body)
+                .body(Body::from(body))
                 .map_err(|e| PDRouterError::NetworkError {
                     message: format!("Failed to build response from {}: {}", decode_url, e),
                 })
