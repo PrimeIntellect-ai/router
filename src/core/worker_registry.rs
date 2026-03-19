@@ -256,6 +256,55 @@ impl WorkerRegistry {
             .collect()
     }
 
+    /// Update the model_id index for a worker.
+    ///
+    /// This re-indexes the worker under `new_model_id` in the model_workers and model_index
+    /// maps, removing it from the old model_id index. Used when a worker's loaded model
+    /// changes (e.g. LoRA load/evict detected during health checks).
+    pub fn update_worker_model(&self, url: &str, new_model_id: &str) {
+        let worker = match self.get_by_url(url) {
+            Some(w) => w,
+            None => return,
+        };
+
+        let old_model_id = worker.model_id().to_string();
+        if old_model_id == new_model_id {
+            return;
+        }
+
+        let worker_id = match self.url_to_id.get(url) {
+            Some(id) => id.clone(),
+            None => return,
+        };
+
+        // Remove from old model_workers index
+        if let Some(mut ids) = self.model_workers.get_mut(&old_model_id) {
+            ids.retain(|id| *id != worker_id);
+        }
+
+        // Remove from old model_index
+        if let Some(entry) = self.model_index.get(&old_model_id) {
+            entry
+                .write()
+                .expect("RwLock for model_index is poisoned")
+                .retain(|w| w.url() != url);
+        }
+
+        // Add to new model_workers index
+        self.model_workers
+            .entry(new_model_id.to_string())
+            .or_default()
+            .push(worker_id);
+
+        // Add to new model_index
+        self.model_index
+            .entry(new_model_id.to_string())
+            .or_insert_with(|| Arc::new(RwLock::new(Vec::new())))
+            .write()
+            .expect("RwLock for model_index is poisoned")
+            .push(worker.clone());
+    }
+
     /// Get all model IDs with workers
     pub fn get_models(&self) -> Vec<String> {
         self.model_workers
@@ -350,8 +399,11 @@ impl WorkerRegistry {
         }
     }
 
-    /// Start a health checker for all workers in the registry
-    /// This should be called once after the registry is populated with workers
+    /// Start a health checker for all workers in the registry.
+    ///
+    /// Periodically checks `/health` on every worker and refreshes the model index
+    /// by querying `/v1/models`. If a worker's loaded model changes (e.g. LoRA
+    /// load/evict), the model index is updated automatically.
     pub fn start_health_checker(&self, check_interval_secs: u64) -> crate::core::HealthChecker {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
@@ -359,6 +411,9 @@ impl WorkerRegistry {
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_clone = shutdown.clone();
         let workers_ref = self.workers.clone();
+        let model_workers_ref = self.model_workers.clone();
+        let model_index_ref = self.model_index.clone();
+        let url_to_id_ref = self.url_to_id.clone();
 
         let handle = tokio::spawn(async move {
             let mut interval =
@@ -367,6 +422,8 @@ impl WorkerRegistry {
             // Counter for periodic load reset (every 10 health check cycles)
             let mut check_count = 0u64;
             const LOAD_RESET_INTERVAL: u64 = 10;
+            // Refresh model index every 5 health check cycles
+            const MODEL_REFRESH_INTERVAL: u64 = 5;
 
             loop {
                 interval.tick().await;
@@ -385,11 +442,77 @@ impl WorkerRegistry {
 
                 // Perform health checks
                 for worker in &workers {
-                    let _ = worker.check_health_async().await; // Use async version directly
+                    let _ = worker.check_health_async().await;
+                }
+
+                check_count += 1;
+
+                // Periodically refresh model discovery
+                if check_count.is_multiple_of(MODEL_REFRESH_INTERVAL) {
+                    for worker in &workers {
+                        if !worker.is_healthy() {
+                            continue;
+                        }
+                        // Determine the base URL for fetching (strip @rank for DP workers)
+                        let url = worker.url();
+                        let fetch_url = if let Some(at_pos) = url.rfind('@') {
+                            // Verify the part after @ is numeric (DP rank)
+                            if url[at_pos + 1..].parse::<usize>().is_ok() {
+                                &url[..at_pos]
+                            } else {
+                                url
+                            }
+                        } else {
+                            url
+                        };
+
+                        let models =
+                            crate::core::worker::fetch_models_from_worker(fetch_url).await;
+                        if let Some(new_model) = models.first() {
+                            let old_model = worker.model_id().to_string();
+                            if old_model != *new_model {
+                                tracing::info!(
+                                    "Model changed on {}: '{}' -> '{}'",
+                                    url,
+                                    old_model,
+                                    new_model
+                                );
+                                // Update model indexes
+                                if let Some(worker_id) = url_to_id_ref.get(url) {
+                                    // Remove from old model_workers
+                                    if let Some(mut ids) =
+                                        model_workers_ref.get_mut(&old_model)
+                                    {
+                                        ids.retain(|id| *id != *worker_id);
+                                    }
+                                    // Remove from old model_index
+                                    if let Some(entry) = model_index_ref.get(&old_model) {
+                                        entry
+                                            .write()
+                                            .expect("RwLock poisoned")
+                                            .retain(|w| w.url() != url);
+                                    }
+                                    // Add to new model_workers
+                                    model_workers_ref
+                                        .entry(new_model.to_string())
+                                        .or_default()
+                                        .push(worker_id.clone());
+                                    // Add to new model_index
+                                    model_index_ref
+                                        .entry(new_model.to_string())
+                                        .or_insert_with(|| {
+                                            Arc::new(RwLock::new(Vec::new()))
+                                        })
+                                        .write()
+                                        .expect("RwLock poisoned")
+                                        .push(worker.clone());
+                                }
+                            }
+                        }
+                    }
                 }
 
                 // Reset loads periodically
-                check_count += 1;
                 if check_count.is_multiple_of(LOAD_RESET_INTERVAL) {
                     tracing::debug!("Resetting worker loads (cycle {})", check_count);
                     for worker in &workers {

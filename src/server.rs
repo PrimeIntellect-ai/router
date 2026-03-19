@@ -731,6 +731,10 @@ pub fn build_app_with_request_tracing(
     let protected_routes = Router::new()
         .route("/generate", post(generate))
         .route("/v1/chat/completions", post(v1_chat_completions))
+        .route(
+            "/v1/chat/completions/tokens",
+            post(v1_chat_completions),
+        )
         .route("/v1/completions", post(v1_completions))
         .route("/rerank", post(rerank))
         .route("/v1/rerank", post(v1_rerank))
