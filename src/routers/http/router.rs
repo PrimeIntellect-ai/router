@@ -104,7 +104,7 @@ impl Router {
         for url in &worker_urls {
             // Fetch model_id from worker's /v1/models endpoint
             let models = fetch_models_from_worker(strip_dp_rank(url)).await;
-            let mut labels = std::collections::HashMap::new();
+            let mut labels = HashMap::new();
             if let Some(first_model) = models.first() {
                 labels.insert("model_id".to_string(), first_model.clone());
                 info!("Discovered model '{}' on worker {}", first_model, url);
@@ -1039,7 +1039,7 @@ impl Router {
                     if res.status().is_success() {
                         // Discover models from the worker
                         let models = fetch_models_from_worker(worker_url).await;
-                        let mut labels = std::collections::HashMap::new();
+                        let mut labels = HashMap::new();
                         if let Some(first_model) = models.first() {
                             labels.insert("model_id".to_string(), first_model.clone());
                             info!("Discovered model '{}' on worker {}", first_model, worker_url);

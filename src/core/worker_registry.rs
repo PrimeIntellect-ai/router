@@ -5,13 +5,14 @@
 use crate::core::{ConnectionMode, Worker, WorkerType};
 use dashmap::DashMap;
 use std::sync::{Arc, RwLock};
-use tracing::info;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 /// Strip the `@<rank>` DP suffix from a worker URL, returning the base URL.
 ///
 /// E.g. `"http://host:8000@2"` → `"http://host:8000"`.
 /// Returns the original string unchanged if there is no numeric suffix.
+#[must_use]
 pub fn strip_dp_rank(url: &str) -> &str {
     if let Some(at_pos) = url.rfind('@') {
         if url[at_pos + 1..].parse::<usize>().is_ok() {
@@ -276,9 +277,8 @@ impl WorkerRegistry {
     /// `new_model_id`. No-op if the model hasn't changed or the worker
     /// is not in the registry.
     pub fn update_worker_model(&self, url: &str, new_model_id: &str) {
-        let worker = match self.get_by_url(url) {
-            Some(w) => w,
-            None => return,
+        let Some(worker) = self.get_by_url(url) else {
+            return;
         };
 
         let old_model_id = worker.model_id().to_string();
@@ -286,9 +286,8 @@ impl WorkerRegistry {
             return;
         }
 
-        let worker_id = match self.url_to_id.get(url) {
-            Some(id) => id.clone(),
-            None => return,
+        let Some(worker_id) = self.url_to_id.get(url).map(|id| id.clone()) else {
+            return;
         };
 
         info!(
@@ -301,8 +300,9 @@ impl WorkerRegistry {
             ids.retain(|id| *id != worker_id);
         }
         if let Some(entry) = self.model_index.get(&old_model_id) {
-            if let Ok(mut vec) = entry.write() {
-                vec.retain(|w| w.url() != url);
+            match entry.write() {
+                Ok(mut vec) => vec.retain(|w| w.url() != url),
+                Err(e) => warn!("Poisoned model_index lock for '{}': {}", old_model_id, e),
             }
         }
 
@@ -311,13 +311,14 @@ impl WorkerRegistry {
             .entry(new_model_id.to_string())
             .or_default()
             .push(worker_id);
-        if let Ok(mut vec) = self
+        match self
             .model_index
             .entry(new_model_id.to_string())
             .or_insert_with(|| Arc::new(RwLock::new(Vec::new())))
             .write()
         {
-            vec.push(worker.clone());
+            Ok(mut vec) => vec.push(worker.clone()),
+            Err(e) => warn!("Poisoned model_index lock for '{}': {}", new_model_id, e),
         }
     }
 
@@ -418,8 +419,9 @@ impl WorkerRegistry {
     /// Start a health checker for all workers in the registry.
     ///
     /// Periodically checks `/health` on every worker and refreshes the model index
-    /// by querying `/v1/models`. If a worker's loaded model changes (e.g. LoRA
+    /// by querying `/v1/models`. If a worker's loaded model changes (e.g. `LoRA`
     /// load/evict), the model index is updated automatically.
+    #[must_use]
     pub fn start_health_checker(&self, check_interval_secs: u64) -> crate::core::HealthChecker {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
@@ -429,12 +431,12 @@ impl WorkerRegistry {
         let registry = self.clone();
 
         let handle = tokio::spawn(async move {
-            let mut interval =
-                tokio::time::interval(tokio::time::Duration::from_secs(check_interval_secs));
-
-            let mut check_count = 0u64;
             const LOAD_RESET_INTERVAL: u64 = 10;
             const MODEL_REFRESH_INTERVAL: u64 = 5;
+
+            let mut interval =
+                tokio::time::interval(tokio::time::Duration::from_secs(check_interval_secs));
+            let mut check_count = 0u64;
 
             loop {
                 interval.tick().await;
