@@ -468,13 +468,44 @@ impl WorkerRegistry {
                     .map(|entry| entry.value().clone())
                     .collect();
 
-                for worker in &workers {
-                    let _ = worker.check_health_async().await;
-                }
+                // Perform health checks concurrently (not sequentially)
+                let health_checks = workers.iter().map(|worker| {
+                    let worker_url = worker.url().to_string();
+                    let was_healthy = worker.is_healthy();
+
+                    async move {
+                        match worker.check_health_async().await {
+                            Ok(()) => {
+                                if !was_healthy {
+                                    tracing::info!("Worker {} is now healthy", worker_url);
+                                }
+                            }
+                            Err(e) => {
+                                if was_healthy {
+                                    tracing::warn!(
+                                        "Worker {} health check failed: {}",
+                                        worker_url,
+                                        e
+                                    );
+                                } else {
+                                    tracing::debug!(
+                                        "Worker {} remains unhealthy: {}",
+                                        worker_url,
+                                        e
+                                    );
+                                }
+                            }
+                        }
+                    }
+                });
+                futures::future::join_all(health_checks).await;
 
                 check_count += 1;
 
                 // Periodically refresh model discovery
+                // TODO: notify PolicyRegistry on model changes so per-model
+                // policies stay in sync (requires a callback or moving this
+                // logic to a layer that has access to both registries).
                 if check_count % MODEL_REFRESH_INTERVAL == 0 {
                     for worker in &workers {
                         if !worker.is_healthy() {
@@ -489,10 +520,17 @@ impl WorkerRegistry {
                     }
                 }
 
+                // Only reset loads when traffic is idle to prevent drift
                 if check_count % LOAD_RESET_INTERVAL == 0 {
-                    tracing::debug!("Resetting worker loads (cycle {})", check_count);
-                    for worker in &workers {
-                        worker.reset_load();
+                    let max_load = workers.iter().map(|w| w.load()).max().unwrap_or(0);
+                    if max_load <= 2 {
+                        tracing::debug!(
+                            "Resetting worker loads to prevent drift (max_load: {})",
+                            max_load
+                        );
+                        for worker in &workers {
+                            worker.reset_load();
+                        }
                     }
                 }
             }
