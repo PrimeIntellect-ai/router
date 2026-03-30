@@ -72,6 +72,11 @@ pub struct WorkerRegistry {
 
     /// URL to worker ID mapping (for backward compatibility)
     url_to_id: Arc<DashMap<String, WorkerId>>,
+
+    /// Tracks the last-known model_id per worker URL.
+    /// Used by the health checker to detect model changes, since
+    /// the Worker trait's model_id() reads from immutable metadata.
+    known_models: Arc<DashMap<String, String>>,
 }
 
 impl WorkerRegistry {
@@ -84,6 +89,7 @@ impl WorkerRegistry {
             type_workers: Arc::new(DashMap::new()),
             connection_workers: Arc::new(DashMap::new()),
             url_to_id: Arc::new(DashMap::new()),
+            known_models: Arc::new(DashMap::new()),
         }
     }
 
@@ -281,7 +287,13 @@ impl WorkerRegistry {
             return;
         };
 
-        let old_model_id = worker.model_id().to_string();
+        // Use known_models to track the current model, since Worker::model_id()
+        // reads from immutable metadata and can't be updated after construction.
+        let old_model_id = match self.known_models.get(url) {
+            Some(entry) => entry.clone(),
+            None => worker.model_id().to_string(),
+        };
+
         if old_model_id == new_model_id {
             return;
         }
@@ -294,6 +306,10 @@ impl WorkerRegistry {
             "Model changed on {}: '{}' -> '{}'",
             url, old_model_id, new_model_id
         );
+
+        // Record the new model so the next refresh cycle sees it as current
+        self.known_models
+            .insert(url.to_string(), new_model_id.to_string());
 
         // Remove from old indexes
         if let Some(mut ids) = self.model_workers.get_mut(&old_model_id) {
