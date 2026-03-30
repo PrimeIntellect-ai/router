@@ -24,4 +24,4 @@ pub use worker::{
     HealthChecker, HealthConfig, Worker, WorkerCollection, WorkerFactory, WorkerLoadGuard,
     WorkerType,
 };
-pub use worker_registry::{WorkerId, WorkerRegistry, WorkerRegistryStats};
+pub use worker_registry::{strip_dp_rank, WorkerId, WorkerRegistry, WorkerRegistryStats};

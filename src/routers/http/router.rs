@@ -1,7 +1,8 @@
 use crate::config::types::RetryConfig;
 use crate::core::{
-    fetch_models_from_worker, is_retryable_status, BasicWorker, CircuitBreakerConfig,
-    DPAwareWorker, HealthConfig, RetryExecutor, Worker, WorkerRegistry, WorkerType,
+    fetch_models_from_worker, is_retryable_status, strip_dp_rank, BasicWorker,
+    CircuitBreakerConfig, DPAwareWorker, HealthConfig, RetryExecutor, Worker, WorkerRegistry,
+    WorkerType,
 };
 use crate::metrics::RouterMetrics;
 use crate::otel_http::{self, ClientRequestOptions};
@@ -102,12 +103,7 @@ impl Router {
         };
         for url in &worker_urls {
             // Fetch model_id from worker's /v1/models endpoint
-            let base_url_for_fetch = if let Some(at_pos) = url.rfind('@') {
-                &url[..at_pos]
-            } else {
-                url.as_str()
-            };
-            let models = fetch_models_from_worker(base_url_for_fetch).await;
+            let models = fetch_models_from_worker(strip_dp_rank(url)).await;
             let mut labels = std::collections::HashMap::new();
             if let Some(first_model) = models.first() {
                 labels.insert("model_id".to_string(), first_model.clone());
