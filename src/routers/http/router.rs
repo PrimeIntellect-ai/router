@@ -1,7 +1,8 @@
 use crate::config::types::RetryConfig;
 use crate::core::{
-    is_retryable_status, BasicWorker, CircuitBreakerConfig, DPAwareWorker, HealthConfig,
-    RetryExecutor, Worker, WorkerRegistry, WorkerType,
+    fetch_models_from_worker, is_retryable_status, strip_dp_rank, BasicWorker,
+    CircuitBreakerConfig, DPAwareWorker, HealthConfig, RetryExecutor, Worker, WorkerRegistry,
+    WorkerType,
 };
 use crate::metrics::RouterMetrics;
 use crate::otel_http::{self, ClientRequestOptions};
@@ -101,8 +102,16 @@ impl Router {
             success_threshold: ctx.router_config.health_check.success_threshold,
         };
         for url in &worker_urls {
-            // TODO: In IGW mode, fetch model_id from worker's /get_model_info endpoint
-            // For now, create worker without model_id
+            // Fetch model_id from worker's /v1/models endpoint
+            let models = fetch_models_from_worker(strip_dp_rank(url)).await;
+            let mut labels = HashMap::new();
+            if let Some(first_model) = models.first() {
+                labels.insert("model_id".to_string(), first_model.clone());
+                info!("Discovered model '{}' on worker {}", first_model, url);
+            } else {
+                debug!("No model discovered on worker {}, using 'unknown'", url);
+            }
+
             let worker_arc: Arc<dyn Worker> = if dp_size > 1 {
                 let (base_url, dp_rank) = dp_utils::parse_worker_url(url);
                 Arc::new(
@@ -113,13 +122,15 @@ impl Router {
                         WorkerType::Regular,
                     )
                     .with_circuit_breaker_config(core_cb_config.clone())
-                    .with_health_config(health_config.clone()),
+                    .with_health_config(health_config.clone())
+                    .with_labels(labels),
                 )
             } else {
                 Arc::new(
                     BasicWorker::new(url.clone(), WorkerType::Regular)
                         .with_circuit_breaker_config(core_cb_config.clone())
-                        .with_health_config(health_config.clone()),
+                        .with_health_config(health_config.clone())
+                        .with_labels(labels),
                 )
             };
             ctx.worker_registry.register(worker_arc.clone());
@@ -1026,6 +1037,14 @@ impl Router {
             match client.get(format!("{}/health", worker_url)).send().await {
                 Ok(res) => {
                     if res.status().is_success() {
+                        // Discover models from the worker
+                        let models = fetch_models_from_worker(worker_url).await;
+                        let mut labels = HashMap::new();
+                        if let Some(first_model) = models.first() {
+                            labels.insert("model_id".to_string(), first_model.clone());
+                            info!("Discovered model '{}' on worker {}", first_model, worker_url);
+                        }
+
                         if self.intra_node_data_parallel_size > 1 {
                             // Expand worker URL into multiple DP-aware URLs based on configured intra_node_data_parallel_size
                             // (e.g., "http://host:8000" → "http://host:8000@0", "@1", etc.)
@@ -1045,7 +1064,6 @@ impl Router {
                                     continue;
                                 }
                                 info!("Added worker: {}", dp_url);
-                                // TODO: In IGW mode, fetch model_id from worker's /get_model_info endpoint
                                 let (base_url, dp_rank) = dp_utils::parse_worker_url(dp_url);
                                 let new_worker = DPAwareWorker::new(
                                     base_url,
@@ -1053,7 +1071,8 @@ impl Router {
                                     self.intra_node_data_parallel_size,
                                     WorkerType::Regular,
                                 )
-                                .with_circuit_breaker_config(self.circuit_breaker_config.clone());
+                                .with_circuit_breaker_config(self.circuit_breaker_config.clone())
+                                .with_labels(labels.clone());
 
                                 let worker_arc: Arc<dyn Worker> = Arc::new(new_worker);
                                 self.worker_registry.register(worker_arc.clone());
@@ -1085,12 +1104,12 @@ impl Router {
                             }
                             info!("Added worker: {}", worker_url);
 
-                            // TODO: In IGW mode, fetch model_id from worker's /get_model_info endpoint
                             let new_worker =
                                 BasicWorker::new(worker_url.to_string(), WorkerType::Regular)
                                     .with_circuit_breaker_config(
                                         self.circuit_breaker_config.clone(),
-                                    );
+                                    )
+                                    .with_labels(labels);
 
                             let worker_arc = Arc::new(new_worker);
                             self.worker_registry.register(worker_arc.clone());

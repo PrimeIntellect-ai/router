@@ -5,7 +5,22 @@
 use crate::core::{ConnectionMode, Worker, WorkerType};
 use dashmap::DashMap;
 use std::sync::{Arc, RwLock};
+use tracing::{info, warn};
 use uuid::Uuid;
+
+/// Strip the `@<rank>` DP suffix from a worker URL, returning the base URL.
+///
+/// E.g. `"http://host:8000@2"` → `"http://host:8000"`.
+/// Returns the original string unchanged if there is no numeric suffix.
+#[must_use]
+pub fn strip_dp_rank(url: &str) -> &str {
+    if let Some(at_pos) = url.rfind('@') {
+        if url[at_pos + 1..].parse::<usize>().is_ok() {
+            return &url[..at_pos];
+        }
+    }
+    url
+}
 
 /// Unique identifier for a worker
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
@@ -38,7 +53,7 @@ impl Default for WorkerId {
 type ModelIndex = Arc<DashMap<String, Arc<RwLock<Vec<Arc<dyn Worker>>>>>>;
 
 /// Worker registry with model-based indexing
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct WorkerRegistry {
     /// All workers indexed by ID
     workers: Arc<DashMap<WorkerId, Arc<dyn Worker>>>,
@@ -57,6 +72,11 @@ pub struct WorkerRegistry {
 
     /// URL to worker ID mapping (for backward compatibility)
     url_to_id: Arc<DashMap<String, WorkerId>>,
+
+    /// Tracks the last-known model_id per worker URL.
+    /// Used by the health checker to detect model changes, since
+    /// the Worker trait's model_id() reads from immutable metadata.
+    known_models: Arc<DashMap<String, String>>,
 }
 
 impl WorkerRegistry {
@@ -69,6 +89,7 @@ impl WorkerRegistry {
             type_workers: Arc::new(DashMap::new()),
             connection_workers: Arc::new(DashMap::new()),
             url_to_id: Arc::new(DashMap::new()),
+            known_models: Arc::new(DashMap::new()),
         }
     }
 
@@ -256,6 +277,67 @@ impl WorkerRegistry {
             .collect()
     }
 
+    /// Re-index a worker under a new `model_id`.
+    ///
+    /// Removes the worker from its old model index and inserts it under
+    /// `new_model_id`. No-op if the model hasn't changed or the worker
+    /// is not in the registry.
+    pub fn update_worker_model(&self, url: &str, new_model_id: &str) {
+        let Some(worker) = self.get_by_url(url) else {
+            return;
+        };
+
+        // Use known_models to track the current model, since Worker::model_id()
+        // reads from immutable metadata and can't be updated after construction.
+        let old_model_id = match self.known_models.get(url) {
+            Some(entry) => entry.clone(),
+            None => worker.model_id().to_string(),
+        };
+
+        if old_model_id == new_model_id {
+            return;
+        }
+
+        let Some(worker_id) = self.url_to_id.get(url).map(|id| id.clone()) else {
+            return;
+        };
+
+        info!(
+            "Model changed on {}: '{}' -> '{}'",
+            url, old_model_id, new_model_id
+        );
+
+        // Record the new model so the next refresh cycle sees it as current
+        self.known_models
+            .insert(url.to_string(), new_model_id.to_string());
+
+        // Remove from old indexes
+        if let Some(mut ids) = self.model_workers.get_mut(&old_model_id) {
+            ids.retain(|id| *id != worker_id);
+        }
+        if let Some(entry) = self.model_index.get(&old_model_id) {
+            match entry.write() {
+                Ok(mut vec) => vec.retain(|w| w.url() != url),
+                Err(e) => warn!("Poisoned model_index lock for '{}': {}", old_model_id, e),
+            }
+        }
+
+        // Insert into new indexes
+        self.model_workers
+            .entry(new_model_id.to_string())
+            .or_default()
+            .push(worker_id);
+        match self
+            .model_index
+            .entry(new_model_id.to_string())
+            .or_insert_with(|| Arc::new(RwLock::new(Vec::new())))
+            .write()
+        {
+            Ok(mut vec) => vec.push(worker.clone()),
+            Err(e) => warn!("Poisoned model_index lock for '{}': {}", new_model_id, e),
+        }
+    }
+
     /// Get all model IDs with workers
     pub fn get_models(&self) -> Vec<String> {
         self.model_workers
@@ -350,50 +432,119 @@ impl WorkerRegistry {
         }
     }
 
-    /// Start a health checker for all workers in the registry
-    /// This should be called once after the registry is populated with workers
+    /// Start a health checker for all workers in the registry.
+    ///
+    /// Periodically checks `/health` on every worker and refreshes the model index
+    /// by querying `/v1/models`. If a worker's loaded model changes (e.g. `LoRA`
+    /// load/evict), the model index is updated automatically.
+    #[must_use]
     pub fn start_health_checker(&self, check_interval_secs: u64) -> crate::core::HealthChecker {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
 
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_clone = shutdown.clone();
-        let workers_ref = self.workers.clone();
+        let registry = self.clone();
 
         let handle = tokio::spawn(async move {
+            const LOAD_RESET_INTERVAL: u64 = 10;
+            const MODEL_REFRESH_INTERVAL: u64 = 5;
+
             let mut interval =
                 tokio::time::interval(tokio::time::Duration::from_secs(check_interval_secs));
-
-            // Counter for periodic load reset (every 10 health check cycles)
             let mut check_count = 0u64;
-            const LOAD_RESET_INTERVAL: u64 = 10;
 
             loop {
                 interval.tick().await;
 
-                // Check for shutdown signal
                 if shutdown_clone.load(Ordering::Acquire) {
                     tracing::debug!("Registry health checker shutting down");
                     break;
                 }
 
-                // Get all workers from registry
-                let workers: Vec<Arc<dyn crate::core::Worker>> = workers_ref
+                let workers: Vec<Arc<dyn crate::core::Worker>> = registry
+                    .workers
                     .iter()
                     .map(|entry| entry.value().clone())
                     .collect();
 
-                // Perform health checks
-                for worker in &workers {
-                    let _ = worker.check_health_async().await; // Use async version directly
+                // Perform health checks concurrently (not sequentially)
+                let health_checks = workers.iter().map(|worker| {
+                    let worker_url = worker.url().to_string();
+                    let was_healthy = worker.is_healthy();
+
+                    async move {
+                        match worker.check_health_async().await {
+                            Ok(()) => {
+                                if !was_healthy {
+                                    tracing::info!("Worker {} is now healthy", worker_url);
+                                }
+                            }
+                            Err(e) => {
+                                if was_healthy {
+                                    tracing::warn!(
+                                        "Worker {} health check failed: {}",
+                                        worker_url,
+                                        e
+                                    );
+                                } else {
+                                    tracing::debug!(
+                                        "Worker {} remains unhealthy: {}",
+                                        worker_url,
+                                        e
+                                    );
+                                }
+                            }
+                        }
+                    }
+                });
+                futures::future::join_all(health_checks).await;
+
+                check_count += 1;
+
+                // Periodically refresh model discovery
+                // TODO: notify PolicyRegistry on model changes so per-model
+                // policies stay in sync (requires a callback or moving this
+                // logic to a layer that has access to both registries).
+                if check_count % MODEL_REFRESH_INTERVAL == 0 {
+                    // Deduplicate by base URL so DP workers (@0, @1, …)
+                    // sharing the same endpoint only trigger one fetch.
+                    let mut fetched: std::collections::HashMap<String, Option<String>> =
+                        std::collections::HashMap::new();
+
+                    for worker in &workers {
+                        if !worker.is_healthy() {
+                            continue;
+                        }
+                        let base_url = strip_dp_rank(worker.url()).to_string();
+                        let new_model = match fetched.entry(base_url.clone()) {
+                            std::collections::hash_map::Entry::Occupied(e) => e.get().clone(),
+                            std::collections::hash_map::Entry::Vacant(e) => {
+                                let models =
+                                    crate::core::worker::fetch_models_from_worker(&base_url)
+                                        .await;
+                                let first = models.into_iter().next();
+                                e.insert(first.clone());
+                                first
+                            }
+                        };
+                        if let Some(ref model) = new_model {
+                            registry.update_worker_model(worker.url(), model);
+                        }
+                    }
                 }
 
-                // Reset loads periodically
-                check_count += 1;
-                if check_count.is_multiple_of(LOAD_RESET_INTERVAL) {
-                    tracing::debug!("Resetting worker loads (cycle {})", check_count);
-                    for worker in &workers {
-                        worker.reset_load();
+                // Only reset loads when traffic is idle to prevent drift
+                if check_count % LOAD_RESET_INTERVAL == 0 {
+                    let max_load = workers.iter().map(|w| w.load()).max().unwrap_or(0);
+                    if max_load <= 2 {
+                        tracing::debug!(
+                            "Resetting worker loads to prevent drift (max_load: {})",
+                            max_load
+                        );
+                        for worker in &workers {
+                            worker.reset_load();
+                        }
                     }
                 }
             }

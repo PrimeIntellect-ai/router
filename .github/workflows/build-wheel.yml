@@ -1,0 +1,59 @@
+name: Build and Release Wheel
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+jobs:
+  build-wheel:
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            suffix: amd64
+          - runner: image-builder-arm-2204
+            suffix: arm64
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install protobuf compiler
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build dependencies
+        run: pip install setuptools setuptools-rust wheel build
+
+      - name: Build wheel
+        run: python -m build --wheel
+
+      - name: Rename wheel with arch suffix
+        run: |
+          cd dist
+          for f in *.whl; do
+            mv "$f" "${f%.whl}-${{ matrix.suffix }}.whl"
+          done
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.suffix }}
+          path: dist/*.whl
+
+      - name: Upload wheel to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.whl

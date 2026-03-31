@@ -17,6 +17,49 @@ static WORKER_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
         .expect("Failed to create worker HTTP client")
 });
 
+/// Query a worker's `/v1/models` endpoint and return the list of model IDs.
+///
+/// Returns an empty vec if the endpoint is unreachable or returns an unexpected format.
+/// This is used during service discovery and health checks to populate worker labels.
+pub async fn fetch_models_from_worker(worker_url: &str) -> Vec<String> {
+    let url = format!("{}/v1/models", worker_url);
+    let timeout = std::time::Duration::from_secs(5);
+
+    let response = match WORKER_CLIENT.get(&url).timeout(timeout).send().await {
+        Ok(r) if r.status().is_success() => r,
+        Ok(r) => {
+            tracing::debug!(
+                "GET {} returned non-success status: {}",
+                url,
+                r.status()
+            );
+            return Vec::new();
+        }
+        Err(e) => {
+            tracing::debug!("Failed to query {}: {}", url, e);
+            return Vec::new();
+        }
+    };
+
+    let body: serde_json::Value = match response.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::debug!("Failed to parse /v1/models response from {}: {}", worker_url, e);
+            return Vec::new();
+        }
+    };
+
+    // OpenAI-compatible format: {"data": [{"id": "model-name", ...}, ...]}
+    body.get("data")
+        .and_then(|d| d.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|item| item.get("id").and_then(|id| id.as_str()).map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Core worker abstraction that represents a backend service
 #[async_trait]
 pub trait Worker: Send + Sync + fmt::Debug {
@@ -580,6 +623,12 @@ impl DPAwareWorker {
     /// Configure health check settings for this worker
     pub fn with_health_config(mut self, config: HealthConfig) -> Self {
         self.base_worker = self.base_worker.with_health_config(config);
+        self
+    }
+
+    /// Set labels on the underlying worker
+    pub fn with_labels(mut self, labels: std::collections::HashMap<String, String>) -> Self {
+        self.base_worker = self.base_worker.with_labels(labels);
         self
     }
 }
