@@ -253,9 +253,17 @@ The continuous integration pipeline includes comprehensive testing, benchmarking
 4. **Basic Inference Testing**: End-to-end validation through the router
 5. **PD Disaggregation Testing**: Benchmark and sanity checks for prefill-decode load balancing
 
-#### Publishing
-- **PyPI Publishing**: Wheels and source distributions published when version changes in `pyproject.toml`
-- **Container Images**: Docker images published using `/docker/Dockerfile.router`
+#### Releasing
+
+To cut a new release with pre-built wheels (amd64 + arm64):
+
+```bash
+./scripts/release.sh 0.1.13
+```
+
+This bumps the version in `pyproject.toml`, commits, tags, and pushes. GitHub Actions then builds and attaches wheels to the release.
+
+You can also trigger a wheel build manually from the Actions tab without tagging.
 
 ## Acknowledgement
 
