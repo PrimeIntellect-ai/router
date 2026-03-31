@@ -507,15 +507,29 @@ impl WorkerRegistry {
                 // policies stay in sync (requires a callback or moving this
                 // logic to a layer that has access to both registries).
                 if check_count % MODEL_REFRESH_INTERVAL == 0 {
+                    // Deduplicate by base URL so DP workers (@0, @1, …)
+                    // sharing the same endpoint only trigger one fetch.
+                    let mut fetched: std::collections::HashMap<String, Option<String>> =
+                        std::collections::HashMap::new();
+
                     for worker in &workers {
                         if !worker.is_healthy() {
                             continue;
                         }
-                        let fetch_url = strip_dp_rank(worker.url());
-                        let models =
-                            crate::core::worker::fetch_models_from_worker(fetch_url).await;
-                        if let Some(new_model) = models.first() {
-                            registry.update_worker_model(worker.url(), new_model);
+                        let base_url = strip_dp_rank(worker.url()).to_string();
+                        let new_model = match fetched.entry(base_url.clone()) {
+                            std::collections::hash_map::Entry::Occupied(e) => e.get().clone(),
+                            std::collections::hash_map::Entry::Vacant(e) => {
+                                let models =
+                                    crate::core::worker::fetch_models_from_worker(&base_url)
+                                        .await;
+                                let first = models.into_iter().next();
+                                e.insert(first.clone());
+                                first
+                            }
+                        };
+                        if let Some(ref model) = new_model {
+                            registry.update_worker_model(worker.url(), model);
                         }
                     }
                 }

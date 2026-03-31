@@ -4,7 +4,7 @@ set -euo pipefail
 VERSION="${1:?Usage: ./scripts/release.sh <version>  (e.g. 0.1.13)}"
 
 # Validate format
-if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+'; then
+if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
     echo "Error: version must be semver (e.g. 0.1.13)" >&2
     exit 1
 fi
