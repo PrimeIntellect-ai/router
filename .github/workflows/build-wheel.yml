@@ -39,13 +39,6 @@ jobs:
       - name: Build wheel
         run: python -m build --wheel
 
-      - name: Rename wheel with arch suffix
-        run: |
-          cd dist
-          for f in *.whl; do
-            mv "$f" "${f%.whl}-${{ matrix.suffix }}.whl"
-          done
-
       - name: Upload wheel artifact
         uses: actions/upload-artifact@v4
         with:
