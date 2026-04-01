@@ -92,8 +92,12 @@ jobs:
           IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
           VERSION="${{ steps.vars.outputs.version }}"
 
+          TAGS="-t ${IMAGE}:${VERSION}"
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            TAGS="$TAGS -t ${IMAGE}:latest"
+          fi
+
           docker buildx imagetools create \
-            -t ${IMAGE}:${VERSION} \
-            -t ${IMAGE}:latest \
+            $TAGS \
             ${IMAGE}:${VERSION}-amd64 \
             ${IMAGE}:${VERSION}-arm64

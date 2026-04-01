@@ -17,3 +17,4 @@ RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/
 COPY --from=builder /build/target/release/vllm-router /usr/local/bin/vllm-router
 
 ENTRYPOINT ["vllm-router"]
+CMD ["--host", "0.0.0.0", "--port", "8080"]
