@@ -535,7 +535,9 @@ impl PDRouter {
         }
 
         // Register cold prefill workers in the registry (no DP expansion for now)
+        let mut cold_prefill_workers_urls = vec![];
         for (url, port) in cold_prefill_urls {
+            cold_prefill_workers_urls.push(url.clone());
             let worker_type = WorkerType::ColdPrefill {
                 bootstrap_port: port,
             };
@@ -586,6 +588,20 @@ impl PDRouter {
         if !decode_workers_urls.is_empty() {
             crate::routers::http::router::Router::wait_for_healthy_workers(
                 &decode_workers_urls,
+                ctx.router_config.worker_startup_timeout_secs,
+                ctx.router_config.worker_startup_check_interval_secs,
+            )
+            .await?;
+        }
+
+        if !cold_prefill_workers_urls.is_empty() {
+            info!(
+                "Waiting for {} cold prefill worker(s) to become healthy: {:?}",
+                cold_prefill_workers_urls.len(),
+                cold_prefill_workers_urls
+            );
+            crate::routers::http::router::Router::wait_for_healthy_workers(
+                &cold_prefill_workers_urls,
                 ctx.router_config.worker_startup_timeout_secs,
                 ctx.router_config.worker_startup_check_interval_secs,
             )

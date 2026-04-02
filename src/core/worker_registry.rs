@@ -420,6 +420,7 @@ impl WorkerRegistry {
         let mut total_load = 0;
         let mut regular_count = 0;
         let mut prefill_count = 0;
+        let mut cold_prefill_count = 0;
         let mut decode_count = 0;
 
         for worker in self.get_all() {
@@ -430,9 +431,8 @@ impl WorkerRegistry {
 
             match worker.worker_type() {
                 WorkerType::Regular => regular_count += 1,
-                WorkerType::Prefill { .. } | WorkerType::ColdPrefill { .. } => {
-                    prefill_count += 1
-                }
+                WorkerType::Prefill { .. } => prefill_count += 1,
+                WorkerType::ColdPrefill { .. } => cold_prefill_count += 1,
                 WorkerType::Decode => decode_count += 1,
             }
         }
@@ -444,6 +444,7 @@ impl WorkerRegistry {
             total_load,
             regular_workers: regular_count,
             prefill_workers: prefill_count,
+            cold_prefill_workers: cold_prefill_count,
             decode_workers: decode_count,
         }
     }
@@ -585,6 +586,7 @@ pub struct WorkerRegistryStats {
     pub total_load: usize,
     pub regular_workers: usize,
     pub prefill_workers: usize,
+    pub cold_prefill_workers: usize,
     pub decode_workers: usize,
 }
 

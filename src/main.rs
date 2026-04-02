@@ -806,6 +806,9 @@ Provide --worker-urls or PD flags as usual.",
         if cli_args.pd_disaggregation && !prefill_urls.is_empty() {
             println!("Prefill nodes: {:?}", prefill_urls);
             println!("Decode nodes: {:?}", cli_args.decode);
+            if !cold_prefill_urls.is_empty() {
+                println!("Cold prefill nodes: {:?}", cold_prefill_urls);
+            }
         }
     }
 

@@ -184,8 +184,9 @@ impl RouterFactory {
         }
         if !prefill_urls.is_empty() || !decode_urls.is_empty() {
             tracing::info!(
-                "Creating VllmPDRouter with static URLs - prefill: {:?}, decode: {:?}",
+                "Creating VllmPDRouter with static URLs - prefill: {:?}, cold_prefill: {:?}, decode: {:?}",
                 prefill_urls,
+                cold_prefill_urls,
                 decode_urls
             );
         }

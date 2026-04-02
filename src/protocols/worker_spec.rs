@@ -115,6 +115,7 @@ pub struct WorkerStats {
 pub struct WorkerTypeStats {
     pub regular: usize,
     pub prefill: usize,
+    pub cold_prefill: usize,
     pub decode: usize,
 }
 

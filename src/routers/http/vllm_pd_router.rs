@@ -1143,8 +1143,9 @@ impl VllmPDRouter {
         } else {
             // Direct URL mode (same as PDRouter)
             info!(
-                "VllmPDRouter::new called in direct URL mode with {} prefill, {} decode workers",
+                "VllmPDRouter::new called in direct URL mode with {} prefill, {} cold prefill, {} decode workers",
                 prefill_urls.len(),
+                cold_prefill_urls.len(),
                 decode_urls.len()
             );
 
@@ -1231,13 +1232,13 @@ impl VllmPDRouter {
         if is_sub_llm {
             let cold = self.pd_router.worker_registry.get_cold_prefill_workers();
             if !cold.is_empty() {
-                debug!(
+                info!(
                     "is_sub_llm=true header detected, routing to cold prefill pool ({} workers)",
                     cold.len()
                 );
                 return cold;
             }
-            debug!(
+            warn!(
                 "is_sub_llm=true header detected but no cold prefill workers configured, falling back to normal prefill pool"
             );
         }

@@ -312,6 +312,7 @@ impl RouterManager {
             by_type: WorkerTypeStats {
                 regular: registry_stats.regular_workers,
                 prefill: registry_stats.prefill_workers,
+                cold_prefill: registry_stats.cold_prefill_workers,
                 decode: registry_stats.decode_workers,
             },
         };
