@@ -115,7 +115,7 @@ impl RouterManager {
             let has_pd_workers = workers.iter().any(|w| {
                 matches!(
                     w.worker_type(),
-                    WorkerType::Prefill { .. } | WorkerType::Decode
+                    WorkerType::Prefill { .. } | WorkerType::ColdPrefill { .. } | WorkerType::Decode
                 )
             });
 
@@ -362,6 +362,7 @@ impl RouterManager {
             worker_type: match worker.worker_type() {
                 WorkerType::Regular => "regular".to_string(),
                 WorkerType::Prefill { .. } => "prefill".to_string(),
+                WorkerType::ColdPrefill { .. } => "cold_prefill".to_string(),
                 WorkerType::Decode => "decode".to_string(),
             },
             is_healthy: worker.is_healthy(),

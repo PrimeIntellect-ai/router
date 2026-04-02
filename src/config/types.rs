@@ -128,6 +128,9 @@ pub enum RoutingMode {
     PrefillDecode {
         /// Prefill worker URLs with optional bootstrap ports
         prefill_urls: Vec<(String, Option<u16>)>,
+        /// Cold prefill worker URLs with optional bootstrap ports (for is_sub_llm requests)
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        cold_prefill_urls: Vec<(String, Option<u16>)>,
         /// Decode worker URLs
         decode_urls: Vec<String>,
         /// Optional separate policy for prefill workers
@@ -146,6 +149,9 @@ pub enum RoutingMode {
     VllmPrefillDecode {
         /// Prefill worker URLs with optional bootstrap ports
         prefill_urls: Vec<(String, Option<u16>)>,
+        /// Cold prefill worker URLs with optional bootstrap ports (for is_sub_llm requests)
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        cold_prefill_urls: Vec<(String, Option<u16>)>,
         /// Decode worker URLs
         decode_urls: Vec<String>,
         /// Optional separate policy for prefill workers
@@ -638,6 +644,7 @@ mod tests {
 
         let pd = RoutingMode::PrefillDecode {
             prefill_urls: vec![("http://prefill1".to_string(), Some(8001))],
+            cold_prefill_urls: vec![],
             decode_urls: vec!["http://decode1".to_string()],
             prefill_policy: None,
             decode_policy: None,
@@ -661,6 +668,7 @@ mod tests {
                 ("http://prefill1".to_string(), Some(8001)),
                 ("http://prefill2".to_string(), None),
             ],
+            cold_prefill_urls: vec![],
             decode_urls: vec![
                 "http://decode1".to_string(),
                 "http://decode2".to_string(),
@@ -690,6 +698,7 @@ mod tests {
         // Test PrefillDecode mode
         let pd = RoutingMode::PrefillDecode {
             prefill_urls: vec![("http://prefill1".to_string(), Some(8001))],
+            cold_prefill_urls: vec![],
             decode_urls: vec!["http://decode1".to_string()],
             prefill_policy: None,
             decode_policy: None,
@@ -888,6 +897,7 @@ mod tests {
         let config = RouterConfig {
             mode: RoutingMode::PrefillDecode {
                 prefill_urls: vec![],
+                cold_prefill_urls: vec![],
                 decode_urls: vec![],
                 prefill_policy: None,
                 decode_policy: None,
@@ -1010,6 +1020,7 @@ mod tests {
                     ("http://prefill1:8000".to_string(), Some(8001)),
                     ("http://prefill2:8000".to_string(), None),
                 ],
+                cold_prefill_urls: vec![],
                 decode_urls: vec![
                     "http://decode1:8000".to_string(),
                     "http://decode2:8000".to_string(),
@@ -1213,6 +1224,7 @@ mod tests {
         // When both prefill and decode policies are specified, they should be used
         let pd = RoutingMode::PrefillDecode {
             prefill_urls: vec![("http://prefill1".to_string(), None)],
+            cold_prefill_urls: vec![],
             decode_urls: vec!["http://decode1".to_string()],
             prefill_policy: Some(PolicyConfig::CacheAware {
                 cache_threshold: 0.5,
@@ -1245,6 +1257,7 @@ mod tests {
         // When only prefill policy is specified, decode should use main policy
         let pd = RoutingMode::PrefillDecode {
             prefill_urls: vec![("http://prefill1".to_string(), None)],
+            cold_prefill_urls: vec![],
             decode_urls: vec!["http://decode1".to_string()],
             prefill_policy: Some(PolicyConfig::CacheAware {
                 cache_threshold: 0.5,
@@ -1276,6 +1289,7 @@ mod tests {
         // When only decode policy is specified, prefill should use main policy
         let pd = RoutingMode::PrefillDecode {
             prefill_urls: vec![("http://prefill1".to_string(), None)],
+            cold_prefill_urls: vec![],
             decode_urls: vec!["http://decode1".to_string()],
             prefill_policy: None,
             decode_policy: Some(PolicyConfig::PowerOfTwo {
@@ -1303,6 +1317,7 @@ mod tests {
         // When no specific policies are specified, both should use main policy
         let pd = RoutingMode::PrefillDecode {
             prefill_urls: vec![("http://prefill1".to_string(), None)],
+            cold_prefill_urls: vec![],
             decode_urls: vec!["http://decode1".to_string()],
             prefill_policy: None,
             decode_policy: None,

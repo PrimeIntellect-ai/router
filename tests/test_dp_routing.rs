@@ -292,6 +292,7 @@ mod dp_e2e_tests {
         RouterConfig {
             mode: RoutingMode::PrefillDecode {
                 prefill_urls,
+                cold_prefill_urls: vec![],
                 decode_urls,
                 prefill_policy: None,
                 decode_policy: None,

@@ -428,6 +428,7 @@ impl PDRouter {
     #[allow(clippy::too_many_arguments)]
     pub async fn new(
         prefill_urls: Vec<(String, Option<u16>)>,
+        cold_prefill_urls: Vec<(String, Option<u16>)>,
         decode_urls: Vec<String>,
         ctx: &Arc<crate::server::AppContext>,
     ) -> Result<Self, String> {
@@ -530,6 +531,19 @@ impl PDRouter {
                         .with_health_config(health_config.clone()),
                 )
             };
+            ctx.worker_registry.register(worker);
+        }
+
+        // Register cold prefill workers in the registry (no DP expansion for now)
+        for (url, port) in cold_prefill_urls {
+            let worker_type = WorkerType::ColdPrefill {
+                bootstrap_port: port,
+            };
+            let worker: Arc<dyn Worker> = Arc::new(
+                BasicWorker::new(url, worker_type)
+                    .with_circuit_breaker_config(core_cb_config.clone())
+                    .with_health_config(health_config.clone()),
+            );
             ctx.worker_registry.register(worker);
         }
 

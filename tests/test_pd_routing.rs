@@ -119,6 +119,7 @@ mod test_pd_routing {
                         ("http://prefill1:8080".to_string(), Some(9000)),
                         ("http://prefill2:8080".to_string(), None),
                     ],
+                    cold_prefill_urls: vec![],
                     decode_urls: vec![
                         "http://decode1:8080".to_string(),
                         "http://decode2:8080".to_string(),
@@ -131,6 +132,7 @@ mod test_pd_routing {
             (
                 RoutingMode::PrefillDecode {
                     prefill_urls: vec![("http://prefill:8080".to_string(), Some(9000))],
+                    cold_prefill_urls: vec![],
                     decode_urls: vec!["http://decode:8080".to_string()],
                     prefill_policy: None,
                     decode_policy: None,
@@ -146,6 +148,7 @@ mod test_pd_routing {
                         ("http://p2:8080".to_string(), Some(9001)),
                         ("http://p3:8080".to_string(), Some(9002)),
                     ],
+                    cold_prefill_urls: vec![],
                     decode_urls: vec!["http://d1:8080".to_string(), "http://d2:8080".to_string()],
                     prefill_policy: None,
                     decode_policy: None,

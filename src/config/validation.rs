@@ -56,6 +56,7 @@ impl ConfigValidator {
                 decode_urls,
                 prefill_policy,
                 decode_policy,
+                ..
             } => {
                 // Only require URLs if service discovery is disabled
                 if !has_service_discovery {
@@ -107,7 +108,7 @@ impl ConfigValidator {
                 decode_urls,
                 prefill_policy,
                 decode_policy,
-                discovery_address: _,
+                ..
             } => {
                 // Only require URLs if service discovery is disabled
                 if !has_service_discovery {
@@ -480,6 +481,7 @@ impl ConfigValidator {
                 decode_urls,
                 prefill_policy,
                 decode_policy,
+                ..
             } = &config.mode
             {
                 // Check power-of-two for prefill
@@ -665,6 +667,7 @@ mod tests {
         let config = RouterConfig::new(
             RoutingMode::PrefillDecode {
                 prefill_urls: vec![("http://prefill:8000".to_string(), Some(8081))],
+                cold_prefill_urls: vec![],
                 decode_urls: vec!["http://decode:8000".to_string()],
                 prefill_policy: None,
                 decode_policy: None,
@@ -681,6 +684,7 @@ mod tests {
         let config = RouterConfig::new(
             RoutingMode::PrefillDecode {
                 prefill_urls: vec![("http://prefill:8000".to_string(), None)],
+                cold_prefill_urls: vec![],
                 decode_urls: vec!["http://decode:8000".to_string()],
                 prefill_policy: None,
                 decode_policy: None,
@@ -698,6 +702,7 @@ mod tests {
         let config = RouterConfig::new(
             RoutingMode::PrefillDecode {
                 prefill_urls: vec![("http://prefill:8000".to_string(), None)],
+                cold_prefill_urls: vec![],
                 decode_urls: vec!["http://decode:8000".to_string()],
                 prefill_policy: None,
                 decode_policy: None,
@@ -743,6 +748,7 @@ mod tests {
                     ("http://prefill1:8000".to_string(), None),
                     ("http://prefill2:8000".to_string(), None),
                 ],
+                cold_prefill_urls: vec![],
                 decode_urls: vec![
                     "http://decode1:8000".to_string(),
                     "http://decode2:8000".to_string(),
@@ -771,6 +777,7 @@ mod tests {
         let config = RouterConfig::new(
             RoutingMode::PrefillDecode {
                 prefill_urls: vec![("http://prefill1:8000".to_string(), None)], // Only 1 prefill
+                cold_prefill_urls: vec![],
                 decode_urls: vec![
                     "http://decode1:8000".to_string(),
                     "http://decode2:8000".to_string(),

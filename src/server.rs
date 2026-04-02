@@ -592,6 +592,7 @@ async fn list_workers_rest(
                     "worker_type": match worker.worker_type() {
                         WorkerType::Regular => "regular",
                         WorkerType::Prefill { .. } => "prefill",
+                        WorkerType::ColdPrefill { .. } => "cold_prefill",
                         WorkerType::Decode => "decode",
                     },
                     "is_healthy": worker.is_healthy(),
@@ -602,8 +603,12 @@ async fn list_workers_rest(
                 });
 
                 // Add bootstrap_port for Prefill workers
-                if let WorkerType::Prefill { bootstrap_port } = worker.worker_type() {
-                    worker_info["bootstrap_port"] = serde_json::json!(bootstrap_port);
+                match worker.worker_type() {
+                    WorkerType::Prefill { bootstrap_port }
+                    | WorkerType::ColdPrefill { bootstrap_port } => {
+                        worker_info["bootstrap_port"] = serde_json::json!(bootstrap_port);
+                    }
+                    _ => {}
                 }
 
                 worker_info
@@ -923,6 +928,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
 
             // 2. HTTP PD Router
             match RouterFactory::create_pd_router(
+                &[],
                 &[],
                 &[],
                 None,

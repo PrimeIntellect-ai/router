@@ -240,6 +240,20 @@ impl WorkerRegistry {
             .collect()
     }
 
+    /// Get all cold prefill workers (regardless of bootstrap_port)
+    pub fn get_cold_prefill_workers(&self) -> Vec<Arc<dyn Worker>> {
+        self.workers
+            .iter()
+            .filter_map(|entry| {
+                let worker = entry.value();
+                match worker.worker_type() {
+                    WorkerType::ColdPrefill { .. } => Some(worker.clone()),
+                    _ => None,
+                }
+            })
+            .collect()
+    }
+
     /// Get all decode workers
     pub fn get_decode_workers(&self) -> Vec<Arc<dyn Worker>> {
         self.get_by_type(&WorkerType::Decode)
@@ -416,7 +430,9 @@ impl WorkerRegistry {
 
             match worker.worker_type() {
                 WorkerType::Regular => regular_count += 1,
-                WorkerType::Prefill { .. } => prefill_count += 1,
+                WorkerType::Prefill { .. } | WorkerType::ColdPrefill { .. } => {
+                    prefill_count += 1
+                }
                 WorkerType::Decode => decode_count += 1,
             }
         }

@@ -154,6 +154,7 @@ impl Router {
         } else if self.vllm_pd_disaggregation {
             RoutingMode::VllmPrefillDecode {
                 prefill_urls: self.prefill_urls.clone().unwrap_or_default(),
+                cold_prefill_urls: vec![],
                 decode_urls: self.decode_urls.clone().unwrap_or_default(),
                 prefill_policy: self.prefill_policy.as_ref().map(convert_policy),
                 decode_policy: self.decode_policy.as_ref().map(convert_policy),
@@ -162,6 +163,7 @@ impl Router {
         } else if self.pd_disaggregation {
             RoutingMode::PrefillDecode {
                 prefill_urls: self.prefill_urls.clone().unwrap_or_default(),
+                cold_prefill_urls: vec![],
                 decode_urls: self.decode_urls.clone().unwrap_or_default(),
                 prefill_policy: self.prefill_policy.as_ref().map(convert_policy),
                 decode_policy: self.decode_policy.as_ref().map(convert_policy),

@@ -1726,6 +1726,7 @@ mod pd_mode_tests {
         let config = RouterConfig {
             mode: RoutingMode::PrefillDecode {
                 prefill_urls: vec![(prefill_url, Some(prefill_port))],
+                cold_prefill_urls: vec![],
                 decode_urls: vec![decode_url],
                 prefill_policy: None,
                 decode_policy: None,

@@ -31,6 +31,7 @@ impl RouterFactory {
                         decode_urls,
                         prefill_policy,
                         decode_policy,
+                        ..
                     } => {
                         Self::create_grpc_pd_router(
                             prefill_urls,
@@ -42,13 +43,9 @@ impl RouterFactory {
                         )
                         .await
                     }
-                    RoutingMode::VllmPrefillDecode {
-                        prefill_urls: _,
-                        decode_urls: _,
-                        prefill_policy: _,
-                        decode_policy: _,
-                        discovery_address: _,
-                    } => Err("vLLM PD mode requires HTTP connection_mode".to_string()),
+                    RoutingMode::VllmPrefillDecode { .. } => {
+                        Err("vLLM PD mode requires HTTP connection_mode".to_string())
+                    }
                     RoutingMode::OpenAI { .. } => {
                         Err("OpenAI mode requires HTTP connection_mode".to_string())
                     }
@@ -62,17 +59,20 @@ impl RouterFactory {
                     }
                     RoutingMode::PrefillDecode {
                         prefill_urls,
+                        cold_prefill_urls,
                         decode_urls,
                         prefill_policy,
                         decode_policy,
                     } => {
                         tracing::info!(
-                            "Creating regular PDRouter with prefill_urls: {:?}, decode_urls: {:?}",
+                            "Creating regular PDRouter with prefill_urls: {:?}, cold_prefill_urls: {:?}, decode_urls: {:?}",
                             prefill_urls,
+                            cold_prefill_urls,
                             decode_urls
                         );
                         Self::create_pd_router(
                             prefill_urls,
+                            cold_prefill_urls,
                             decode_urls,
                             prefill_policy.as_ref(),
                             decode_policy.as_ref(),
@@ -83,15 +83,17 @@ impl RouterFactory {
                     }
                     RoutingMode::VllmPrefillDecode {
                         prefill_urls,
+                        cold_prefill_urls,
                         decode_urls,
                         prefill_policy,
                         decode_policy,
                         discovery_address,
                     } => {
-                        tracing::info!("Creating VllmPDRouter with prefill_urls: {:?}, decode_urls: {:?}, discovery: {:?}",
-                                      prefill_urls, decode_urls, discovery_address);
+                        tracing::info!("Creating VllmPDRouter with prefill_urls: {:?}, cold_prefill_urls: {:?}, decode_urls: {:?}, discovery: {:?}",
+                                      prefill_urls, cold_prefill_urls, decode_urls, discovery_address);
                         Self::create_vllm_pd_router(
                             prefill_urls,
+                            cold_prefill_urls,
                             decode_urls,
                             discovery_address.clone(),
                             prefill_policy.as_ref(),
@@ -123,6 +125,7 @@ impl RouterFactory {
     /// Create a PD router with injected policy
     pub async fn create_pd_router(
         prefill_urls: &[(String, Option<u16>)],
+        cold_prefill_urls: &[(String, Option<u16>)],
         decode_urls: &[String],
         prefill_policy_config: Option<&PolicyConfig>,
         decode_policy_config: Option<&PolicyConfig>,
@@ -140,7 +143,13 @@ impl RouterFactory {
         ctx.policy_registry.set_decode_policy(decode_policy);
 
         // Create PD router with context (policies are in PolicyRegistry)
-        let router = PDRouter::new(prefill_urls.to_vec(), decode_urls.to_vec(), ctx).await?;
+        let router = PDRouter::new(
+            prefill_urls.to_vec(),
+            cold_prefill_urls.to_vec(),
+            decode_urls.to_vec(),
+            ctx,
+        )
+        .await?;
 
         Ok(Box::new(router))
     }
@@ -148,6 +157,7 @@ impl RouterFactory {
     /// Create a vLLM PD router with service discovery and/or static URLs
     pub async fn create_vllm_pd_router(
         prefill_urls: &[(String, Option<u16>)],
+        cold_prefill_urls: &[(String, Option<u16>)],
         decode_urls: &[String],
         discovery_address: Option<String>,
         prefill_policy_config: Option<&PolicyConfig>,
@@ -182,6 +192,7 @@ impl RouterFactory {
 
         let router = VllmPDRouter::new(
             prefill_urls.to_vec(),
+            cold_prefill_urls.to_vec(),
             decode_urls.to_vec(),
             discovery_address,
             ctx,

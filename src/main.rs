@@ -9,24 +9,32 @@ use vllm_router_rs::metrics::PrometheusConfig;
 use vllm_router_rs::server::{self, ServerConfig};
 use vllm_router_rs::service_discovery::ServiceDiscoveryConfig;
 
-// Helper function to parse prefill arguments from command line
-// Returns prefill_entries with (URL, optional_bootstrap_port)
+/// Parse `--prefill <url> [port]` arguments from the raw command line.
 fn parse_prefill_args() -> Vec<(String, Option<u16>)> {
+    parse_url_port_args("--prefill")
+}
+
+/// Parse `--cold-prefill <url> [port]` arguments from the raw command line.
+fn parse_cold_prefill_args() -> Vec<(String, Option<u16>)> {
+    parse_url_port_args("--cold-prefill")
+}
+
+/// Generic parser for `--flag <url> [port]` repeated arguments.
+fn parse_url_port_args(flag: &str) -> Vec<(String, Option<u16>)> {
     let args: Vec<String> = std::env::args().collect();
-    let mut prefill_entries = Vec::new();
+    let mut entries = Vec::new();
     let mut i = 0;
 
     while i < args.len() {
-        if args[i] == "--prefill" && i + 1 < args.len() {
+        if args[i] == flag && i + 1 < args.len() {
             let url = args[i + 1].clone();
 
             let bootstrap_port = if i + 2 < args.len() && !args[i + 2].starts_with("--") {
-                // Check if next arg is a port number
                 if let Ok(port) = args[i + 2].parse::<u16>() {
-                    i += 1; // Skip the port argument
+                    i += 1;
                     Some(port)
                 } else if args[i + 2].to_lowercase() == "none" {
-                    i += 1; // Skip the "none" argument
+                    i += 1;
                     None
                 } else {
                     None
@@ -34,14 +42,14 @@ fn parse_prefill_args() -> Vec<(String, Option<u16>)> {
             } else {
                 None
             };
-            prefill_entries.push((url, bootstrap_port));
-            i += 2; // Skip --prefill and URL
+            entries.push((url, bootstrap_port));
+            i += 2;
         } else {
             i += 1;
         }
     }
 
-    prefill_entries
+    entries
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -417,6 +425,7 @@ impl CliArgs {
     fn to_router_config(
         &self,
         prefill_urls: Vec<(String, Option<u16>)>,
+        cold_prefill_urls: Vec<(String, Option<u16>)>,
     ) -> ConfigResult<RouterConfig> {
         // Validate mutually exclusive modes
         if self.pd_disaggregation && self.vllm_pd_disaggregation {
@@ -449,6 +458,7 @@ impl CliArgs {
 
             RoutingMode::PrefillDecode {
                 prefill_urls,
+                cold_prefill_urls,
                 decode_urls,
                 prefill_policy: self.prefill_policy.as_ref().map(|p| self.parse_policy(p)),
                 decode_policy: self.decode_policy.as_ref().map(|p| self.parse_policy(p)),
@@ -502,6 +512,7 @@ impl CliArgs {
 
             RoutingMode::VllmPrefillDecode {
                 prefill_urls: prefill_urls.clone(),
+                cold_prefill_urls,
                 decode_urls: final_decode_urls,
                 prefill_policy: self.prefill_policy.as_ref().map(|p| self.parse_policy(p)),
                 decode_policy: self.decode_policy.as_ref().map(|p| self.parse_policy(p)),
@@ -716,12 +727,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenvy::dotenv().ok();
     println!("DEBUG: Main function started");
 
-    // Parse prefill arguments manually before clap parsing
+    // Parse prefill and cold-prefill arguments manually before clap parsing
     println!("DEBUG: Parsing prefill arguments");
     let prefill_urls = parse_prefill_args();
+    let cold_prefill_urls = parse_cold_prefill_args();
     println!("DEBUG: Prefill URLs parsed: {:?}", prefill_urls);
+    println!("DEBUG: Cold prefill URLs parsed: {:?}", cold_prefill_urls);
 
-    // Filter out prefill arguments and their values before passing to clap
+    // Filter out --prefill and --cold-prefill arguments before passing to clap
     println!("DEBUG: Filtering CLI arguments");
     let mut filtered_args: Vec<String> = Vec::new();
     let raw_args: Vec<String> = std::env::args().collect();
@@ -729,8 +742,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut i = 0;
 
     while i < raw_args.len() {
-        if raw_args[i] == "--prefill" && i + 1 < raw_args.len() {
-            // Skip --prefill and its URL
+        if (raw_args[i] == "--prefill" || raw_args[i] == "--cold-prefill")
+            && i + 1 < raw_args.len()
+        {
+            // Skip the flag and its URL
             i += 2;
 
             // Also skip bootstrap port if present
@@ -796,7 +811,7 @@ Provide --worker-urls or PD flags as usual.",
 
     // Convert to RouterConfig
     println!("DEBUG: Converting to RouterConfig");
-    let router_config = cli_args.to_router_config(prefill_urls)?;
+    let router_config = cli_args.to_router_config(prefill_urls, cold_prefill_urls)?;
     println!("DEBUG: RouterConfig created successfully");
 
     // Validate configuration

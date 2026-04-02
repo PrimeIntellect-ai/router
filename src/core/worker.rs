@@ -291,6 +291,11 @@ pub enum WorkerType {
         /// Bootstrap port for communication with decode workers
         bootstrap_port: Option<u16>,
     },
+    /// Cold prefill worker for `is_sub_llm` requests
+    ColdPrefill {
+        /// Bootstrap port for communication with decode workers
+        bootstrap_port: Option<u16>,
+    },
     /// Decode worker for PD disaggregated mode
     Decode,
 }
@@ -302,6 +307,10 @@ impl fmt::Display for WorkerType {
             WorkerType::Prefill { bootstrap_port } => match bootstrap_port {
                 Some(port) => write!(f, "Prefill(bootstrap:{})", port),
                 None => write!(f, "Prefill"),
+            },
+            WorkerType::ColdPrefill { bootstrap_port } => match bootstrap_port {
+                Some(port) => write!(f, "ColdPrefill(bootstrap:{})", port),
+                None => write!(f, "ColdPrefill"),
             },
             WorkerType::Decode => write!(f, "Decode"),
         }
@@ -758,6 +767,26 @@ impl WorkerFactory {
     ) -> Box<dyn Worker> {
         Box::new(
             BasicWorker::new(url, WorkerType::Prefill { bootstrap_port })
+                .with_circuit_breaker_config(circuit_breaker_config),
+        )
+    }
+
+    /// Create a cold prefill worker with optional bootstrap port
+    pub fn create_cold_prefill(url: String, bootstrap_port: Option<u16>) -> Box<dyn Worker> {
+        Box::new(BasicWorker::new(
+            url,
+            WorkerType::ColdPrefill { bootstrap_port },
+        ))
+    }
+
+    /// Create a cold prefill worker with custom circuit breaker configuration
+    pub fn create_cold_prefill_with_config(
+        url: String,
+        bootstrap_port: Option<u16>,
+        circuit_breaker_config: CircuitBreakerConfig,
+    ) -> Box<dyn Worker> {
+        Box::new(
+            BasicWorker::new(url, WorkerType::ColdPrefill { bootstrap_port })
                 .with_circuit_breaker_config(circuit_breaker_config),
         )
     }

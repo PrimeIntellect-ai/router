@@ -1103,6 +1103,7 @@ impl VllmPDRouter {
     /// 2. Direct URL mode: discovery_address is None, prefill_urls and decode_urls are provided
     pub async fn new(
         prefill_urls: Vec<(String, Option<u16>)>,
+        cold_prefill_urls: Vec<(String, Option<u16>)>,
         decode_urls: Vec<String>,
         discovery_address: Option<String>,
         ctx: &Arc<crate::server::AppContext>,
@@ -1115,7 +1116,7 @@ impl VllmPDRouter {
             );
 
             // Create underlying PD router with empty worker lists (they'll be discovered dynamically)
-            let pd_router = PDRouter::new(vec![], vec![], ctx).await?;
+            let pd_router = PDRouter::new(vec![], cold_prefill_urls, vec![], ctx).await?;
 
             // Initialize service discovery
             let mut service_registry = ServiceRegistry::new();
@@ -1148,7 +1149,7 @@ impl VllmPDRouter {
             );
 
             // Create underlying PD router with provided worker lists
-            let pd_router = PDRouter::new(prefill_urls, decode_urls, ctx).await?;
+            let pd_router = PDRouter::new(prefill_urls, cold_prefill_urls, decode_urls, ctx).await?;
 
             // No service discovery in direct URL mode
             let service_registry = ServiceRegistry::new();
@@ -1210,6 +1211,37 @@ impl VllmPDRouter {
     /// Delegates to the underlying PDRouter
     pub async fn remove_decode_server(&self, url: &str) -> Result<String, PDRouterError> {
         self.pd_router.remove_decode_server(url).await
+    }
+
+    /// Select the appropriate prefill worker pool based on request headers.
+    ///
+    /// When the `is_sub_llm: true` header is present and cold-prefill workers are
+    /// configured, returns the cold-prefill pool. Otherwise returns the normal
+    /// prefill pool.
+    fn get_prefill_workers_for_request(
+        &self,
+        headers: Option<&HeaderMap>,
+    ) -> Vec<Arc<dyn Worker>> {
+        let is_sub_llm = headers
+            .and_then(|h| h.get("is_sub_llm"))
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v == "true")
+            .unwrap_or(false);
+
+        if is_sub_llm {
+            let cold = self.pd_router.worker_registry.get_cold_prefill_workers();
+            if !cold.is_empty() {
+                debug!(
+                    "is_sub_llm=true header detected, routing to cold prefill pool ({} workers)",
+                    cold.len()
+                );
+                return cold;
+            }
+            debug!(
+                "is_sub_llm=true header detected but no cold prefill workers configured, falling back to normal prefill pool"
+            );
+        }
+        self.pd_router.worker_registry.get_prefill_workers()
     }
 
     /// Get a reference to the underlying PDRouter's worker registry
@@ -1316,7 +1348,7 @@ impl RouterTrait for VllmPDRouter {
             };
 
             // Get prefill and decode workers from worker_registry
-            let prefill_workers = self.pd_router.worker_registry.get_prefill_workers();
+            let prefill_workers = self.get_prefill_workers_for_request(headers);
             let decode_workers = self.pd_router.worker_registry.get_decode_workers();
 
             info!(
@@ -1389,8 +1421,6 @@ impl RouterTrait for VllmPDRouter {
 
             let prefill_worker = &prefill_workers[prefill_idx];
             let decode_worker = &decode_workers[decode_idx];
-            // Load tracking is handled inside process_vllm_two_stage_request for fine-grained
-            // tracking: prefill load only during prefill phase, decode load only during decode phase.
 
             info!(
                 "Chat: Selected prefill={} [policy:{}], decode={} [policy:{}]",
@@ -1487,7 +1517,7 @@ impl RouterTrait for VllmPDRouter {
             };
 
             // Get prefill and decode workers from worker_registry
-            let prefill_workers = self.pd_router.worker_registry.get_prefill_workers();
+            let prefill_workers = self.get_prefill_workers_for_request(headers);
             let decode_workers = self.pd_router.worker_registry.get_decode_workers();
 
             info!(
@@ -1560,8 +1590,6 @@ impl RouterTrait for VllmPDRouter {
 
             let prefill_worker = &prefill_workers[prefill_idx];
             let decode_worker = &decode_workers[decode_idx];
-            // Load tracking is handled inside process_vllm_two_stage_request for fine-grained
-            // tracking: prefill load only during prefill phase, decode load only during decode phase.
 
             info!(
                 "Completion: Selected prefill={} [policy:{}], decode={} [policy:{}]",
@@ -1694,7 +1722,7 @@ impl RouterTrait for VllmPDRouter {
             self.process_vllm_request(request_json, path, headers).await
         } else {
             // Direct URL mode - use worker registry, filtered by availability
-            let all_prefill = self.pd_router.worker_registry.get_prefill_workers();
+            let all_prefill = self.get_prefill_workers_for_request(headers);
             let prefill_workers: Vec<Arc<dyn Worker>> = all_prefill
                 .iter()
                 .filter(|w| w.is_available())
