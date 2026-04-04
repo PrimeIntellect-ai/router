@@ -548,27 +548,18 @@ impl Router {
         Some(available[idx].clone())
     }
 
-    /// Internal header name used to pass the run_id from JWT auth to the
-    /// response handler for usage tracking. Set by server.rs after JWT
-    /// verification, stripped before forwarding to the worker.
-    pub const RUN_ID_HEADER: &'static str = "x-prime-internal-run-id";
-
     pub async fn route_typed_request<T: GenerationRequest + serde::Serialize + Clone>(
         &self,
         headers: Option<&HeaderMap>,
         typed_req: &T,
         route: &str,
         model_id: Option<&str>,
+        run_id: Option<&str>,
     ) -> Response {
         let start = Instant::now();
         let is_stream = typed_req.is_stream();
         let text = typed_req.extract_text_for_routing();
-
-        // Extract run_id from internal header (set by server.rs after JWT auth)
-        let run_id = headers
-            .and_then(|h| h.get(Self::RUN_ID_HEADER))
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
+        let run_id = run_id.map(|s| s.to_string());
 
         let response = RetryExecutor::execute_response_with_retry(
             &self.retry_config,
@@ -869,7 +860,6 @@ impl Router {
             for (name, value) in headers {
                 if *name != CONTENT_TYPE
                     && *name != CONTENT_LENGTH
-                    && !name.as_str().eq_ignore_ascii_case(Self::RUN_ID_HEADER)
                     && !header_utils::TRACE_HEADER_NAMES
                         .iter()
                         .any(|&th| name.as_str().eq_ignore_ascii_case(th))
@@ -1504,8 +1494,9 @@ impl RouterTrait for Router {
         headers: Option<&HeaderMap>,
         body: &GenerateRequest,
         model_id: Option<&str>,
+        run_id: Option<&str>,
     ) -> Response {
-        self.route_typed_request(headers, body, "/generate", model_id)
+        self.route_typed_request(headers, body, "/generate", model_id, run_id)
             .await
     }
 
@@ -1514,8 +1505,9 @@ impl RouterTrait for Router {
         headers: Option<&HeaderMap>,
         body: &ChatCompletionRequest,
         model_id: Option<&str>,
+        run_id: Option<&str>,
     ) -> Response {
-        self.route_typed_request(headers, body, "/v1/chat/completions", model_id)
+        self.route_typed_request(headers, body, "/v1/chat/completions", model_id, run_id)
             .await
     }
 
@@ -1524,8 +1516,9 @@ impl RouterTrait for Router {
         headers: Option<&HeaderMap>,
         body: &CompletionRequest,
         model_id: Option<&str>,
+        run_id: Option<&str>,
     ) -> Response {
-        self.route_typed_request(headers, body, "/v1/completions", model_id)
+        self.route_typed_request(headers, body, "/v1/completions", model_id, run_id)
             .await
     }
 
@@ -1534,8 +1527,9 @@ impl RouterTrait for Router {
         headers: Option<&HeaderMap>,
         body: &ResponsesRequest,
         model_id: Option<&str>,
+        run_id: Option<&str>,
     ) -> Response {
-        self.route_typed_request(headers, body, "/v1/responses", model_id)
+        self.route_typed_request(headers, body, "/v1/responses", model_id, run_id)
             .await
     }
 
@@ -1558,7 +1552,7 @@ impl RouterTrait for Router {
         // Record embeddings-specific metrics in addition to general request metrics
         let start = Instant::now();
         let res = self
-            .route_typed_request(headers, body, "/v1/embeddings", model_id)
+            .route_typed_request(headers, body, "/v1/embeddings", model_id, None)
             .await;
 
         // Embedding specific metrics
@@ -1583,7 +1577,7 @@ impl RouterTrait for Router {
             return (StatusCode::BAD_REQUEST, e).into_response();
         }
         let response = self
-            .route_typed_request(headers, body, "/v1/rerank", model_id)
+            .route_typed_request(headers, body, "/v1/rerank", model_id, None)
             .await;
         if response.status().is_success() {
             match Self::build_rerank_response(body, response).await {

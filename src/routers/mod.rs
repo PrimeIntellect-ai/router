@@ -70,6 +70,7 @@ pub trait RouterTrait: Send + Sync + Debug + WorkerManagement {
         headers: Option<&HeaderMap>,
         body: &GenerateRequest,
         model_id: Option<&str>,
+        run_id: Option<&str>,
     ) -> Response;
 
     /// Route a chat completion request
@@ -78,6 +79,7 @@ pub trait RouterTrait: Send + Sync + Debug + WorkerManagement {
         headers: Option<&HeaderMap>,
         body: &ChatCompletionRequest,
         model_id: Option<&str>,
+        run_id: Option<&str>,
     ) -> Response;
 
     /// Route a completion request
@@ -86,6 +88,7 @@ pub trait RouterTrait: Send + Sync + Debug + WorkerManagement {
         headers: Option<&HeaderMap>,
         body: &CompletionRequest,
         model_id: Option<&str>,
+        run_id: Option<&str>,
     ) -> Response;
 
     /// Route a responses request
@@ -94,6 +97,7 @@ pub trait RouterTrait: Send + Sync + Debug + WorkerManagement {
         headers: Option<&HeaderMap>,
         body: &ResponsesRequest,
         model_id: Option<&str>,
+        run_id: Option<&str>,
     ) -> Response;
 
     /// Retrieve a stored/background response by id

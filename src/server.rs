@@ -252,67 +252,61 @@ async fn get_model_info(State(state): State<Arc<AppState>>, req: Request) -> Res
     state.router.get_model_info(req).await
 }
 
-/// Inject the run_id from JWT claims into the request headers as an internal
-/// header. The router reads this to track per-run token usage and strips it
-/// before forwarding to the worker.
-fn inject_run_id(headers: &mut http::HeaderMap, claims: &Option<RftClaims>) {
-    if let Some(claims) = claims {
-        if let Ok(value) = http::HeaderValue::from_str(&claims.run_id) {
-            headers.insert(
-                crate::routers::http::router::Router::RUN_ID_HEADER,
-                value,
-            );
-        }
-    }
+/// Extract the run_id from JWT claims for passing to the router.
+fn run_id_from_claims(claims: &Option<RftClaims>) -> Option<String> {
+    claims.as_ref().map(|c| c.run_id.clone())
 }
 
 // Generation endpoints
 // The RouterTrait now accepts optional headers and typed body directly
 async fn generate(
     State(state): State<Arc<AppState>>,
-    mut headers: http::HeaderMap,
+    headers: http::HeaderMap,
     Json(body): Json<GenerateRequest>,
 ) -> Response {
     let claims = match authorize_request(&state, &headers).await {
         Ok(c) => c,
         Err(response) => return response,
     };
-    inject_run_id(&mut headers, &claims);
+    let run_id = run_id_from_claims(&claims);
 
     state
         .router
-        .route_generate(Some(&headers), &body, None)
+        .route_generate(Some(&headers), &body, None, run_id.as_deref())
         .await
 }
 
 async fn v1_chat_completions(
     State(state): State<Arc<AppState>>,
-    mut headers: http::HeaderMap,
+    headers: http::HeaderMap,
     Json(body): Json<ChatCompletionRequest>,
 ) -> Response {
     let claims = match authorize_request(&state, &headers).await {
         Ok(c) => c,
         Err(response) => return response,
     };
-    inject_run_id(&mut headers, &claims);
+    let run_id = run_id_from_claims(&claims);
 
-    state.router.route_chat(Some(&headers), &body, None).await
+    state
+        .router
+        .route_chat(Some(&headers), &body, None, run_id.as_deref())
+        .await
 }
 
 async fn v1_completions(
     State(state): State<Arc<AppState>>,
-    mut headers: http::HeaderMap,
+    headers: http::HeaderMap,
     Json(body): Json<CompletionRequest>,
 ) -> Response {
     let claims = match authorize_request(&state, &headers).await {
         Ok(c) => c,
         Err(response) => return response,
     };
-    inject_run_id(&mut headers, &claims);
+    let run_id = run_id_from_claims(&claims);
 
     state
         .router
-        .route_completion(Some(&headers), &body, None)
+        .route_completion(Some(&headers), &body, None, run_id.as_deref())
         .await
 }
 

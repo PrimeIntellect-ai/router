@@ -1252,8 +1252,9 @@ impl RouterTrait for VllmPDRouter {
         headers: Option<&HeaderMap>,
         body: &crate::protocols::spec::GenerateRequest,
         model_id: Option<&str>,
+        _run_id: Option<&str>,
     ) -> Response {
-        self.pd_router.route_generate(headers, body, model_id).await
+        self.pd_router.route_generate(headers, body, model_id, _run_id).await
     }
 
     // Override OpenAI-compatible routes for vLLM two-stage processing
@@ -1262,6 +1263,7 @@ impl RouterTrait for VllmPDRouter {
         headers: Option<&HeaderMap>,
         body: &crate::protocols::spec::ChatCompletionRequest,
         _model_id: Option<&str>,
+        _run_id: Option<&str>,
     ) -> Response {
         info!(
             "vLLM route_chat called, use_discovery={}",
@@ -1433,6 +1435,7 @@ impl RouterTrait for VllmPDRouter {
         headers: Option<&HeaderMap>,
         body: &crate::protocols::spec::CompletionRequest,
         _model_id: Option<&str>,
+        _run_id: Option<&str>,
     ) -> Response {
         info!(
             "vLLM route_completion called, use_discovery={}",
@@ -1604,6 +1607,7 @@ impl RouterTrait for VllmPDRouter {
         headers: Option<&HeaderMap>,
         body: &crate::protocols::spec::ResponsesRequest,
         _model_id: Option<&str>,
+        _run_id: Option<&str>,
     ) -> Response {
         let request_json = match serde_json::to_value(body) {
             Ok(json) => json,

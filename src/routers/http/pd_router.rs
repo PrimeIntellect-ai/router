@@ -2007,6 +2007,7 @@ impl RouterTrait for PDRouter {
         headers: Option<&HeaderMap>,
         body: &GenerateRequest,
         model_id: Option<&str>,
+        _run_id: Option<&str>,
     ) -> Response {
         // Extract parameters
         let is_stream = body.stream;
@@ -2049,6 +2050,7 @@ impl RouterTrait for PDRouter {
         headers: Option<&HeaderMap>,
         body: &ChatCompletionRequest,
         model_id: Option<&str>,
+        _run_id: Option<&str>,
     ) -> Response {
         // Extract parameters
         let is_stream = body.stream;
@@ -2090,6 +2092,7 @@ impl RouterTrait for PDRouter {
         headers: Option<&HeaderMap>,
         body: &CompletionRequest,
         model_id: Option<&str>,
+        _run_id: Option<&str>,
     ) -> Response {
         // Extract parameters
         let is_stream = body.stream;
@@ -2124,6 +2127,7 @@ impl RouterTrait for PDRouter {
         _headers: Option<&HeaderMap>,
         _body: &ResponsesRequest,
         _model_id: Option<&str>,
+        _run_id: Option<&str>,
     ) -> Response {
         (
             StatusCode::NOT_IMPLEMENTED,
