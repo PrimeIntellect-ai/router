@@ -548,6 +548,11 @@ impl Router {
         Some(available[idx].clone())
     }
 
+    /// Internal header name used to pass the run_id from JWT auth to the
+    /// response handler for usage tracking. Set by server.rs after JWT
+    /// verification, stripped before forwarding to the worker.
+    pub const RUN_ID_HEADER: &'static str = "x-prime-internal-run-id";
+
     pub async fn route_typed_request<T: GenerationRequest + serde::Serialize + Clone>(
         &self,
         headers: Option<&HeaderMap>,
@@ -558,6 +563,12 @@ impl Router {
         let start = Instant::now();
         let is_stream = typed_req.is_stream();
         let text = typed_req.extract_text_for_routing();
+
+        // Extract run_id from internal header (set by server.rs after JWT auth)
+        let run_id = headers
+            .and_then(|h| h.get(Self::RUN_ID_HEADER))
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
 
         let response = RetryExecutor::execute_response_with_retry(
             &self.retry_config,
@@ -605,6 +616,7 @@ impl Router {
                         worker.url(),
                         is_stream,
                         load_incremented,
+                        run_id.as_deref(),
                     )
                     .await;
 
@@ -775,6 +787,28 @@ impl Router {
     }
 
     // Send typed request directly without conversion
+    /// Parse the `usage` field from a vLLM JSON response body and record metrics.
+    fn extract_and_record_usage(run_id: &str, body: &[u8]) {
+        #[derive(serde::Deserialize)]
+        struct UsageOnly {
+            usage: Option<Usage>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Usage {
+            prompt_tokens: Option<u64>,
+            completion_tokens: Option<u64>,
+        }
+        if let Ok(parsed) = serde_json::from_slice::<UsageOnly>(body) {
+            if let Some(usage) = parsed.usage {
+                RouterMetrics::record_run_usage(
+                    run_id,
+                    usage.prompt_tokens.unwrap_or(0),
+                    usage.completion_tokens.unwrap_or(0),
+                );
+            }
+        }
+    }
+
     async fn send_typed_request<T: serde::Serialize>(
         &self,
         headers: Option<&HeaderMap>,
@@ -783,6 +817,7 @@ impl Router {
         worker_url: &str,
         is_stream: bool,
         load_incremented: bool, // Whether load was incremented for this request
+        run_id: Option<&str>,
     ) -> Response {
         let (mut request_builder, extracted_dp_rank, request_url) =
             if self.intra_node_data_parallel_size > 1 {
@@ -834,6 +869,7 @@ impl Router {
             for (name, value) in headers {
                 if *name != CONTENT_TYPE
                     && *name != CONTENT_LENGTH
+                    && !name.as_str().eq_ignore_ascii_case(Self::RUN_ID_HEADER)
                     && !header_utils::TRACE_HEADER_NAMES
                         .iter()
                         .any(|&th| name.as_str().eq_ignore_ascii_case(th))
@@ -892,6 +928,12 @@ impl Router {
 
             let response = match res.bytes().await {
                 Ok(body) => {
+                    // Extract token usage for per-run billing metrics
+                    if let Some(run_id) = run_id {
+                        if status.is_success() {
+                            Self::extract_and_record_usage(run_id, &body);
+                        }
+                    }
                     let mut response = Response::new(axum::body::Body::from(body));
                     *response.status_mut() = status;
                     *response.headers_mut() = response_headers;
