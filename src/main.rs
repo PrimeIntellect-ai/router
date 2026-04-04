@@ -195,6 +195,12 @@ struct CliArgs {
     #[arg(long, num_args = 0..)]
     api_key_validation_urls: Vec<String>,
 
+    /// Path to PEM-encoded RSA public key for JWT verification.
+    /// When set, Bearer tokens are verified as RS256 JWTs and run
+    /// metadata (run_id, user_id) is extracted for usage metrics.
+    #[arg(long)]
+    jwt_public_key_path: Option<String>,
+
     /// Backend to route requests to (vllm, trtllm, openai, anthropic)
     #[arg(long, value_enum, default_value_t = Backend::Vllm, alias = "runtime")]
     backend: Backend,
@@ -592,6 +598,19 @@ impl CliArgs {
             Vec::new()
         };
 
+        // Load JWT public key from file or env var
+        let jwt_public_key = if let Some(path) = &self.jwt_public_key_path {
+            Some(std::fs::read_to_string(path).map_err(|e| {
+                ConfigError::ValidationFailed {
+                    reason: format!("Failed to read JWT public key from {path}: {e}"),
+                }
+            })?)
+        } else if let Ok(pem) = std::env::var("JWT_PUBLIC_KEY") {
+            Some(pem)
+        } else {
+            None
+        };
+
         // Build RouterConfig
         Ok(RouterConfig {
             mode,
@@ -606,6 +625,7 @@ impl CliArgs {
             intra_node_data_parallel_size: self.intra_node_data_parallel_size,
             api_key: self.api_key.clone(),
             api_key_validation_urls,
+            jwt_public_key,
             discovery,
             metrics,
             log_dir: self.log_dir.clone(),

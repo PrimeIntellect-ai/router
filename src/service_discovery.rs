@@ -643,6 +643,7 @@ mod tests {
             response_storage: Arc::new(crate::data_connector::MemoryResponseStorage::new()),
             api_key_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             api_key_validation_urls: Arc::new(Vec::new()),
+            jwt_verifier: None,
         });
 
         let router = Router::new(vec![], &app_context).await.unwrap();

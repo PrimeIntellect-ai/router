@@ -164,6 +164,20 @@ pub fn init_metrics() {
         "Number of running requests per worker"
     );
 
+    // Token usage metrics (per run, for billing)
+    describe_counter!(
+        "vllm_router_run_prompt_tokens_total",
+        "Total prompt tokens by run ID"
+    );
+    describe_counter!(
+        "vllm_router_run_completion_tokens_total",
+        "Total completion tokens by run ID"
+    );
+    describe_counter!(
+        "vllm_router_run_requests_total",
+        "Total requests by run ID"
+    );
+
     // Tokenizer metrics
     describe_histogram!(
         "vllm_tokenizer_encode_duration_seconds",
@@ -441,6 +455,14 @@ impl RouterMetrics {
             "worker" => worker.to_string()
         )
         .increment(1);
+    }
+
+    // Per-run token usage metrics (for billing)
+    pub fn record_run_usage(run_id: &str, prompt_tokens: u64, completion_tokens: u64) {
+        let labels = [("run_id", run_id.to_string())];
+        counter!("vllm_router_run_prompt_tokens_total", &labels).increment(prompt_tokens);
+        counter!("vllm_router_run_completion_tokens_total", &labels).increment(completion_tokens);
+        counter!("vllm_router_run_requests_total", &labels).increment(1);
     }
 
     // Service discovery metrics
