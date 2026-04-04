@@ -778,7 +778,8 @@ impl Router {
     }
 
     // Send typed request directly without conversion
-    /// Parse the `usage` field from a vLLM JSON response body and record metrics.
+    /// Parse the `usage` field from a JSON response body and record per-run metrics.
+    /// Works for both non-streaming (full body) and streaming (SSE chunk) responses.
     fn extract_and_record_usage(run_id: &str, body: &[u8]) {
         #[derive(serde::Deserialize)]
         struct UsageOnly {
@@ -796,6 +797,25 @@ impl Router {
                     usage.prompt_tokens.unwrap_or(0),
                     usage.completion_tokens.unwrap_or(0),
                 );
+            }
+        }
+    }
+
+    /// Scan an SSE chunk for usage data and record per-run metrics.
+    /// SSE chunks contain lines like `data: {...}`. We look for lines that
+    /// contain a `"usage"` field with non-null token counts.
+    fn extract_usage_from_sse_chunk(run_id: &str, bytes: &[u8]) {
+        // Quick check: skip chunks that don't contain usage data
+        if !bytes.windows(7).any(|w| w == b"\"usage\"") {
+            return;
+        }
+        // Parse each SSE data line
+        for line in bytes.split(|&b| b == b'\n') {
+            if let Some(json_data) = line.strip_prefix(b"data: ") {
+                if json_data == b"[DONE]" {
+                    continue;
+                }
+                Self::extract_and_record_usage(run_id, json_data);
             }
         }
     }
@@ -956,6 +976,7 @@ impl Router {
             // For streaming with load tracking, we need to manually decrement when done
             let registry = Arc::clone(&self.worker_registry);
             let worker_url = worker_url.to_string();
+            let stream_run_id = run_id.map(|s| s.to_string());
 
             // Preserve headers for streaming response
             let mut response_headers = header_utils::preserve_response_headers(res.headers());
@@ -972,6 +993,10 @@ impl Router {
                 while let Some(chunk) = stream.next().await {
                     match chunk {
                         Ok(bytes) => {
+                            // Extract per-run usage from streaming chunks
+                            if let Some(ref rid) = stream_run_id {
+                                Self::extract_usage_from_sse_chunk(rid, &bytes);
+                            }
                             // Check for stream end marker
                             if bytes
                                 .as_ref()
@@ -1011,6 +1036,8 @@ impl Router {
             response
         } else {
             // For requests without load tracking, just stream
+            let stream_run_id = run_id.map(|s| s.to_string());
+
             // Preserve headers for streaming response
             let mut response_headers = header_utils::preserve_response_headers(res.headers());
             // Ensure we set the correct content-type for SSE
@@ -1025,6 +1052,10 @@ impl Router {
                 while let Some(chunk) = stream.next().await {
                     match chunk {
                         Ok(bytes) => {
+                            // Extract per-run usage from streaming chunks
+                            if let Some(ref rid) = stream_run_id {
+                                Self::extract_usage_from_sse_chunk(rid, &bytes);
+                            }
                             if tx.send(Ok(bytes)).is_err() {
                                 break;
                             }
