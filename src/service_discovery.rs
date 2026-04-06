@@ -996,35 +996,144 @@ mod tests {
         assert_ne!(pod1, pod3);
     }
 
-    #[tokio::test]
-    async fn test_handle_pod_event_removes_tracked_unhealthy_pod() {
-        let router = create_test_router().await;
-        let tracked_pods = Arc::new(Mutex::new(HashSet::new()));
+    /// Mock router that tracks add/remove calls for testing service discovery
+    /// without needing real backend servers.
+    #[derive(Debug)]
+    struct MockRouter {
+        workers: std::sync::Mutex<Vec<String>>,
+        removed: std::sync::Mutex<Vec<String>>,
+    }
 
-        // Simulate a pod that was previously healthy and tracked
+    impl MockRouter {
+        fn new() -> Self {
+            Self {
+                workers: std::sync::Mutex::new(Vec::new()),
+                removed: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn active_workers(&self) -> Vec<String> {
+            self.workers.lock().unwrap().clone()
+        }
+
+        fn removed_workers(&self) -> Vec<String> {
+            self.removed.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::routers::WorkerManagement for MockRouter {
+        async fn add_worker(&self, worker_url: &str) -> Result<String, String> {
+            self.workers.lock().unwrap().push(worker_url.to_string());
+            Ok(worker_url.to_string())
+        }
+
+        fn remove_worker(&self, worker_url: &str) {
+            self.workers.lock().unwrap().retain(|u| u != worker_url);
+            self.removed.lock().unwrap().push(worker_url.to_string());
+        }
+
+        fn get_worker_urls(&self) -> Vec<String> {
+            self.workers.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::routers::RouterTrait for MockRouter {
+        fn as_any(&self) -> &dyn std::any::Any { self }
+
+        async fn health(&self, _req: axum::extract::Request<axum::body::Body>) -> axum::response::Response {
+            axum::http::StatusCode::OK.into_response()
+        }
+        async fn health_generate(&self, _req: axum::extract::Request<axum::body::Body>) -> axum::response::Response {
+            axum::http::StatusCode::OK.into_response()
+        }
+        async fn get_server_info(&self, _req: axum::extract::Request<axum::body::Body>) -> axum::response::Response {
+            axum::http::StatusCode::OK.into_response()
+        }
+        async fn get_models(&self, _req: axum::extract::Request<axum::body::Body>) -> axum::response::Response {
+            axum::http::StatusCode::OK.into_response()
+        }
+        async fn get_model_info(&self, _req: axum::extract::Request<axum::body::Body>) -> axum::response::Response {
+            axum::http::StatusCode::OK.into_response()
+        }
+        async fn route_generate(&self, _h: Option<&axum::http::HeaderMap>, _b: &crate::protocols::spec::GenerateRequest, _m: Option<&str>) -> axum::response::Response {
+            axum::http::StatusCode::OK.into_response()
+        }
+        async fn route_chat(&self, _h: Option<&axum::http::HeaderMap>, _b: &crate::protocols::spec::ChatCompletionRequest, _m: Option<&str>) -> axum::response::Response {
+            axum::http::StatusCode::OK.into_response()
+        }
+        async fn route_completion(&self, _h: Option<&axum::http::HeaderMap>, _b: &crate::protocols::spec::CompletionRequest, _m: Option<&str>) -> axum::response::Response {
+            axum::http::StatusCode::OK.into_response()
+        }
+        async fn route_responses(&self, _h: Option<&axum::http::HeaderMap>, _b: &crate::protocols::spec::ResponsesRequest, _m: Option<&str>) -> axum::response::Response {
+            axum::http::StatusCode::OK.into_response()
+        }
+        async fn get_response(&self, _h: Option<&axum::http::HeaderMap>, _id: &str) -> axum::response::Response {
+            axum::http::StatusCode::OK.into_response()
+        }
+        async fn cancel_response(&self, _h: Option<&axum::http::HeaderMap>, _id: &str) -> axum::response::Response {
+            axum::http::StatusCode::OK.into_response()
+        }
+        async fn route_embeddings(&self, _h: Option<&axum::http::HeaderMap>, _b: &crate::protocols::spec::EmbeddingRequest, _m: Option<&str>) -> axum::response::Response {
+            axum::http::StatusCode::OK.into_response()
+        }
+        async fn route_rerank(&self, _h: Option<&axum::http::HeaderMap>, _b: &crate::protocols::spec::RerankRequest, _m: Option<&str>) -> axum::response::Response {
+            axum::http::StatusCode::OK.into_response()
+        }
+        async fn flush_cache(&self) -> axum::response::Response {
+            axum::http::StatusCode::OK.into_response()
+        }
+        async fn get_worker_loads(&self) -> axum::response::Response {
+            axum::http::StatusCode::OK.into_response()
+        }
+        fn router_type(&self) -> &'static str { "mock" }
+        fn readiness(&self) -> axum::response::Response {
+            axum::http::StatusCode::OK.into_response()
+        }
+    }
+
+    use axum::response::IntoResponse;
+
+    /// Tests the full lifecycle: healthy pod is added, then becomes unhealthy and is removed.
+    /// Verifies both the tracked_pods set and the actual router state.
+    #[tokio::test]
+    async fn test_healthy_pod_added_then_removed_when_unhealthy() {
+        let router = Arc::new(MockRouter::new()) as Arc<dyn crate::routers::RouterTrait>;
+        let tracked_pods = Arc::new(Mutex::new(HashSet::new()));
+        let port = 8080u16;
+
+        // Step 1: A healthy pod appears — should be added to the router
         let healthy_pod = PodInfo {
-            name: "pod1".into(),
-            ip: "1.2.3.4".parse().unwrap(),
+            name: "inference-5".into(),
+            ip: "10.0.0.5".parse().unwrap(),
             status: "Running".into(),
             is_ready: true,
             pod_type: None,
             bootstrap_port: None,
         };
-        {
-            let mut tracker = tracked_pods.lock().unwrap();
-            tracker.insert(healthy_pod.clone());
-        }
 
-        // Now the same pod becomes unhealthy (not ready)
+        handle_pod_event(
+            &healthy_pod,
+            Arc::clone(&tracked_pods),
+            Arc::clone(&router),
+            port,
+            false,
+        )
+        .await;
+
+        assert!(tracked_pods.lock().unwrap().contains(&healthy_pod));
+        assert_eq!(router.get_worker_urls(), vec!["http://10.0.0.5:8080"]);
+
+        // Step 2: The same pod becomes unhealthy (e.g. crash, probe failure)
         let unhealthy_pod = PodInfo {
-            name: "pod1".into(),
-            ip: "1.2.3.4".parse().unwrap(),
+            name: "inference-5".into(),
+            ip: "10.0.0.5".parse().unwrap(),
             status: "Running".into(),
             is_ready: false,
             pod_type: None,
             bootstrap_port: None,
         };
-        let port = 8080u16;
 
         handle_pod_event(
             &unhealthy_pod,
@@ -1035,38 +1144,108 @@ mod tests {
         )
         .await;
 
-        // Pod should have been removed from tracking
-        assert!(!tracked_pods.lock().unwrap().contains(&healthy_pod));
-        assert!(!tracked_pods.lock().unwrap().contains(&unhealthy_pod));
+        // Should be removed from both tracking and the router
+        assert!(tracked_pods.lock().unwrap().is_empty());
+        assert!(router.get_worker_urls().is_empty());
+
+        let mock = router.as_any().downcast_ref::<MockRouter>().unwrap();
+        assert_eq!(mock.removed_workers(), vec!["http://10.0.0.5:8080"]);
     }
 
+    /// Tests that multiple workers are handled independently — only the unhealthy one is removed.
     #[tokio::test]
-    async fn test_handle_pod_event_ignores_untracked_unhealthy_pod() {
-        let router = create_test_router().await;
+    async fn test_unhealthy_removal_does_not_affect_other_workers() {
+        let router = Arc::new(MockRouter::new()) as Arc<dyn crate::routers::RouterTrait>;
         let tracked_pods = Arc::new(Mutex::new(HashSet::new()));
+        let port = 8080u16;
 
-        // An unhealthy pod that was never tracked
-        let unhealthy_pod = PodInfo {
-            name: "pod1".into(),
-            ip: "1.2.3.4".parse().unwrap(),
+        // Add two healthy pods
+        for i in 1..=2 {
+            let pod = PodInfo {
+                name: format!("inference-{}", i),
+                ip: format!("10.0.0.{}", i).parse().unwrap(),
+                status: "Running".into(),
+                is_ready: true,
+                pod_type: None,
+                bootstrap_port: None,
+            };
+            handle_pod_event(&pod, Arc::clone(&tracked_pods), Arc::clone(&router), port, false).await;
+        }
+
+        assert_eq!(router.get_worker_urls().len(), 2);
+
+        // Pod 1 becomes unhealthy
+        let unhealthy = PodInfo {
+            name: "inference-1".into(),
+            ip: "10.0.0.1".parse().unwrap(),
+            status: "Running".into(),
+            is_ready: false,
+            pod_type: None,
+            bootstrap_port: None,
+        };
+        handle_pod_event(&unhealthy, Arc::clone(&tracked_pods), Arc::clone(&router), port, false).await;
+
+        // Only pod 2 should remain
+        assert_eq!(router.get_worker_urls(), vec!["http://10.0.0.2:8080"]);
+        assert_eq!(tracked_pods.lock().unwrap().len(), 1);
+    }
+
+    /// Tests that an unhealthy pod that was never tracked doesn't trigger a removal.
+    #[tokio::test]
+    async fn test_unhealthy_untracked_pod_is_ignored() {
+        let router = Arc::new(MockRouter::new()) as Arc<dyn crate::routers::RouterTrait>;
+        let tracked_pods = Arc::new(Mutex::new(HashSet::new()));
+        let port = 8080u16;
+
+        let unhealthy = PodInfo {
+            name: "inference-1".into(),
+            ip: "10.0.0.1".parse().unwrap(),
             status: "Pending".into(),
             is_ready: false,
             pod_type: None,
             bootstrap_port: None,
         };
+        handle_pod_event(&unhealthy, Arc::clone(&tracked_pods), Arc::clone(&router), port, false).await;
+
+        assert!(tracked_pods.lock().unwrap().is_empty());
+        assert!(router.get_worker_urls().is_empty());
+        let mock = router.as_any().downcast_ref::<MockRouter>().unwrap();
+        assert!(mock.removed_workers().is_empty());
+    }
+
+    /// Tests that a pod can recover: unhealthy → healthy re-adds it to the router.
+    #[tokio::test]
+    async fn test_pod_recovery_readds_worker() {
+        let router = Arc::new(MockRouter::new()) as Arc<dyn crate::routers::RouterTrait>;
+        let tracked_pods = Arc::new(Mutex::new(HashSet::new()));
         let port = 8080u16;
 
-        handle_pod_event(
-            &unhealthy_pod,
-            Arc::clone(&tracked_pods),
-            Arc::clone(&router),
-            port,
-            false,
-        )
-        .await;
+        let healthy = PodInfo {
+            name: "inference-1".into(),
+            ip: "10.0.0.1".parse().unwrap(),
+            status: "Running".into(),
+            is_ready: true,
+            pod_type: None,
+            bootstrap_port: None,
+        };
+        let unhealthy = PodInfo {
+            name: "inference-1".into(),
+            ip: "10.0.0.1".parse().unwrap(),
+            status: "Running".into(),
+            is_ready: false,
+            pod_type: None,
+            bootstrap_port: None,
+        };
 
-        // Nothing should happen - tracked set remains empty
-        assert!(tracked_pods.lock().unwrap().is_empty());
+        // healthy → unhealthy → healthy again
+        handle_pod_event(&healthy, Arc::clone(&tracked_pods), Arc::clone(&router), port, false).await;
+        assert_eq!(router.get_worker_urls().len(), 1);
+
+        handle_pod_event(&unhealthy, Arc::clone(&tracked_pods), Arc::clone(&router), port, false).await;
+        assert!(router.get_worker_urls().is_empty());
+
+        handle_pod_event(&healthy, Arc::clone(&tracked_pods), Arc::clone(&router), port, false).await;
+        assert_eq!(router.get_worker_urls(), vec!["http://10.0.0.1:8080"]);
     }
 
     #[tokio::test]
