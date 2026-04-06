@@ -84,12 +84,6 @@ pub struct RouterConfig {
     /// Profiling timeout in seconds (for vLLM profiling endpoints)
     #[serde(default = "default_profile_timeout_secs")]
     pub profile_timeout_secs: u64,
-    /// Platform usage reporting URL (e.g. https://api.primeintellect.ai/api/internal/rft/usage).
-    /// When set together with `usage_report_api_key`, the router will periodically
-    /// POST accumulated inference token counts to this endpoint.
-    pub usage_report_url: Option<String>,
-    /// API key for usage reporting (sent as X-Api-Key header).
-    pub usage_report_api_key: Option<String>,
 }
 
 fn default_profile_timeout_secs() -> u64 {
@@ -497,8 +491,6 @@ impl Default for RouterConfig {
             history_backend: default_history_backend(),
             enable_profiling: false,
             profile_timeout_secs: default_profile_timeout_secs(),
-            usage_report_url: None,
-            usage_report_api_key: None,
         }
     }
 }
@@ -1071,8 +1063,6 @@ mod tests {
             history_backend: default_history_backend(),
             enable_profiling: false,
             profile_timeout_secs: default_profile_timeout_secs(),
-            usage_report_url: None,
-            usage_report_api_key: None,
         };
 
         assert!(config.mode.is_pd_mode());
@@ -1141,8 +1131,6 @@ mod tests {
             history_backend: default_history_backend(),
             enable_profiling: false,
             profile_timeout_secs: default_profile_timeout_secs(),
-            usage_report_url: None,
-            usage_report_api_key: None,
         };
 
         assert!(!config.mode.is_pd_mode());
@@ -1207,8 +1195,6 @@ mod tests {
             history_backend: default_history_backend(),
             enable_profiling: false,
             profile_timeout_secs: default_profile_timeout_secs(),
-            usage_report_url: None,
-            usage_report_api_key: None,
         };
 
         assert!(config.has_service_discovery());

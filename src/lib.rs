@@ -19,7 +19,6 @@ pub mod server;
 pub mod service_discovery;
 pub mod tokenizer;
 pub mod tree;
-pub mod usage_reporter;
 use crate::metrics::PrometheusConfig;
 
 #[pyclass(eq)]
@@ -254,8 +253,6 @@ impl Router {
             history_backend: config::HistoryBackend::Memory,
             enable_profiling: false, // Profiling disabled in Python binding by default
             profile_timeout_secs: 10, // Default profiling timeout
-            usage_report_url: None,
-            usage_report_api_key: None,
         })
     }
 }

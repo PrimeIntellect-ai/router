@@ -7,7 +7,6 @@ use crate::core::{
 use crate::metrics::RouterMetrics;
 use crate::otel_http::{self, ClientRequestOptions};
 use crate::policies::{LoadBalancingPolicy, PolicyRegistry};
-use crate::usage_reporter::UsageReporter;
 use crate::protocols::spec::{
     ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, GenerationRequest,
     RerankRequest, RerankResponse, RerankResult, ResponsesRequest,
@@ -793,10 +792,11 @@ impl Router {
         }
         if let Ok(parsed) = serde_json::from_slice::<UsageOnly>(body) {
             if let Some(usage) = parsed.usage {
-                let prompt = usage.prompt_tokens.unwrap_or(0);
-                let completion = usage.completion_tokens.unwrap_or(0);
-                RouterMetrics::record_run_usage(run_id, prompt, completion);
-                UsageReporter::record_global(run_id, prompt, completion);
+                RouterMetrics::record_run_usage(
+                    run_id,
+                    usage.prompt_tokens.unwrap_or(0),
+                    usage.completion_tokens.unwrap_or(0),
+                );
             }
         }
     }
