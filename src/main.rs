@@ -369,6 +369,17 @@ struct CliArgs {
     /// Enable profiling calls to vLLM workers
     #[arg(long, default_value_t = false)]
     profile: bool,
+
+    /// Platform usage reporting URL. When set, the router periodically reports
+    /// inference token usage to this endpoint (e.g. https://api.primeintellect.ai/api/internal/rft/usage).
+    /// Falls back to USAGE_REPORT_URL env var.
+    #[arg(long)]
+    usage_report_url: Option<String>,
+
+    /// API key for usage reporting (sent as X-Api-Key header).
+    /// Falls back to USAGE_REPORT_API_KEY env var.
+    #[arg(long)]
+    usage_report_api_key: Option<String>,
 }
 
 impl CliArgs {
@@ -611,6 +622,16 @@ impl CliArgs {
             None
         };
 
+        // Usage reporting config (CLI args or env vars)
+        let usage_report_url = self
+            .usage_report_url
+            .clone()
+            .or_else(|| std::env::var("USAGE_REPORT_URL").ok());
+        let usage_report_api_key = self
+            .usage_report_api_key
+            .clone()
+            .or_else(|| std::env::var("USAGE_REPORT_API_KEY").ok());
+
         // Build RouterConfig
         Ok(RouterConfig {
             mode,
@@ -671,6 +692,8 @@ impl CliArgs {
             },
             enable_profiling: self.profile,
             profile_timeout_secs: 10, // Default profiling timeout
+            usage_report_url,
+            usage_report_api_key,
         })
     }
 

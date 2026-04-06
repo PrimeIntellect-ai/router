@@ -1,6 +1,7 @@
 use crate::{
     auth::{JwtVerifier, RftClaims},
     config::{ConnectionMode, HistoryBackend, RouterConfig, TraceConfig},
+    usage_reporter::{UsageReporter, UsageReporterConfig},
     core::{WorkerRegistry, WorkerType},
     data_connector::{MemoryResponseStorage, NoOpResponseStorage, SharedResponseStorage},
     logging::{self, LoggingConfig},
@@ -111,6 +112,24 @@ impl AppContext {
 
         if jwt_verifier.is_some() {
             info!("JWT verification enabled for Bearer tokens");
+        }
+
+        // Initialize global usage reporter if configured
+        match (
+            &router_config.usage_report_url,
+            &router_config.usage_report_api_key,
+        ) {
+            (Some(url), Some(api_key)) => {
+                UsageReporter::set_global(UsageReporter::new(UsageReporterConfig {
+                    url: url.clone(),
+                    api_key: api_key.clone(),
+                    flush_interval: Duration::from_secs(30),
+                }));
+            }
+            (Some(_), None) => {
+                warn!("usage_report_url set but usage_report_api_key missing — usage reporting disabled");
+            }
+            _ => {}
         }
 
         Ok(Self {
