@@ -471,51 +471,59 @@ async fn handle_pod_event(
                 "Removing unhealthy pod: {} | type: {:?} | status: {} ready: {} | url: {}",
                 pod_info.name, pod_info.pod_type, pod_info.status, pod_info.is_ready, worker_url
             );
-
-            // Reuse the same PD-aware removal logic as handle_pod_deletion
-            if pd_mode && pod_info.pod_type.is_some() {
-                use crate::routers::http::pd_router::PDRouter;
-                use crate::routers::http::vllm_pd_router::VllmPDRouter;
-
-                if let Some(pd_router) = router.as_any().downcast_ref::<PDRouter>() {
-                    match &pod_info.pod_type {
-                        Some(PodType::Prefill) => {
-                            if let Err(e) = pd_router.remove_prefill_server(&worker_url).await {
-                                error!("Failed to remove unhealthy prefill server {}: {}", worker_url, e);
-                            }
-                        }
-                        Some(PodType::Decode) => {
-                            if let Err(e) = pd_router.remove_decode_server(&worker_url).await {
-                                error!("Failed to remove unhealthy decode server {}: {}", worker_url, e);
-                            }
-                        }
-                        Some(PodType::Regular) | None => {
-                            router.remove_worker(&worker_url);
-                        }
-                    }
-                } else if let Some(vllm_pd_router) = router.as_any().downcast_ref::<VllmPDRouter>() {
-                    match &pod_info.pod_type {
-                        Some(PodType::Prefill) => {
-                            if let Err(e) = vllm_pd_router.remove_prefill_server(&worker_url).await {
-                                error!("Failed to remove unhealthy vllm prefill server {}: {}", worker_url, e);
-                            }
-                        }
-                        Some(PodType::Decode) => {
-                            if let Err(e) = vllm_pd_router.remove_decode_server(&worker_url).await {
-                                error!("Failed to remove unhealthy vllm decode server {}: {}", worker_url, e);
-                            }
-                        }
-                        Some(PodType::Regular) | None => {
-                            router.remove_worker(&worker_url);
-                        }
-                    }
-                } else {
-                    router.remove_worker(&worker_url);
-                }
-            } else {
-                router.remove_worker(&worker_url);
-            }
+            remove_worker_from_router(pod_info, &worker_url, &router, pd_mode).await;
         }
+    }
+}
+
+/// Removes a worker from the router, handling PD-aware routing modes.
+async fn remove_worker_from_router(
+    pod_info: &PodInfo,
+    worker_url: &str,
+    router: &Arc<dyn RouterTrait>,
+    pd_mode: bool,
+) {
+    if pd_mode && pod_info.pod_type.is_some() {
+        use crate::routers::http::pd_router::PDRouter;
+        use crate::routers::http::vllm_pd_router::VllmPDRouter;
+
+        if let Some(pd_router) = router.as_any().downcast_ref::<PDRouter>() {
+            match &pod_info.pod_type {
+                Some(PodType::Prefill) => {
+                    if let Err(e) = pd_router.remove_prefill_server(worker_url).await {
+                        error!("Failed to remove prefill server {}: {}", worker_url, e);
+                    }
+                }
+                Some(PodType::Decode) => {
+                    if let Err(e) = pd_router.remove_decode_server(worker_url).await {
+                        error!("Failed to remove decode server {}: {}", worker_url, e);
+                    }
+                }
+                Some(PodType::Regular) | None => {
+                    router.remove_worker(worker_url);
+                }
+            }
+        } else if let Some(vllm_pd_router) = router.as_any().downcast_ref::<VllmPDRouter>() {
+            match &pod_info.pod_type {
+                Some(PodType::Prefill) => {
+                    if let Err(e) = vllm_pd_router.remove_prefill_server(worker_url).await {
+                        error!("Failed to remove vllm prefill server {}: {}", worker_url, e);
+                    }
+                }
+                Some(PodType::Decode) => {
+                    if let Err(e) = vllm_pd_router.remove_decode_server(worker_url).await {
+                        error!("Failed to remove vllm decode server {}: {}", worker_url, e);
+                    }
+                }
+                Some(PodType::Regular) | None => {
+                    router.remove_worker(worker_url);
+                }
+            }
+        } else {
+            router.remove_worker(worker_url);
+        }
+    } else {
+        router.remove_worker(worker_url);
     }
 }
 
@@ -544,57 +552,7 @@ async fn handle_pod_deletion(
             "Removing pod: {} | type: {:?} | url: {}",
             pod_info.name, pod_info.pod_type, worker_url
         );
-
-        // Handle PD mode removal
-        if pd_mode && pod_info.pod_type.is_some() {
-            // Import both PD router types
-            use crate::routers::http::pd_router::PDRouter;
-            use crate::routers::http::vllm_pd_router::VllmPDRouter;
-
-            // Try to downcast to PDRouter first, then VllmPDRouter
-            if let Some(pd_router) = router.as_any().downcast_ref::<PDRouter>() {
-                match &pod_info.pod_type {
-                    Some(PodType::Prefill) => {
-                        if let Err(e) = pd_router.remove_prefill_server(&worker_url).await {
-                            error!("Failed to remove prefill server {}: {}", worker_url, e);
-                        }
-                    }
-                    Some(PodType::Decode) => {
-                        if let Err(e) = pd_router.remove_decode_server(&worker_url).await {
-                            error!("Failed to remove decode server {}: {}", worker_url, e);
-                        }
-                    }
-                    Some(PodType::Regular) | None => {
-                        // Fall back to regular remove_worker
-                        router.remove_worker(&worker_url);
-                    }
-                }
-            } else if let Some(vllm_pd_router) = router.as_any().downcast_ref::<VllmPDRouter>() {
-                // Support --vllm-pd-disaggregation mode with K8s service discovery
-                match &pod_info.pod_type {
-                    Some(PodType::Prefill) => {
-                        if let Err(e) = vllm_pd_router.remove_prefill_server(&worker_url).await {
-                            error!("Failed to remove vllm prefill server {}: {}", worker_url, e);
-                        }
-                    }
-                    Some(PodType::Decode) => {
-                        if let Err(e) = vllm_pd_router.remove_decode_server(&worker_url).await {
-                            error!("Failed to remove vllm decode server {}: {}", worker_url, e);
-                        }
-                    }
-                    Some(PodType::Regular) | None => {
-                        // Fall back to regular remove_worker
-                        router.remove_worker(&worker_url);
-                    }
-                }
-            } else {
-                // PD mode but not a PDRouter or VllmPDRouter, use generic removal
-                router.remove_worker(&worker_url);
-            }
-        } else {
-            // Regular mode removal
-            router.remove_worker(&worker_url);
-        }
+        remove_worker_from_router(pod_info, &worker_url, &router, pd_mode).await;
     } else {
         // This case might occur if a pod is deleted before it was ever marked healthy and added.
         // Or if the event is duplicated. No action needed on the router if it wasn't tracked (and thus not added).
