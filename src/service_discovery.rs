@@ -441,6 +441,81 @@ async fn handle_pod_event(
                 }
             }
         }
+    } else {
+        // Pod is NOT healthy — if it was previously tracked, remove it from the router.
+        // This handles the case where a pod becomes unready (e.g. crash, OOM, probe failure)
+        // without being deleted. Without this, the router keeps routing traffic to a dead backend.
+        //
+        // Note: We match by name+ip rather than full PodInfo equality because the tracked set
+        // stores the original (healthy) PodInfo, and fields like is_ready/status will differ.
+        let was_tracked = {
+            let mut tracker = match tracked_pods.lock() {
+                Ok(tracker) => tracker,
+                Err(e) => {
+                    error!("Failed to acquire tracked_pods lock: {}", e);
+                    return;
+                }
+            };
+            let prev = tracker
+                .iter()
+                .find(|p| p.name == pod_info.name && p.ip == pod_info.ip)
+                .cloned();
+            if let Some(ref prev) = prev {
+                tracker.remove(prev);
+            }
+            prev.is_some()
+        };
+
+        if was_tracked {
+            info!(
+                "Removing unhealthy pod: {} | type: {:?} | status: {} ready: {} | url: {}",
+                pod_info.name, pod_info.pod_type, pod_info.status, pod_info.is_ready, worker_url
+            );
+
+            // Reuse the same PD-aware removal logic as handle_pod_deletion
+            if pd_mode && pod_info.pod_type.is_some() {
+                use crate::routers::http::pd_router::PDRouter;
+                use crate::routers::http::vllm_pd_router::VllmPDRouter;
+
+                if let Some(pd_router) = router.as_any().downcast_ref::<PDRouter>() {
+                    match &pod_info.pod_type {
+                        Some(PodType::Prefill) => {
+                            if let Err(e) = pd_router.remove_prefill_server(&worker_url).await {
+                                error!("Failed to remove unhealthy prefill server {}: {}", worker_url, e);
+                            }
+                        }
+                        Some(PodType::Decode) => {
+                            if let Err(e) = pd_router.remove_decode_server(&worker_url).await {
+                                error!("Failed to remove unhealthy decode server {}: {}", worker_url, e);
+                            }
+                        }
+                        Some(PodType::Regular) | None => {
+                            router.remove_worker(&worker_url);
+                        }
+                    }
+                } else if let Some(vllm_pd_router) = router.as_any().downcast_ref::<VllmPDRouter>() {
+                    match &pod_info.pod_type {
+                        Some(PodType::Prefill) => {
+                            if let Err(e) = vllm_pd_router.remove_prefill_server(&worker_url).await {
+                                error!("Failed to remove unhealthy vllm prefill server {}: {}", worker_url, e);
+                            }
+                        }
+                        Some(PodType::Decode) => {
+                            if let Err(e) = vllm_pd_router.remove_decode_server(&worker_url).await {
+                                error!("Failed to remove unhealthy vllm decode server {}: {}", worker_url, e);
+                            }
+                        }
+                        Some(PodType::Regular) | None => {
+                            router.remove_worker(&worker_url);
+                        }
+                    }
+                } else {
+                    router.remove_worker(&worker_url);
+                }
+            } else {
+                router.remove_worker(&worker_url);
+            }
+        }
     }
 }
 
@@ -961,6 +1036,79 @@ mod tests {
 
         assert_eq!(pod1, pod2);
         assert_ne!(pod1, pod3);
+    }
+
+    #[tokio::test]
+    async fn test_handle_pod_event_removes_tracked_unhealthy_pod() {
+        let router = create_test_router().await;
+        let tracked_pods = Arc::new(Mutex::new(HashSet::new()));
+
+        // Simulate a pod that was previously healthy and tracked
+        let healthy_pod = PodInfo {
+            name: "pod1".into(),
+            ip: "1.2.3.4".parse().unwrap(),
+            status: "Running".into(),
+            is_ready: true,
+            pod_type: None,
+            bootstrap_port: None,
+        };
+        {
+            let mut tracker = tracked_pods.lock().unwrap();
+            tracker.insert(healthy_pod.clone());
+        }
+
+        // Now the same pod becomes unhealthy (not ready)
+        let unhealthy_pod = PodInfo {
+            name: "pod1".into(),
+            ip: "1.2.3.4".parse().unwrap(),
+            status: "Running".into(),
+            is_ready: false,
+            pod_type: None,
+            bootstrap_port: None,
+        };
+        let port = 8080u16;
+
+        handle_pod_event(
+            &unhealthy_pod,
+            Arc::clone(&tracked_pods),
+            Arc::clone(&router),
+            port,
+            false,
+        )
+        .await;
+
+        // Pod should have been removed from tracking
+        assert!(!tracked_pods.lock().unwrap().contains(&healthy_pod));
+        assert!(!tracked_pods.lock().unwrap().contains(&unhealthy_pod));
+    }
+
+    #[tokio::test]
+    async fn test_handle_pod_event_ignores_untracked_unhealthy_pod() {
+        let router = create_test_router().await;
+        let tracked_pods = Arc::new(Mutex::new(HashSet::new()));
+
+        // An unhealthy pod that was never tracked
+        let unhealthy_pod = PodInfo {
+            name: "pod1".into(),
+            ip: "1.2.3.4".parse().unwrap(),
+            status: "Pending".into(),
+            is_ready: false,
+            pod_type: None,
+            bootstrap_port: None,
+        };
+        let port = 8080u16;
+
+        handle_pod_event(
+            &unhealthy_pod,
+            Arc::clone(&tracked_pods),
+            Arc::clone(&router),
+            port,
+            false,
+        )
+        .await;
+
+        // Nothing should happen - tracked set remains empty
+        assert!(tracked_pods.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
