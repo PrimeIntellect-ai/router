@@ -663,11 +663,18 @@ impl VllmPDRouter {
                 .await
                 .map_err(|e| format!("Failed to read decode response: {}", e))?;
 
-            // Per-run billing metrics on success.
+            // Per-run billing metrics on success. This branch also
+            // handles `stream=true` requests, in which case the buffered
+            // body is SSE-framed rather than a single JSON object — the
+            // helper picks the right parser.
             if let Some(rid) = run_id {
                 if status.is_success() {
                     usage_metrics::record_run_request(rid);
-                    usage_metrics::extract_and_record_usage(rid, &decode_body);
+                    usage_metrics::extract_and_record_usage_buffered(
+                        rid,
+                        &decode_body,
+                        is_streaming,
+                    );
                 }
             }
 
@@ -1092,11 +1099,18 @@ impl VllmPDRouter {
                         ),
                     })?;
 
-            // Per-run billing metrics on success.
+            // Per-run billing metrics on success. This branch also
+            // handles `stream=true` requests, in which case the buffered
+            // body is SSE-framed rather than a single JSON object — the
+            // helper picks the right parser.
             if let Some(rid) = run_id {
                 if status.is_success() {
                     usage_metrics::record_run_request(rid);
-                    usage_metrics::extract_and_record_usage(rid, &decode_body);
+                    usage_metrics::extract_and_record_usage_buffered(
+                        rid,
+                        &decode_body,
+                        is_streaming,
+                    );
                 }
             }
 

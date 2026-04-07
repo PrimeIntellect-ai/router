@@ -1104,13 +1104,16 @@ impl PDRouter {
                         Err(error_response) => return error_response,
                     };
 
-                    // Successful response: count the request once for billing.
-                    if let Some(rid) = context.run_id {
-                        usage_metrics::record_run_request(rid);
-                    }
-
                     if context.is_stream {
-                        // Streaming response with logprobs
+                        // Streaming response with logprobs. Count the
+                        // request once; token counts come from the stream.
+                        // We bill here (before the stream starts) because
+                        // the client has already received the success
+                        // status line, mirroring the non-logprob branch.
+                        if let Some(rid) = context.run_id {
+                            usage_metrics::record_run_request(rid);
+                        }
+
                         let prefill_logprobs = prefill_body
                             .as_ref()
                             .and_then(|body| serde_json::from_slice::<Value>(body).ok())
@@ -1133,7 +1136,11 @@ impl PDRouter {
                             context.run_id.map(|s| s.to_string()),
                         )
                     } else {
-                        // Non-streaming response with logprobs
+                        // Non-streaming response with logprobs.
+                        // Billing happens inside process_non_streaming_response
+                        // after the decode body is successfully read, so a
+                        // mid-body read failure does not count against the
+                        // run.
                         self.process_non_streaming_response(
                             res,
                             status,
@@ -1602,12 +1609,16 @@ impl PDRouter {
             }
         };
 
-        // Record per-run token usage for billing on success. The status
-        // check is defensive: today the only caller already gates on
-        // success, but guarding here too prevents future callers from
-        // accidentally billing failed requests.
+        // Record per-run billing metrics on success. We bill *after* the
+        // body has been successfully read — if `.bytes().await` fails
+        // above, we return 500 and never reach this point, so a
+        // mid-body upstream failure does not count as a billed request.
+        // The status check is defensive: today the only caller already
+        // gates on success, but guarding here too prevents future
+        // callers from accidentally billing failed requests.
         if let Some(rid) = run_id {
             if status.is_success() {
+                usage_metrics::record_run_request(rid);
                 usage_metrics::extract_and_record_usage(rid, &decode_body);
             }
         }
