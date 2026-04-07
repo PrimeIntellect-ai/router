@@ -5046,6 +5046,7 @@ dependencies = [
  "lazy_static",
  "metrics",
  "metrics-exporter-prometheus",
+ "metrics-util",
  "minijinja",
  "once_cell",
  "opentelemetry",

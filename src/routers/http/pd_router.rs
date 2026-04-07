@@ -1471,7 +1471,6 @@ impl PDRouter {
 
     // Helper to create a streaming response
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     fn create_streaming_response(
         &self,
         stream: impl futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static,
