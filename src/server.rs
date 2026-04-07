@@ -189,21 +189,16 @@ async fn transparent_proxy_handler(State(state): State<Arc<AppState>>, req: Requ
 }
 
 // Health check endpoints
-async fn liveness(State(state): State<Arc<AppState>>, req: Request) -> Response {
-    let headers = req.headers().clone();
-    if let Err(response) = authorize_request(&state, &headers).await {
-        return response;
-    }
-
+//
+// /liveness and /readiness are intentionally unauthenticated so kube
+// probes (which can't carry Bearer tokens) keep working when JWT or
+// API-key auth is enabled. They expose no sensitive information — just
+// "the router process is alive" / "at least one worker is ready".
+async fn liveness(State(state): State<Arc<AppState>>, _req: Request) -> Response {
     state.router.liveness()
 }
 
-async fn readiness(State(state): State<Arc<AppState>>, req: Request) -> Response {
-    let headers = req.headers().clone();
-    if let Err(response) = authorize_request(&state, &headers).await {
-        return response;
-    }
-
+async fn readiness(State(state): State<Arc<AppState>>, _req: Request) -> Response {
     state.router.readiness()
 }
 
