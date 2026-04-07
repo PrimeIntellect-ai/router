@@ -457,11 +457,19 @@ impl RouterMetrics {
         .increment(1);
     }
 
-    // Per-run token usage metrics (for billing)
+    // Per-run token usage metrics (for billing).
+    // Token counters and the request counter are recorded independently:
+    // upstream responses do not always include a `usage` block (especially
+    // streaming), so we still want to count the request even when token
+    // counts are unavailable.
     pub fn record_run_usage(run_id: &str, prompt_tokens: u64, completion_tokens: u64) {
         let labels = [("run_id", run_id.to_string())];
         counter!("vllm_router_run_prompt_tokens_total", &labels).increment(prompt_tokens);
         counter!("vllm_router_run_completion_tokens_total", &labels).increment(completion_tokens);
+    }
+
+    pub fn record_run_request(run_id: &str) {
+        let labels = [("run_id", run_id.to_string())];
         counter!("vllm_router_run_requests_total", &labels).increment(1);
     }
 

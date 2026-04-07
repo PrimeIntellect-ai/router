@@ -1252,12 +1252,18 @@ impl RouterTrait for VllmPDRouter {
         headers: Option<&HeaderMap>,
         body: &crate::protocols::spec::GenerateRequest,
         model_id: Option<&str>,
-        _run_id: Option<&str>,
+        run_id: Option<&str>,
     ) -> Response {
-        self.pd_router.route_generate(headers, body, model_id, _run_id).await
+        self.pd_router
+            .route_generate(headers, body, model_id, run_id)
+            .await
     }
 
     // Override OpenAI-compatible routes for vLLM two-stage processing
+    // TODO(billing): thread `run_id` through `process_vllm_request` and
+    // `process_vllm_two_stage_request` so per-run usage metrics are emitted
+    // for vLLM PD deployments using these paths. The standard PDRouter path
+    // already records them.
     async fn route_chat(
         &self,
         headers: Option<&HeaderMap>,

@@ -13,6 +13,7 @@ use crate::protocols::spec::{
 };
 use crate::routers::header_utils;
 use crate::routers::http::dp_utils;
+use crate::routers::http::usage_metrics;
 use crate::routers::{RouterTrait, WorkerManagement};
 use axum::body::to_bytes;
 use axum::{
@@ -777,49 +778,6 @@ impl Router {
             .await
     }
 
-    // Send typed request directly without conversion
-    /// Parse the `usage` field from a JSON response body and record per-run metrics.
-    /// Works for both non-streaming (full body) and streaming (SSE chunk) responses.
-    fn extract_and_record_usage(run_id: &str, body: &[u8]) {
-        #[derive(serde::Deserialize)]
-        struct UsageOnly {
-            usage: Option<Usage>,
-        }
-        #[derive(serde::Deserialize)]
-        struct Usage {
-            prompt_tokens: Option<u64>,
-            completion_tokens: Option<u64>,
-        }
-        if let Ok(parsed) = serde_json::from_slice::<UsageOnly>(body) {
-            if let Some(usage) = parsed.usage {
-                RouterMetrics::record_run_usage(
-                    run_id,
-                    usage.prompt_tokens.unwrap_or(0),
-                    usage.completion_tokens.unwrap_or(0),
-                );
-            }
-        }
-    }
-
-    /// Scan an SSE chunk for usage data and record per-run metrics.
-    /// SSE chunks contain lines like `data: {...}`. We look for lines that
-    /// contain a `"usage"` field with non-null token counts.
-    fn extract_usage_from_sse_chunk(run_id: &str, bytes: &[u8]) {
-        // Quick check: skip chunks that don't contain usage data
-        if !bytes.windows(7).any(|w| w == b"\"usage\"") {
-            return;
-        }
-        // Parse each SSE data line
-        for line in bytes.split(|&b| b == b'\n') {
-            if let Some(json_data) = line.strip_prefix(b"data: ") {
-                if json_data == b"[DONE]" {
-                    continue;
-                }
-                Self::extract_and_record_usage(run_id, json_data);
-            }
-        }
-    }
-
     async fn send_typed_request<T: serde::Serialize>(
         &self,
         headers: Option<&HeaderMap>,
@@ -938,10 +896,14 @@ impl Router {
 
             let response = match res.bytes().await {
                 Ok(body) => {
-                    // Extract token usage for per-run billing metrics
+                    // Record per-run billing metrics on success. The request
+                    // counter and the token counters are recorded
+                    // independently, because some upstream responses omit
+                    // the `usage` block entirely.
                     if let Some(run_id) = run_id {
                         if status.is_success() {
-                            Self::extract_and_record_usage(run_id, &body);
+                            usage_metrics::record_run_request(run_id);
+                            usage_metrics::extract_and_record_usage(run_id, &body);
                         }
                     }
                     let mut response = Response::new(axum::body::Body::from(body));
@@ -984,6 +946,11 @@ impl Router {
             } else {
                 None
             };
+            // Count the request once up-front (regardless of whether the
+            // upstream emits a usage block in the stream).
+            if let Some(ref rid) = stream_run_id {
+                usage_metrics::record_run_request(rid);
+            }
 
             // Preserve headers for streaming response
             let mut response_headers = header_utils::preserve_response_headers(res.headers());
@@ -1002,7 +969,7 @@ impl Router {
                         Ok(bytes) => {
                             // Extract per-run usage from streaming chunks
                             if let Some(ref rid) = stream_run_id {
-                                Self::extract_usage_from_sse_chunk(rid, &bytes);
+                                usage_metrics::extract_usage_from_sse_chunk(rid, &bytes);
                             }
                             // Check for stream end marker
                             if bytes
@@ -1050,6 +1017,11 @@ impl Router {
             } else {
                 None
             };
+            // Count the request once up-front (regardless of whether the
+            // upstream emits a usage block in the stream).
+            if let Some(ref rid) = stream_run_id {
+                usage_metrics::record_run_request(rid);
+            }
 
             // Preserve headers for streaming response
             let mut response_headers = header_utils::preserve_response_headers(res.headers());
@@ -1067,7 +1039,7 @@ impl Router {
                         Ok(bytes) => {
                             // Extract per-run usage from streaming chunks
                             if let Some(ref rid) = stream_run_id {
-                                Self::extract_usage_from_sse_chunk(rid, &bytes);
+                                usage_metrics::extract_usage_from_sse_chunk(rid, &bytes);
                             }
                             if tx.send(Ok(bytes)).is_err() {
                                 break;
