@@ -976,7 +976,14 @@ impl Router {
             // For streaming with load tracking, we need to manually decrement when done
             let registry = Arc::clone(&self.worker_registry);
             let worker_url = worker_url.to_string();
-            let stream_run_id = run_id.map(|s| s.to_string());
+            // Only record per-run usage on successful responses, matching the
+            // non-streaming path. A non-success status may still carry a body
+            // with a "usage" field that should not be billed.
+            let stream_run_id = if status.is_success() {
+                run_id.map(|s| s.to_string())
+            } else {
+                None
+            };
 
             // Preserve headers for streaming response
             let mut response_headers = header_utils::preserve_response_headers(res.headers());
@@ -1036,7 +1043,13 @@ impl Router {
             response
         } else {
             // For requests without load tracking, just stream
-            let stream_run_id = run_id.map(|s| s.to_string());
+            // Only record per-run usage on successful responses, matching the
+            // non-streaming path.
+            let stream_run_id = if status.is_success() {
+                run_id.map(|s| s.to_string())
+            } else {
+                None
+            };
 
             // Preserve headers for streaming response
             let mut response_headers = header_utils::preserve_response_headers(res.headers());
