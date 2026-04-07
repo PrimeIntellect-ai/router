@@ -1499,6 +1499,7 @@ impl PDRouter {
         tokio::spawn(async move {
             // Use a flag to track whether stream completed successfully
             let mut stream_completed = false;
+            let mut usage_extractor = run_id.map(usage_metrics::SseUsageExtractor::new);
 
             futures_util::pin_mut!(stream);
             while let Some(chunk_result) = stream.next().await {
@@ -1506,9 +1507,11 @@ impl PDRouter {
                     Ok(chunk) => {
                         // Extract per-run token usage from streaming chunks
                         // for billing. Status was already verified successful
-                        // before we got here, so it's safe to bill.
-                        if let Some(ref rid) = run_id {
-                            usage_metrics::extract_usage_from_sse_chunk(rid, &chunk);
+                        // before we got here, so it's safe to bill. The
+                        // extractor buffers across chunks since TCP segment
+                        // boundaries can split SSE lines.
+                        if let Some(extractor) = usage_extractor.as_mut() {
+                            extractor.push_chunk(&chunk);
                         }
 
                         // Check for stream end marker to decrement load early
@@ -1599,9 +1602,14 @@ impl PDRouter {
             }
         };
 
-        // Record per-run token usage for billing on success.
+        // Record per-run token usage for billing on success. The status
+        // check is defensive: today the only caller already gates on
+        // success, but guarding here too prevents future callers from
+        // accidentally billing failed requests.
         if let Some(rid) = run_id {
-            usage_metrics::extract_and_record_usage(rid, &decode_body);
+            if status.is_success() {
+                usage_metrics::extract_and_record_usage(rid, &decode_body);
+            }
         }
 
         if !return_logprob {

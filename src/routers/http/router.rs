@@ -964,12 +964,16 @@ impl Router {
             tokio::spawn(async move {
                 let mut stream = stream;
                 let mut decremented = false;
+                let mut usage_extractor =
+                    stream_run_id.map(usage_metrics::SseUsageExtractor::new);
                 while let Some(chunk) = stream.next().await {
                     match chunk {
                         Ok(bytes) => {
-                            // Extract per-run usage from streaming chunks
-                            if let Some(ref rid) = stream_run_id {
-                                usage_metrics::extract_usage_from_sse_chunk(rid, &bytes);
+                            // Extract per-run usage from streaming chunks.
+                            // Buffered across chunks because TCP segment
+                            // boundaries can split SSE lines.
+                            if let Some(extractor) = usage_extractor.as_mut() {
+                                extractor.push_chunk(&bytes);
                             }
                             // Check for stream end marker
                             if bytes
@@ -1034,12 +1038,16 @@ impl Router {
             // Spawn task to forward stream
             tokio::spawn(async move {
                 let mut stream = stream;
+                let mut usage_extractor =
+                    stream_run_id.map(usage_metrics::SseUsageExtractor::new);
                 while let Some(chunk) = stream.next().await {
                     match chunk {
                         Ok(bytes) => {
-                            // Extract per-run usage from streaming chunks
-                            if let Some(ref rid) = stream_run_id {
-                                usage_metrics::extract_usage_from_sse_chunk(rid, &bytes);
+                            // Extract per-run usage from streaming chunks.
+                            // Buffered across chunks because TCP segment
+                            // boundaries can split SSE lines.
+                            if let Some(extractor) = usage_extractor.as_mut() {
+                                extractor.push_chunk(&bytes);
                             }
                             if tx.send(Ok(bytes)).is_err() {
                                 break;
