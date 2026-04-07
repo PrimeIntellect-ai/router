@@ -91,7 +91,6 @@ once_cell = "1.21.3"
 jsonwebtoken = "9"
 zmq = "0.10.0"
 rmp-serde = "1.3"
-metrics-util = { version = "0.20", default-features = false }
 
 [build-dependencies]
 tonic-prost-build = "0.14"

@@ -1,6 +1,5 @@
 use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
-use metrics_util::MetricKindMask;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
@@ -287,18 +286,18 @@ pub fn start_prometheus(config: PrometheusConfig) {
     PrometheusBuilder::new()
         .with_http_listener(socket_addr)
         .upkeep_timeout(Duration::from_secs(5 * 60))
-        // Drop counters that haven't been updated in 24h. This bounds the
-        // in-memory cardinality of per-run billing counters
-        // (`vllm_router_run_*_total`), which are labeled by `run_id` and
-        // would otherwise accumulate indefinitely as RFT runs come and go.
-        .idle_timeout(
-            MetricKindMask::COUNTER,
-            Some(Duration::from_secs(24 * 60 * 60)),
-        )
         .set_buckets_for_metric(duration_matcher, &duration_bucket)
         .expect("failed to set duration bucket")
         .install()
         .expect("failed to install Prometheus metrics exporter");
+    // NOTE: per-run billing counters (`vllm_router_run_*_total`) are
+    // labeled by `run_id` and accumulate one series per RFT run for the
+    // lifetime of the router process. We deliberately do not configure
+    // an `idle_timeout` here: the only timeout the exporter exposes is
+    // a global `MetricKindMask::COUNTER` filter, which would also evict
+    // normal request counters and break `rate()` over long windows. RFT
+    // run volume is low enough that the resulting cardinality growth is
+    // negligible.
 }
 
 pub struct RouterMetrics;
