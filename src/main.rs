@@ -598,17 +598,26 @@ impl CliArgs {
             Vec::new()
         };
 
-        // Load JWT public key from file or env var
+        // Load JWT public key from file or env var. Treat
+        // empty/whitespace-only values as unset so a misconfigured secret
+        // (e.g. an unset env var that still gets injected as "") doesn't
+        // crash the router with a confusing "Invalid RSA public key"
+        // startup error.
         let jwt_public_key = if let Some(path) = &self.jwt_public_key_path {
-            Some(std::fs::read_to_string(path).map_err(|e| {
+            let pem = std::fs::read_to_string(path).map_err(|e| {
                 ConfigError::ValidationFailed {
                     reason: format!("Failed to read JWT public key from {path}: {e}"),
                 }
-            })?)
-        } else if let Ok(pem) = std::env::var("JWT_PUBLIC_KEY") {
-            Some(pem)
+            })?;
+            if pem.trim().is_empty() {
+                None
+            } else {
+                Some(pem)
+            }
         } else {
-            None
+            std::env::var("JWT_PUBLIC_KEY")
+                .ok()
+                .filter(|pem| !pem.trim().is_empty())
         };
 
         // Build RouterConfig
