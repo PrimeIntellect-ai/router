@@ -4,6 +4,7 @@ use super::dp_utils;
 use super::logprobs_merge;
 use super::pd_router::PDRouter;
 use super::pd_types::{error_chain, PDRouterError};
+use super::usage_metrics;
 use super::vllm_service_discovery::{ServiceRegistry, ServiceType};
 use crate::core::{BasicWorker, Worker, WorkerType};
 use crate::metrics::RouterMetrics;
@@ -235,6 +236,7 @@ impl VllmPDRouter {
         request_json: Value,
         path: &str,
         headers: Option<&HeaderMap>,
+        run_id: Option<&str>,
     ) -> Response {
         debug!("Processing vLLM request for path: {}", path);
         debug!(
@@ -319,6 +321,7 @@ impl VllmPDRouter {
                 &decode_instances[decode_idx],
                 path,
                 headers,
+                run_id,
             )
             .await
         {
@@ -338,6 +341,7 @@ impl VllmPDRouter {
     }
 
     /// Two-stage request processing for vLLM disaggregated mode using discovered endpoints
+    #[allow(clippy::too_many_arguments)]
     async fn process_vllm_two_stage_request_discovered(
         &self,
         request_json: Value,
@@ -345,6 +349,7 @@ impl VllmPDRouter {
         decode_instance: &(String, String),
         path: &str,
         headers: Option<&HeaderMap>,
+        run_id: Option<&str>,
     ) -> Result<Response, String> {
         let (prefill_http, prefill_zmq) = prefill_instance;
         let (decode_http, decode_zmq) = decode_instance;
@@ -608,6 +613,14 @@ impl VllmPDRouter {
                 .await
                 .map_err(|e| format!("Failed to read decode response: {}", e))?;
 
+            // Per-run billing metrics on success.
+            if let Some(rid) = run_id {
+                if status.is_success() {
+                    usage_metrics::record_run_request(rid);
+                    usage_metrics::extract_and_record_usage(rid, &decode_body);
+                }
+            }
+
             // Parse decode response as JSON
             let mut decode_json: Value = serde_json::from_slice(&decode_body)
                 .map_err(|e| format!("Failed to parse decode response as JSON: {}", e))?;
@@ -650,6 +663,21 @@ impl VllmPDRouter {
                 .await
                 .map_err(|e| format!("Failed to read decode response: {}", e))?;
 
+            // Per-run billing metrics on success. This branch also
+            // handles `stream=true` requests, in which case the buffered
+            // body is SSE-framed rather than a single JSON object — the
+            // helper picks the right parser.
+            if let Some(rid) = run_id {
+                if status.is_success() {
+                    usage_metrics::record_run_request(rid);
+                    usage_metrics::extract_and_record_usage_buffered(
+                        rid,
+                        &decode_body,
+                        is_streaming,
+                    );
+                }
+            }
+
             let body = if let Some(prefill_prompt_token_ids) = prefill_response_json.get("prompt_token_ids") {
                 if !prefill_prompt_token_ids.is_null() {
                     if let Ok(mut decode_json) = serde_json::from_slice::<Value>(&decode_body) {
@@ -689,6 +717,7 @@ impl VllmPDRouter {
     /// This function handles fine-grained load tracking: the prefill worker's load is only
     /// incremented during the prefill phase, and the decode worker's load is only incremented
     /// during the decode phase. This accurately reflects the sequential nature of PD disaggregation.
+    #[allow(clippy::too_many_arguments)]
     async fn process_vllm_two_stage_request(
         &self,
         original_request: Value,
@@ -696,6 +725,7 @@ impl VllmPDRouter {
         decode_worker: Arc<dyn Worker>,
         path: &str,
         headers: Option<&HeaderMap>,
+        run_id: Option<&str>,
     ) -> Result<Response, PDRouterError> {
         debug!("ENTERED process_vllm_two_stage_request method");
         let start_time = Instant::now();
@@ -1009,6 +1039,14 @@ impl VllmPDRouter {
                         ),
                     })?;
 
+            // Per-run billing metrics on success.
+            if let Some(rid) = run_id {
+                if status.is_success() {
+                    usage_metrics::record_run_request(rid);
+                    usage_metrics::extract_and_record_usage(rid, &decode_body);
+                }
+            }
+
             // Parse decode response as JSON
             let mut decode_json: Value =
                 serde_json::from_slice(&decode_body).map_err(|e| PDRouterError::NetworkError {
@@ -1060,6 +1098,21 @@ impl VllmPDRouter {
                             decode_url, e
                         ),
                     })?;
+
+            // Per-run billing metrics on success. This branch also
+            // handles `stream=true` requests, in which case the buffered
+            // body is SSE-framed rather than a single JSON object — the
+            // helper picks the right parser.
+            if let Some(rid) = run_id {
+                if status.is_success() {
+                    usage_metrics::record_run_request(rid);
+                    usage_metrics::extract_and_record_usage_buffered(
+                        rid,
+                        &decode_body,
+                        is_streaming,
+                    );
+                }
+            }
 
             let body = if let Some(prefill_prompt_token_ids) = prefill_response_json.get("prompt_token_ids") {
                 if !prefill_prompt_token_ids.is_null() {
@@ -1252,8 +1305,11 @@ impl RouterTrait for VllmPDRouter {
         headers: Option<&HeaderMap>,
         body: &crate::protocols::spec::GenerateRequest,
         model_id: Option<&str>,
+        run_id: Option<&str>,
     ) -> Response {
-        self.pd_router.route_generate(headers, body, model_id).await
+        self.pd_router
+            .route_generate(headers, body, model_id, run_id)
+            .await
     }
 
     // Override OpenAI-compatible routes for vLLM two-stage processing
@@ -1262,6 +1318,7 @@ impl RouterTrait for VllmPDRouter {
         headers: Option<&HeaderMap>,
         body: &crate::protocols::spec::ChatCompletionRequest,
         _model_id: Option<&str>,
+        run_id: Option<&str>,
     ) -> Response {
         info!(
             "vLLM route_chat called, use_discovery={}",
@@ -1291,7 +1348,7 @@ impl RouterTrait for VllmPDRouter {
             };
 
             // Process vLLM two-stage request with service discovery
-            self.process_vllm_request(request_json, "/v1/chat/completions", headers)
+            self.process_vllm_request(request_json, "/v1/chat/completions", headers, run_id)
                 .await
         } else {
             // Direct URL mode - implement routing logic here (not delegating to PDRouter)
@@ -1408,6 +1465,7 @@ impl RouterTrait for VllmPDRouter {
                     decode_worker.clone(),
                     "/v1/chat/completions",
                     headers,
+                    run_id,
                 )
                 .await
             {
@@ -1433,6 +1491,7 @@ impl RouterTrait for VllmPDRouter {
         headers: Option<&HeaderMap>,
         body: &crate::protocols::spec::CompletionRequest,
         _model_id: Option<&str>,
+        run_id: Option<&str>,
     ) -> Response {
         info!(
             "vLLM route_completion called, use_discovery={}",
@@ -1462,7 +1521,7 @@ impl RouterTrait for VllmPDRouter {
             };
 
             // Process vLLM two-stage request with service discovery
-            self.process_vllm_request(request_json, "/v1/completions", headers)
+            self.process_vllm_request(request_json, "/v1/completions", headers, run_id)
                 .await
         } else {
             // Direct URL mode - implement routing logic here (not delegating to PDRouter)
@@ -1579,6 +1638,7 @@ impl RouterTrait for VllmPDRouter {
                     decode_worker.clone(),
                     "/v1/completions",
                     headers,
+                    run_id,
                 )
                 .await
             {
@@ -1604,6 +1664,7 @@ impl RouterTrait for VllmPDRouter {
         headers: Option<&HeaderMap>,
         body: &crate::protocols::spec::ResponsesRequest,
         _model_id: Option<&str>,
+        _run_id: Option<&str>,
     ) -> Response {
         let request_json = match serde_json::to_value(body) {
             Ok(json) => json,
@@ -1690,8 +1751,10 @@ impl RouterTrait for VllmPDRouter {
         let request_json = body;
 
         if self.use_discovery {
-            // Discovery mode - use vLLM-specific two-stage processing
-            self.process_vllm_request(request_json, path, headers).await
+            // Discovery mode - use vLLM-specific two-stage processing.
+            // Transparent proxy has no per-run billing context.
+            self.process_vllm_request(request_json, path, headers, None)
+                .await
         } else {
             // Direct URL mode - use worker registry, filtered by availability
             let all_prefill = self.pd_router.worker_registry.get_prefill_workers();
@@ -1778,7 +1841,8 @@ impl RouterTrait for VllmPDRouter {
                 decode_worker.url()
             );
 
-            // Execute two-stage processing
+            // Execute two-stage processing.
+            // Transparent proxy has no per-run billing context.
             match self
                 .process_vllm_two_stage_request(
                     request_json,
@@ -1786,6 +1850,7 @@ impl RouterTrait for VllmPDRouter {
                     decode_worker.clone(),
                     path,
                     headers,
+                    None,
                 )
                 .await
             {

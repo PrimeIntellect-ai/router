@@ -13,6 +13,7 @@ use crate::protocols::spec::{
 };
 use crate::routers::header_utils;
 use crate::routers::http::dp_utils;
+use crate::routers::http::usage_metrics;
 use crate::routers::{RouterTrait, WorkerManagement};
 use axum::body::to_bytes;
 use axum::{
@@ -554,10 +555,12 @@ impl Router {
         typed_req: &T,
         route: &str,
         model_id: Option<&str>,
+        run_id: Option<&str>,
     ) -> Response {
         let start = Instant::now();
         let is_stream = typed_req.is_stream();
         let text = typed_req.extract_text_for_routing();
+        let run_id = run_id.map(|s| s.to_string());
 
         let response = RetryExecutor::execute_response_with_retry(
             &self.retry_config,
@@ -605,6 +608,7 @@ impl Router {
                         worker.url(),
                         is_stream,
                         load_incremented,
+                        run_id.as_deref(),
                     )
                     .await;
 
@@ -774,7 +778,6 @@ impl Router {
             .await
     }
 
-    // Send typed request directly without conversion
     async fn send_typed_request<T: serde::Serialize>(
         &self,
         headers: Option<&HeaderMap>,
@@ -783,6 +786,7 @@ impl Router {
         worker_url: &str,
         is_stream: bool,
         load_incremented: bool, // Whether load was incremented for this request
+        run_id: Option<&str>,
     ) -> Response {
         let (mut request_builder, extracted_dp_rank, request_url) =
             if self.intra_node_data_parallel_size > 1 {
@@ -892,6 +896,16 @@ impl Router {
 
             let response = match res.bytes().await {
                 Ok(body) => {
+                    // Record per-run billing metrics on success. The request
+                    // counter and the token counters are recorded
+                    // independently, because some upstream responses omit
+                    // the `usage` block entirely.
+                    if let Some(run_id) = run_id {
+                        if status.is_success() {
+                            usage_metrics::record_run_request(run_id);
+                            usage_metrics::extract_and_record_usage(run_id, &body);
+                        }
+                    }
                     let mut response = Response::new(axum::body::Body::from(body));
                     *response.status_mut() = status;
                     *response.headers_mut() = response_headers;
@@ -924,6 +938,19 @@ impl Router {
             // For streaming with load tracking, we need to manually decrement when done
             let registry = Arc::clone(&self.worker_registry);
             let worker_url = worker_url.to_string();
+            // Only record per-run usage on successful responses, matching the
+            // non-streaming path. A non-success status may still carry a body
+            // with a "usage" field that should not be billed.
+            let stream_run_id = if status.is_success() {
+                run_id.map(|s| s.to_string())
+            } else {
+                None
+            };
+            // Count the request once up-front (regardless of whether the
+            // upstream emits a usage block in the stream).
+            if let Some(ref rid) = stream_run_id {
+                usage_metrics::record_run_request(rid);
+            }
 
             // Preserve headers for streaming response
             let mut response_headers = header_utils::preserve_response_headers(res.headers());
@@ -937,9 +964,17 @@ impl Router {
             tokio::spawn(async move {
                 let mut stream = stream;
                 let mut decremented = false;
+                let mut usage_extractor =
+                    stream_run_id.map(usage_metrics::SseUsageExtractor::new);
                 while let Some(chunk) = stream.next().await {
                     match chunk {
                         Ok(bytes) => {
+                            // Extract per-run usage from streaming chunks.
+                            // Buffered across chunks because TCP segment
+                            // boundaries can split SSE lines.
+                            if let Some(extractor) = usage_extractor.as_mut() {
+                                extractor.push_chunk(&bytes);
+                            }
                             // Check for stream end marker
                             if bytes
                                 .as_ref()
@@ -979,6 +1014,19 @@ impl Router {
             response
         } else {
             // For requests without load tracking, just stream
+            // Only record per-run usage on successful responses, matching the
+            // non-streaming path.
+            let stream_run_id = if status.is_success() {
+                run_id.map(|s| s.to_string())
+            } else {
+                None
+            };
+            // Count the request once up-front (regardless of whether the
+            // upstream emits a usage block in the stream).
+            if let Some(ref rid) = stream_run_id {
+                usage_metrics::record_run_request(rid);
+            }
+
             // Preserve headers for streaming response
             let mut response_headers = header_utils::preserve_response_headers(res.headers());
             // Ensure we set the correct content-type for SSE
@@ -990,9 +1038,17 @@ impl Router {
             // Spawn task to forward stream
             tokio::spawn(async move {
                 let mut stream = stream;
+                let mut usage_extractor =
+                    stream_run_id.map(usage_metrics::SseUsageExtractor::new);
                 while let Some(chunk) = stream.next().await {
                     match chunk {
                         Ok(bytes) => {
+                            // Extract per-run usage from streaming chunks.
+                            // Buffered across chunks because TCP segment
+                            // boundaries can split SSE lines.
+                            if let Some(extractor) = usage_extractor.as_mut() {
+                                extractor.push_chunk(&bytes);
+                            }
                             if tx.send(Ok(bytes)).is_err() {
                                 break;
                             }
@@ -1462,8 +1518,9 @@ impl RouterTrait for Router {
         headers: Option<&HeaderMap>,
         body: &GenerateRequest,
         model_id: Option<&str>,
+        run_id: Option<&str>,
     ) -> Response {
-        self.route_typed_request(headers, body, "/generate", model_id)
+        self.route_typed_request(headers, body, "/generate", model_id, run_id)
             .await
     }
 
@@ -1472,8 +1529,9 @@ impl RouterTrait for Router {
         headers: Option<&HeaderMap>,
         body: &ChatCompletionRequest,
         model_id: Option<&str>,
+        run_id: Option<&str>,
     ) -> Response {
-        self.route_typed_request(headers, body, "/v1/chat/completions", model_id)
+        self.route_typed_request(headers, body, "/v1/chat/completions", model_id, run_id)
             .await
     }
 
@@ -1482,8 +1540,9 @@ impl RouterTrait for Router {
         headers: Option<&HeaderMap>,
         body: &CompletionRequest,
         model_id: Option<&str>,
+        run_id: Option<&str>,
     ) -> Response {
-        self.route_typed_request(headers, body, "/v1/completions", model_id)
+        self.route_typed_request(headers, body, "/v1/completions", model_id, run_id)
             .await
     }
 
@@ -1492,8 +1551,9 @@ impl RouterTrait for Router {
         headers: Option<&HeaderMap>,
         body: &ResponsesRequest,
         model_id: Option<&str>,
+        run_id: Option<&str>,
     ) -> Response {
-        self.route_typed_request(headers, body, "/v1/responses", model_id)
+        self.route_typed_request(headers, body, "/v1/responses", model_id, run_id)
             .await
     }
 
@@ -1516,7 +1576,7 @@ impl RouterTrait for Router {
         // Record embeddings-specific metrics in addition to general request metrics
         let start = Instant::now();
         let res = self
-            .route_typed_request(headers, body, "/v1/embeddings", model_id)
+            .route_typed_request(headers, body, "/v1/embeddings", model_id, None)
             .await;
 
         // Embedding specific metrics
@@ -1541,7 +1601,7 @@ impl RouterTrait for Router {
             return (StatusCode::BAD_REQUEST, e).into_response();
         }
         let response = self
-            .route_typed_request(headers, body, "/v1/rerank", model_id)
+            .route_typed_request(headers, body, "/v1/rerank", model_id, None)
             .await;
         if response.status().is_success() {
             match Self::build_rerank_response(body, response).await {

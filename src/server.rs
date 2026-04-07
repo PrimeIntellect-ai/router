@@ -1,4 +1,5 @@
 use crate::{
+    auth::{JwtVerifier, RftClaims},
     config::{ConnectionMode, HistoryBackend, RouterConfig, TraceConfig},
     core::{WorkerRegistry, WorkerType},
     data_connector::{MemoryResponseStorage, NoOpResponseStorage, SharedResponseStorage},
@@ -51,6 +52,7 @@ pub struct AppContext {
     pub response_storage: SharedResponseStorage,
     pub api_key_cache: Arc<RwLock<HashMap<String, bool>>>,
     pub api_key_validation_urls: Arc<Vec<String>>,
+    pub jwt_verifier: Option<Arc<JwtVerifier>>,
 }
 
 impl AppContext {
@@ -97,6 +99,20 @@ impl AppContext {
             HistoryBackend::None => Arc::new(NoOpResponseStorage::new()),
         };
 
+        let jwt_verifier = router_config
+            .jwt_public_key
+            .as_ref()
+            .map(|pem| {
+                JwtVerifier::new(pem)
+                    .map(Arc::new)
+                    .map_err(|e| format!("Failed to initialize JWT verifier: {e}"))
+            })
+            .transpose()?;
+
+        if jwt_verifier.is_some() {
+            info!("JWT verification enabled for Bearer tokens");
+        }
+
         Ok(Self {
             client,
             router_config,
@@ -108,6 +124,7 @@ impl AppContext {
             response_storage,
             api_key_cache: Arc::new(RwLock::new(HashMap::new())),
             api_key_validation_urls: Arc::new(api_key_validation_urls),
+            jwt_verifier,
         })
     }
 }
@@ -235,6 +252,11 @@ async fn get_model_info(State(state): State<Arc<AppState>>, req: Request) -> Res
     state.router.get_model_info(req).await
 }
 
+/// Extract the run_id from JWT claims for passing to the router.
+fn run_id_from_claims(claims: &Option<RftClaims>) -> Option<String> {
+    claims.as_ref().map(|c| c.run_id.clone())
+}
+
 // Generation endpoints
 // The RouterTrait now accepts optional headers and typed body directly
 async fn generate(
@@ -242,13 +264,15 @@ async fn generate(
     headers: http::HeaderMap,
     Json(body): Json<GenerateRequest>,
 ) -> Response {
-    if let Err(response) = authorize_request(&state, &headers).await {
-        return response;
-    }
+    let claims = match authorize_request(&state, &headers).await {
+        Ok(c) => c,
+        Err(response) => return response,
+    };
+    let run_id = run_id_from_claims(&claims);
 
     state
         .router
-        .route_generate(Some(&headers), &body, None)
+        .route_generate(Some(&headers), &body, None, run_id.as_deref())
         .await
 }
 
@@ -257,11 +281,16 @@ async fn v1_chat_completions(
     headers: http::HeaderMap,
     Json(body): Json<ChatCompletionRequest>,
 ) -> Response {
-    if let Err(response) = authorize_request(&state, &headers).await {
-        return response;
-    }
+    let claims = match authorize_request(&state, &headers).await {
+        Ok(c) => c,
+        Err(response) => return response,
+    };
+    let run_id = run_id_from_claims(&claims);
 
-    state.router.route_chat(Some(&headers), &body, None).await
+    state
+        .router
+        .route_chat(Some(&headers), &body, None, run_id.as_deref())
+        .await
 }
 
 async fn v1_completions(
@@ -269,13 +298,15 @@ async fn v1_completions(
     headers: http::HeaderMap,
     Json(body): Json<CompletionRequest>,
 ) -> Response {
-    if let Err(response) = authorize_request(&state, &headers).await {
-        return response;
-    }
+    let claims = match authorize_request(&state, &headers).await {
+        Ok(c) => c,
+        Err(response) => return response,
+    };
+    let run_id = run_id_from_claims(&claims);
 
     state
         .router
-        .route_completion(Some(&headers), &body, None)
+        .route_completion(Some(&headers), &body, None, run_id.as_deref())
         .await
 }
 
@@ -408,13 +439,17 @@ struct UrlQuery {
     url: String,
 }
 
+/// Authorize the request and optionally return JWT claims if a valid JWT was provided.
 async fn authorize_request(
     state: &Arc<AppState>,
     headers: &http::HeaderMap,
-) -> Result<(), Response> {
+) -> Result<Option<RftClaims>, Response> {
     let validation_urls = state.context.api_key_validation_urls.as_ref();
-    if validation_urls.is_empty() {
-        return Ok(());
+    let has_jwt_verifier = state.context.jwt_verifier.is_some();
+
+    // No auth configured at all — allow everything
+    if validation_urls.is_empty() && !has_jwt_verifier {
+        return Ok(None);
     }
 
     let auth_header = headers
@@ -428,9 +463,29 @@ async fn authorize_request(
         .filter(|value| !value.is_empty())
         .ok_or_else(|| (StatusCode::UNAUTHORIZED, AUTH_FAILURE_MESSAGE).into_response())?;
 
+    // Try JWT verification first (local, no network call)
+    if let Some(verifier) = &state.context.jwt_verifier {
+        match verifier.verify(token) {
+            Ok(claims) => return Ok(Some(claims)),
+            Err(_) => {
+                // Not a valid JWT — fall through to API key validation if configured
+                if validation_urls.is_empty() {
+                    return Err(
+                        (StatusCode::UNAUTHORIZED, AUTH_FAILURE_MESSAGE).into_response()
+                    );
+                }
+            }
+        }
+    }
+
+    // Fall back to API key validation URLs
+    if validation_urls.is_empty() {
+        return Err((StatusCode::UNAUTHORIZED, AUTH_FAILURE_MESSAGE).into_response());
+    }
+
     if let Some(valid) = state.context.api_key_cache.read().await.get(token).copied() {
         if valid {
-            return Ok(());
+            return Ok(None);
         }
         return Err((StatusCode::UNAUTHORIZED, AUTH_FAILURE_MESSAGE).into_response());
     }
@@ -466,7 +521,7 @@ async fn authorize_request(
         .insert(token.to_string(), validated);
 
     if validated {
-        Ok(())
+        Ok(None)
     } else {
         Err((StatusCode::UNAUTHORIZED, AUTH_FAILURE_MESSAGE).into_response())
     }

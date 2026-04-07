@@ -3,6 +3,7 @@
 use super::dp_utils;
 use super::logprobs_merge;
 use super::pd_types::{api_path, PDRouterError};
+use super::usage_metrics;
 use crate::config::types::RetryConfig;
 use crate::core::{
     is_retryable_status, BasicWorker, CircuitBreakerConfig, DPAwareWorker, HealthConfig,
@@ -62,6 +63,7 @@ struct PDRequestContext<'a> {
     return_logprob: bool,
     request_text: Option<String>,
     model_id: Option<&'a str>,
+    run_id: Option<&'a str>,
 }
 
 impl PDRouter {
@@ -980,6 +982,7 @@ impl PDRouter {
                 Some(response_headers),
                 prefill,
                 decode,
+                None, // error path: never bill
             )
         } else {
             // Handle non-streaming error response
@@ -1102,7 +1105,15 @@ impl PDRouter {
                     };
 
                     if context.is_stream {
-                        // Streaming response with logprobs
+                        // Streaming response with logprobs. Count the
+                        // request once; token counts come from the stream.
+                        // We bill here (before the stream starts) because
+                        // the client has already received the success
+                        // status line, mirroring the non-logprob branch.
+                        if let Some(rid) = context.run_id {
+                            usage_metrics::record_run_request(rid);
+                        }
+
                         let prefill_logprobs = prefill_body
                             .as_ref()
                             .and_then(|body| serde_json::from_slice::<Value>(body).ok())
@@ -1122,14 +1133,20 @@ impl PDRouter {
                             Some(response_headers),
                             prefill,
                             decode,
+                            context.run_id.map(|s| s.to_string()),
                         )
                     } else {
-                        // Non-streaming response with logprobs
+                        // Non-streaming response with logprobs.
+                        // Billing happens inside process_non_streaming_response
+                        // after the decode body is successfully read, so a
+                        // mid-body read failure does not count against the
+                        // run.
                         self.process_non_streaming_response(
                             res,
                             status,
                             context.return_logprob,
                             prefill_body,
+                            context.run_id,
                         )
                         .await
                     }
@@ -1239,6 +1256,14 @@ impl PDRouter {
                         self.handle_decode_error_response(res, &context, prefill, decode)
                             .await
                     } else if context.is_stream {
+                        // Successful streaming response: count the request
+                        // once for billing (token counts come from the
+                        // stream, but the request counter must increment
+                        // even when usage is omitted).
+                        if let Some(rid) = context.run_id {
+                            usage_metrics::record_run_request(rid);
+                        }
+
                         // Streaming response without logprobs - direct passthrough
                         let decode_url = decode.url().to_string();
                         let response_headers =
@@ -1253,6 +1278,7 @@ impl PDRouter {
                             Some(response_headers),
                             prefill,
                             decode,
+                            context.run_id.map(|s| s.to_string()),
                         )
                     } else {
                         // Non-streaming response without logprobs - direct passthrough like fast version
@@ -1261,6 +1287,15 @@ impl PDRouter {
 
                         match res.bytes().await {
                             Ok(decode_body) => {
+                                // Successful non-streaming response:
+                                // record per-run billing metrics.
+                                if let Some(rid) = context.run_id {
+                                    usage_metrics::record_run_request(rid);
+                                    usage_metrics::extract_and_record_usage(
+                                        rid,
+                                        &decode_body,
+                                    );
+                                }
                                 let mut response =
                                     Response::new(axum::body::Body::from(decode_body));
                                 *response.status_mut() = status;
@@ -1453,6 +1488,7 @@ impl PDRouter {
         headers: Option<HeaderMap>,
         prefill: &dyn Worker,
         decode: &dyn Worker,
+        run_id: Option<String>,
     ) -> Response {
         // For streaming, increment load now - will be decremented when streaming completes
         prefill.increment_load();
@@ -1470,11 +1506,21 @@ impl PDRouter {
         tokio::spawn(async move {
             // Use a flag to track whether stream completed successfully
             let mut stream_completed = false;
+            let mut usage_extractor = run_id.map(usage_metrics::SseUsageExtractor::new);
 
             futures_util::pin_mut!(stream);
             while let Some(chunk_result) = stream.next().await {
                 match chunk_result {
                     Ok(chunk) => {
+                        // Extract per-run token usage from streaming chunks
+                        // for billing. Status was already verified successful
+                        // before we got here, so it's safe to bill. The
+                        // extractor buffers across chunks since TCP segment
+                        // boundaries can split SSE lines.
+                        if let Some(extractor) = usage_extractor.as_mut() {
+                            extractor.push_chunk(&chunk);
+                        }
+
                         // Check for stream end marker to decrement load early
                         let is_done = chunk
                             .as_ref()
@@ -1551,6 +1597,7 @@ impl PDRouter {
         status: StatusCode,
         return_logprob: bool,
         prefill_body: Option<bytes::Bytes>,
+        run_id: Option<&str>,
     ) -> Response {
         let response = res.bytes().await;
         let decode_body = match response {
@@ -1561,6 +1608,20 @@ impl PDRouter {
                     .into_response();
             }
         };
+
+        // Record per-run billing metrics on success. We bill *after* the
+        // body has been successfully read — if `.bytes().await` fails
+        // above, we return 500 and never reach this point, so a
+        // mid-body upstream failure does not count as a billed request.
+        // The status check is defensive: today the only caller already
+        // gates on success, but guarding here too prevents future
+        // callers from accidentally billing failed requests.
+        if let Some(rid) = run_id {
+            if status.is_success() {
+                usage_metrics::record_run_request(rid);
+                usage_metrics::extract_and_record_usage(rid, &decode_body);
+            }
+        }
 
         if !return_logprob {
             return (status, decode_body).into_response();
@@ -2007,6 +2068,7 @@ impl RouterTrait for PDRouter {
         headers: Option<&HeaderMap>,
         body: &GenerateRequest,
         model_id: Option<&str>,
+        run_id: Option<&str>,
     ) -> Response {
         // Extract parameters
         let is_stream = body.stream;
@@ -2038,6 +2100,7 @@ impl RouterTrait for PDRouter {
             return_logprob,
             request_text,
             model_id,
+            run_id,
         };
 
         // Execute with retry and bootstrap injection
@@ -2049,6 +2112,7 @@ impl RouterTrait for PDRouter {
         headers: Option<&HeaderMap>,
         body: &ChatCompletionRequest,
         model_id: Option<&str>,
+        run_id: Option<&str>,
     ) -> Response {
         // Extract parameters
         let is_stream = body.stream;
@@ -2079,6 +2143,7 @@ impl RouterTrait for PDRouter {
             return_logprob,
             request_text,
             model_id,
+            run_id,
         };
 
         // Execute with retry and bootstrap injection
@@ -2090,6 +2155,7 @@ impl RouterTrait for PDRouter {
         headers: Option<&HeaderMap>,
         body: &CompletionRequest,
         model_id: Option<&str>,
+        run_id: Option<&str>,
     ) -> Response {
         // Extract parameters
         let is_stream = body.stream;
@@ -2113,6 +2179,7 @@ impl RouterTrait for PDRouter {
             return_logprob,
             request_text,
             model_id,
+            run_id,
         };
 
         // Execute with retry and bootstrap injection
@@ -2124,6 +2191,7 @@ impl RouterTrait for PDRouter {
         _headers: Option<&HeaderMap>,
         _body: &ResponsesRequest,
         _model_id: Option<&str>,
+        _run_id: Option<&str>, // Not implemented; usage metrics N/A.
     ) -> Response {
         (
             StatusCode::NOT_IMPLEMENTED,
@@ -2182,6 +2250,7 @@ impl RouterTrait for PDRouter {
             return_logprob: false,
             request_text: req_text,
             model_id,
+            run_id: None,
         };
 
         // Execute with retry and bootstrap injection
@@ -2797,6 +2866,7 @@ mod tests {
             None,
             prefill_ref.as_ref(),
             decode_ref.as_ref(),
+            None,
         );
 
         // Load should be incremented immediately

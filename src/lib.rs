@@ -3,6 +3,7 @@ pub mod config;
 pub mod logging;
 use std::collections::HashMap;
 
+pub mod auth;
 pub mod core;
 pub mod data_connector;
 #[cfg(feature = "grpc-client")]
@@ -213,6 +214,7 @@ impl Router {
             intra_node_data_parallel_size: self.intra_node_data_parallel_size,
             api_key: self.api_key.clone(),
             api_key_validation_urls: self.api_key_validation_urls.clone(),
+            jwt_public_key: None,
             discovery,
             metrics,
             log_dir: self.log_dir.clone(),

@@ -90,7 +90,7 @@ async fn test_openai_router_propagates_trace_context() {
     let response = {
         let _enter = span.enter();
         router
-            .route_chat(Some(&headers), &create_chat_request(), None)
+            .route_chat(Some(&headers), &create_chat_request(), None, None)
             .await
     };
     assert_eq!(response.status(), StatusCode::OK);
