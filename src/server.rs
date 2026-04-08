@@ -148,9 +148,10 @@ async fn transparent_proxy_handler(State(state): State<Arc<AppState>>, req: Requ
     let headers = req.headers().clone();
 
     // Check authorization
-    if let Err(response) = authorize_request(&state, &headers).await {
-        return response;
-    }
+    let claims = match authorize_request(&state, &headers).await {
+        Ok(c) => c,
+        Err(response) => return response,
+    };
 
     // Extract path and method
     let path = req.uri().path().to_string();
@@ -180,6 +181,21 @@ async fn transparent_proxy_handler(State(state): State<Arc<AppState>>, req: Requ
             }
         }
     };
+
+    // Enforce JWT model scope on whatever the body claims to target.
+    // Unknown endpoints can still carry a `model` field, and we don't want
+    // the transparent proxy to be a bypass for the typed handlers.
+    let requested_model = body_json.get("model").and_then(|v| v.as_str());
+    if let Err(response) = enforce_model_scope(&claims, requested_model) {
+        return response;
+    }
+    if claims.is_some() && body_json.get("lora_path").is_some() {
+        return (
+            StatusCode::FORBIDDEN,
+            "lora_path override is not allowed with a run-scoped JWT",
+        )
+            .into_response();
+    }
 
     // Route through transparent proxy
     state
@@ -252,6 +268,51 @@ fn run_id_from_claims(claims: &Option<RftClaims>) -> Option<String> {
     claims.as_ref().map(|c| c.run_id.clone())
 }
 
+/// Reject the request if a run-scoped JWT is trying to reach a model
+/// outside its allowlist (base model + own LoRA).
+///
+/// API-key auth (`claims == None`) is unrestricted.
+fn enforce_model_scope(
+    claims: &Option<RftClaims>,
+    requested_model: Option<&str>,
+) -> Result<(), Response> {
+    let Some(claims) = claims else {
+        return Ok(());
+    };
+
+    if claims.allows_model(requested_model) {
+        return Ok(());
+    }
+
+    let body = format!(
+        "run {} is not authorized to access model {:?}",
+        claims.run_id, requested_model
+    );
+    warn!(
+        run_id = %claims.run_id,
+        requested_model = ?requested_model,
+        allowed_base = ?claims.model,
+        allowed_lora = ?claims.lora,
+        "rejecting request: model outside JWT scope"
+    );
+    Err((StatusCode::FORBIDDEN, body).into_response())
+}
+
+/// Reject `lora_path` overrides on JWT-authenticated requests. The vLLM
+/// `lora_path` extension lets a caller point at any LoRA on disk, which
+/// would bypass the JWT's `lora` claim. Strip-or-reject is the only safe
+/// move; we hard-reject so failures are loud rather than silent.
+fn enforce_no_lora_path_override<T>(claims: &Option<RftClaims>, lora_path: &Option<T>) -> Result<(), Response> {
+    if claims.is_some() && lora_path.is_some() {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "lora_path override is not allowed with a run-scoped JWT",
+        )
+            .into_response());
+    }
+    Ok(())
+}
+
 // Generation endpoints
 // The RouterTrait now accepts optional headers and typed body directly
 async fn generate(
@@ -280,6 +341,12 @@ async fn v1_chat_completions(
         Ok(c) => c,
         Err(response) => return response,
     };
+    if let Err(response) = enforce_model_scope(&claims, body.model.as_deref()) {
+        return response;
+    }
+    if let Err(response) = enforce_no_lora_path_override(&claims, &body.lora_path) {
+        return response;
+    }
     let run_id = run_id_from_claims(&claims);
 
     state
@@ -297,6 +364,12 @@ async fn v1_completions(
         Ok(c) => c,
         Err(response) => return response,
     };
+    if let Err(response) = enforce_model_scope(&claims, body.model.as_deref()) {
+        return response;
+    }
+    if let Err(response) = enforce_no_lora_path_override(&claims, &body.lora_path) {
+        return response;
+    }
     let run_id = run_id_from_claims(&claims);
 
     state
@@ -337,8 +410,20 @@ async fn v1_responses(
     headers: http::HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
-    if let Err(response) = authorize_request(&state, &headers).await {
+    let claims = match authorize_request(&state, &headers).await {
+        Ok(c) => c,
+        Err(response) => return response,
+    };
+    let requested_model = body.get("model").and_then(|v| v.as_str());
+    if let Err(response) = enforce_model_scope(&claims, requested_model) {
         return response;
+    }
+    if claims.is_some() && body.get("lora_path").is_some() {
+        return (
+            StatusCode::FORBIDDEN,
+            "lora_path override is not allowed with a run-scoped JWT",
+        )
+            .into_response();
     }
 
     state
@@ -352,7 +437,11 @@ async fn v1_embeddings(
     headers: http::HeaderMap,
     Json(body): Json<EmbeddingRequest>,
 ) -> Response {
-    if let Err(response) = authorize_request(&state, &headers).await {
+    let claims = match authorize_request(&state, &headers).await {
+        Ok(c) => c,
+        Err(response) => return response,
+    };
+    if let Err(response) = enforce_model_scope(&claims, body.model.as_deref()) {
         return response;
     }
 
