@@ -247,11 +247,60 @@ async fn get_server_info(State(state): State<Arc<AppState>>, req: Request) -> Re
 
 async fn v1_models(State(state): State<Arc<AppState>>, req: Request) -> Response {
     let headers = req.headers().clone();
-    if let Err(response) = authorize_request(&state, &headers).await {
-        return response;
+    let claims = match authorize_request(&state, &headers).await {
+        Ok(c) => c,
+        Err(response) => return response,
+    };
+
+    let upstream = state.router.get_models(req).await;
+
+    // Admin / API-key auth sees the full list. Run-scoped JWTs only see
+    // the entries their `allows_model` check accepts — i.e. their base
+    // model and their own LoRA(s). This stops `/v1/models` from leaking
+    // sibling runs' adapter names, which are otherwise the only piece of
+    // the JWT model-isolation boundary that's not unguessable.
+    let Some(claims) = claims else {
+        return upstream;
+    };
+
+    filter_models_response(upstream, &claims).await
+}
+
+/// Rebuild a `/v1/models` response with `data[]` filtered to entries the
+/// JWT is allowed to target. On any parse failure we fall back to a 502
+/// rather than leaking the unfiltered list.
+async fn filter_models_response(response: Response, claims: &RftClaims) -> Response {
+    let (parts, body) = response.into_parts();
+    if !parts.status.is_success() {
+        return Response::from_parts(parts, body);
     }
 
-    state.router.get_models(req).await
+    let bytes = match axum::body::to_bytes(body, usize::MAX).await {
+        Ok(b) => b,
+        Err(e) => {
+            warn!("failed to read /v1/models body for filtering: {e}");
+            return (StatusCode::BAD_GATEWAY, "failed to read upstream models response")
+                .into_response();
+        }
+    };
+
+    let mut json: serde_json::Value = match serde_json::from_slice(&bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("failed to parse /v1/models body for filtering: {e}");
+            return (StatusCode::BAD_GATEWAY, "failed to parse upstream models response")
+                .into_response();
+        }
+    };
+
+    if let Some(data) = json.get_mut("data").and_then(|d| d.as_array_mut()) {
+        data.retain(|entry| {
+            let id = entry.get("id").and_then(|v| v.as_str());
+            claims.allows_model(id)
+        });
+    }
+
+    Json(json).into_response()
 }
 
 async fn get_model_info(State(state): State<Arc<AppState>>, req: Request) -> Response {
