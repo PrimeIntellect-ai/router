@@ -10,7 +10,7 @@ use crate::{
     protocols::{
         spec::{
             ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest,
-            RerankRequest, V1RerankReqInput,
+            RerankRequest, V1RerankReqInput, DEFAULT_MODEL_NAME,
         },
         worker_spec::{WorkerApiResponse, WorkerConfigRequest, WorkerErrorResponse},
     },
@@ -428,6 +428,59 @@ fn pin_and_check_model(
         .into_response())
 }
 
+/// `String` variant for `RerankRequest` (whose `model` field is a
+/// non-optional `String` defaulting to `DEFAULT_MODEL_NAME`). Treats an
+/// empty string or the `"default"` sentinel as "no model specified" and
+/// pins it to the JWT base before validation. Required because
+/// `V1RerankReqInput` has no model field at all and always lands here
+/// with `model == "default"` after the `From` conversion — a JWT caller
+/// could otherwise never satisfy the scope check.
+fn pin_and_check_model_string(
+    claims: &Option<RftClaims>,
+    model: &mut String,
+) -> Result<(), Response> {
+    let Some(claims) = claims else {
+        return Ok(());
+    };
+
+    if model.is_empty() || model == DEFAULT_MODEL_NAME {
+        match claims.model.as_deref() {
+            Some(base) if !base.is_empty() => {
+                *model = base.to_string();
+            }
+            _ => {
+                warn!(
+                    run_id = %claims.run_id,
+                    "rejecting JWT request: rerank body has no model and JWT has no base model claim"
+                );
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    "request omits `model` and JWT has no base model to fall back to",
+                )
+                    .into_response());
+            }
+        }
+    }
+
+    if claims.allows_model(model) {
+        return Ok(());
+    }
+
+    warn!(
+        run_id = %claims.run_id,
+        requested_model = %model,
+        "rejecting rerank request: model outside JWT scope"
+    );
+    Err((
+        StatusCode::FORBIDDEN,
+        format!(
+            "run {} is not authorized to access model {:?}",
+            claims.run_id, model
+        ),
+    )
+        .into_response())
+}
+
 /// JSON-body variant for the transparent proxy / `/v1/responses`. Same
 /// semantics as [`pin_and_check_model`]: pins missing/empty `model` to
 /// the JWT base, then validates against the allowlist.
@@ -600,9 +653,13 @@ async fn v1_completions(
 async fn rerank(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
-    Json(body): Json<RerankRequest>,
+    Json(mut body): Json<RerankRequest>,
 ) -> Response {
-    if let Err(response) = authorize_request(&state, &headers).await {
+    let claims = match authorize_request(&state, &headers).await {
+        Ok(c) => c,
+        Err(response) => return response,
+    };
+    if let Err(response) = pin_and_check_model_string(&claims, &mut body.model) {
         return response;
     }
 
@@ -614,13 +671,21 @@ async fn v1_rerank(
     headers: http::HeaderMap,
     Json(body): Json<V1RerankReqInput>,
 ) -> Response {
-    if let Err(response) = authorize_request(&state, &headers).await {
+    let claims = match authorize_request(&state, &headers).await {
+        Ok(c) => c,
+        Err(response) => return response,
+    };
+    // V1RerankReqInput has no `model` field; the From conversion fills
+    // in `DEFAULT_MODEL_NAME`, which `pin_and_check_model_string` will
+    // then rewrite to the JWT base when claims are present.
+    let mut converted: RerankRequest = body.into();
+    if let Err(response) = pin_and_check_model_string(&claims, &mut converted.model) {
         return response;
     }
 
     state
         .router
-        .route_rerank(Some(&headers), &body.into(), None)
+        .route_rerank(Some(&headers), &converted, None)
         .await
 }
 
