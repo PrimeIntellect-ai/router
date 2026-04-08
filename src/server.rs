@@ -287,8 +287,13 @@ async fn v1_models(State(state): State<Arc<AppState>>, req: Request) -> Response
 /// Rebuild a `/v1/models` response with `data[]` filtered to entries the
 /// JWT is allowed to target. On any parse failure we fall back to a 502
 /// rather than leaking the unfiltered list.
+///
+/// We preserve the upstream response `parts` (status, headers) and only
+/// swap the body, so JWT-authenticated callers still receive
+/// `x-request-id`, rate-limit headers, etc. that API-key callers see.
+/// Only `Content-Length` is overwritten because the body length changes.
 async fn filter_models_response(response: Response, claims: &RftClaims) -> Response {
-    let (parts, body) = response.into_parts();
+    let (mut parts, body) = response.into_parts();
     if !parts.status.is_success() {
         return Response::from_parts(parts, body);
     }
@@ -321,7 +326,31 @@ async fn filter_models_response(response: Response, claims: &RftClaims) -> Respo
         });
     }
 
-    Json(json).into_response()
+    let new_body = match serde_json::to_vec(&json) {
+        Ok(b) => b,
+        Err(e) => {
+            warn!("failed to re-serialize filtered /v1/models body: {e}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to serialize filtered models response",
+            )
+                .into_response();
+        }
+    };
+
+    // Body length changed; refresh Content-Length and force JSON
+    // content-type (the upstream may not have set one). Other headers
+    // stay intact so request IDs / rate-limit metadata propagate.
+    parts.headers.insert(
+        http::header::CONTENT_LENGTH,
+        http::HeaderValue::from(new_body.len()),
+    );
+    parts.headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/json"),
+    );
+
+    Response::from_parts(parts, axum::body::Body::from(new_body))
 }
 
 async fn get_model_info(State(state): State<Arc<AppState>>, req: Request) -> Response {
