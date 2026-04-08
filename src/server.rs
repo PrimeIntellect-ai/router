@@ -316,6 +316,18 @@ async fn filter_models_response(response: Response, claims: &RftClaims) -> Respo
         }
     };
 
+    // We have to handle two response shapes:
+    //   1. OpenAI-style:    {"object": "list", "data": [{"id": ..., ...}, ...]}
+    //      (all single-router HTTP backends use this)
+    //   2. RouterManager:   {"models": ["model_a", "model_b", ...]}
+    //      (the IGW / multi-router deployment, see
+    //      `RouterManager::get_models` in routers/router_manager.rs)
+    //
+    // If neither shape matches we fail closed (502) rather than passing
+    // the body through unfiltered — the doc comment promises this and
+    // an unrecognized shape on a JWT-authed `/v1/models` is the exact
+    // case where leaking is most dangerous.
+    let mut filtered_something = false;
     if let Some(data) = json.get_mut("data").and_then(|d| d.as_array_mut()) {
         data.retain(|entry| {
             entry
@@ -324,6 +336,27 @@ async fn filter_models_response(response: Response, claims: &RftClaims) -> Respo
                 .map(|id| claims.allows_model(id))
                 .unwrap_or(false)
         });
+        filtered_something = true;
+    }
+    if let Some(models) = json.get_mut("models").and_then(|m| m.as_array_mut()) {
+        models.retain(|entry| {
+            entry
+                .as_str()
+                .map(|name| claims.allows_model(name))
+                .unwrap_or(false)
+        });
+        filtered_something = true;
+    }
+    if !filtered_something {
+        warn!(
+            run_id = %claims.run_id,
+            "refusing to return /v1/models: upstream payload has neither `data` nor `models` array"
+        );
+        return (
+            StatusCode::BAD_GATEWAY,
+            "upstream models response shape not recognized; refusing to leak",
+        )
+            .into_response();
     }
 
     let new_body = match serde_json::to_vec(&json) {
