@@ -10,7 +10,7 @@ use crate::{
     protocols::{
         spec::{
             ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest,
-            RerankRequest, V1RerankReqInput,
+            RerankRequest, V1RerankReqInput, DEFAULT_MODEL_NAME,
         },
         worker_spec::{WorkerApiResponse, WorkerConfigRequest, WorkerErrorResponse},
     },
@@ -148,9 +148,10 @@ async fn transparent_proxy_handler(State(state): State<Arc<AppState>>, req: Requ
     let headers = req.headers().clone();
 
     // Check authorization
-    if let Err(response) = authorize_request(&state, &headers).await {
-        return response;
-    }
+    let claims = match authorize_request(&state, &headers).await {
+        Ok(c) => c,
+        Err(response) => return response,
+    };
 
     // Extract path and method
     let path = req.uri().path().to_string();
@@ -180,6 +181,39 @@ async fn transparent_proxy_handler(State(state): State<Arc<AppState>>, req: Requ
             }
         }
     };
+
+    // Catch-all proxy: we deliberately do NOT pin a JWT model into the
+    // body here, because unknown endpoints may not take a `model` field
+    // at all and silently injecting one would corrupt the request. We
+    // only enforce that *if* the body explicitly carries a `model`, it
+    // must be in the JWT's allowlist; and that any `lora_path` override
+    // is rejected.
+    if let Some(claims_ref) = claims.as_ref() {
+        if let Some(model) = body_json
+            .get("model")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            if !claims_ref.allows_model(model) {
+                warn!(
+                    run_id = %claims_ref.run_id,
+                    requested_model = %model,
+                    "rejecting transparent-proxy request: model outside JWT scope"
+                );
+                return (
+                    StatusCode::FORBIDDEN,
+                    format!(
+                        "run {} is not authorized to access model {:?}",
+                        claims_ref.run_id, model
+                    ),
+                )
+                    .into_response();
+            }
+        }
+        if let Err(response) = enforce_no_lora_path_override_json(&claims, &body_json) {
+            return response;
+        }
+    }
 
     // Route through transparent proxy
     state
@@ -231,11 +265,125 @@ async fn get_server_info(State(state): State<Arc<AppState>>, req: Request) -> Re
 
 async fn v1_models(State(state): State<Arc<AppState>>, req: Request) -> Response {
     let headers = req.headers().clone();
-    if let Err(response) = authorize_request(&state, &headers).await {
-        return response;
+    let claims = match authorize_request(&state, &headers).await {
+        Ok(c) => c,
+        Err(response) => return response,
+    };
+
+    let upstream = state.router.get_models(req).await;
+
+    // Admin / API-key auth sees the full list. Run-scoped JWTs only see
+    // the entries their `allows_model` check accepts — i.e. their base
+    // model and their own LoRA(s). This stops `/v1/models` from leaking
+    // sibling runs' adapter names, which are otherwise the only piece of
+    // the JWT model-isolation boundary that's not unguessable.
+    let Some(claims) = claims else {
+        return upstream;
+    };
+
+    filter_models_response(upstream, &claims).await
+}
+
+/// Rebuild a `/v1/models` response with `data[]` filtered to entries the
+/// JWT is allowed to target. On any parse failure we fall back to a 502
+/// rather than leaking the unfiltered list.
+///
+/// We preserve the upstream response `parts` (status, headers) and only
+/// swap the body, so JWT-authenticated callers still receive
+/// `x-request-id`, rate-limit headers, etc. that API-key callers see.
+/// Only `Content-Length` is overwritten because the body length changes.
+async fn filter_models_response(response: Response, claims: &RftClaims) -> Response {
+    let (mut parts, body) = response.into_parts();
+    if !parts.status.is_success() {
+        return Response::from_parts(parts, body);
     }
 
-    state.router.get_models(req).await
+    let bytes = match axum::body::to_bytes(body, usize::MAX).await {
+        Ok(b) => b,
+        Err(e) => {
+            warn!("failed to read /v1/models body for filtering: {e}");
+            return (StatusCode::BAD_GATEWAY, "failed to read upstream models response")
+                .into_response();
+        }
+    };
+
+    let mut json: serde_json::Value = match serde_json::from_slice(&bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("failed to parse /v1/models body for filtering: {e}");
+            return (StatusCode::BAD_GATEWAY, "failed to parse upstream models response")
+                .into_response();
+        }
+    };
+
+    // We have to handle two response shapes:
+    //   1. OpenAI-style:    {"object": "list", "data": [{"id": ..., ...}, ...]}
+    //      (all single-router HTTP backends use this)
+    //   2. RouterManager:   {"models": ["model_a", "model_b", ...]}
+    //      (the IGW / multi-router deployment, see
+    //      `RouterManager::get_models` in routers/router_manager.rs)
+    //
+    // If neither shape matches we fail closed (502) rather than passing
+    // the body through unfiltered — the doc comment promises this and
+    // an unrecognized shape on a JWT-authed `/v1/models` is the exact
+    // case where leaking is most dangerous.
+    let mut filtered_something = false;
+    if let Some(data) = json.get_mut("data").and_then(|d| d.as_array_mut()) {
+        data.retain(|entry| {
+            entry
+                .get("id")
+                .and_then(|v| v.as_str())
+                .map(|id| claims.allows_model(id))
+                .unwrap_or(false)
+        });
+        filtered_something = true;
+    }
+    if let Some(models) = json.get_mut("models").and_then(|m| m.as_array_mut()) {
+        models.retain(|entry| {
+            entry
+                .as_str()
+                .map(|name| claims.allows_model(name))
+                .unwrap_or(false)
+        });
+        filtered_something = true;
+    }
+    if !filtered_something {
+        warn!(
+            run_id = %claims.run_id,
+            "refusing to return /v1/models: upstream payload has neither `data` nor `models` array"
+        );
+        return (
+            StatusCode::BAD_GATEWAY,
+            "upstream models response shape not recognized; refusing to leak",
+        )
+            .into_response();
+    }
+
+    let new_body = match serde_json::to_vec(&json) {
+        Ok(b) => b,
+        Err(e) => {
+            warn!("failed to re-serialize filtered /v1/models body: {e}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to serialize filtered models response",
+            )
+                .into_response();
+        }
+    };
+
+    // Body length changed; refresh Content-Length and force JSON
+    // content-type (the upstream may not have set one). Other headers
+    // stay intact so request IDs / rate-limit metadata propagate.
+    parts.headers.insert(
+        http::header::CONTENT_LENGTH,
+        http::HeaderValue::from(new_body.len()),
+    );
+    parts.headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/json"),
+    );
+
+    Response::from_parts(parts, axum::body::Body::from(new_body))
 }
 
 async fn get_model_info(State(state): State<Arc<AppState>>, req: Request) -> Response {
@@ -252,6 +400,217 @@ fn run_id_from_claims(claims: &Option<RftClaims>) -> Option<String> {
     claims.as_ref().map(|c| c.run_id.clone())
 }
 
+/// Pin the request body's `model` field to the JWT's allowlist and
+/// validate it. If the request omits `model` (or sends an empty string),
+/// it is rewritten to the JWT's base `model` claim — never silently left
+/// as `None`, because in multi-model deployments dispatch with `None`
+/// would route to an arbitrary worker outside the JWT's scope.
+///
+/// API-key auth (`claims == None`) is unrestricted and the body is
+/// passed through unchanged.
+fn pin_and_check_model(
+    claims: &Option<RftClaims>,
+    model: &mut Option<String>,
+) -> Result<(), Response> {
+    let Some(claims) = claims else {
+        return Ok(());
+    };
+
+    let needs_pin = match model.as_deref() {
+        Some(m) => m.is_empty(),
+        None => true,
+    };
+    if needs_pin {
+        match claims.model.as_deref() {
+            Some(base) if !base.is_empty() => {
+                *model = Some(base.to_string());
+            }
+            _ => {
+                warn!(
+                    run_id = %claims.run_id,
+                    "rejecting JWT request: no model in body and JWT has no base model claim"
+                );
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    "request omits `model` and JWT has no base model to fall back to",
+                )
+                    .into_response());
+            }
+        }
+    }
+
+    let resolved = model.as_deref().unwrap_or("");
+    if claims.allows_model(resolved) {
+        return Ok(());
+    }
+
+    warn!(
+        run_id = %claims.run_id,
+        requested_model = %resolved,
+        allowed_base = ?claims.model,
+        allowed_lora = ?claims.lora,
+        "rejecting request: model outside JWT scope"
+    );
+    Err((
+        StatusCode::FORBIDDEN,
+        format!(
+            "run {} is not authorized to access model {:?}",
+            claims.run_id, resolved
+        ),
+    )
+        .into_response())
+}
+
+/// `String` variant for `RerankRequest` (whose `model` field is a
+/// non-optional `String` defaulting to `DEFAULT_MODEL_NAME`). Treats an
+/// empty string or the `"default"` sentinel as "no model specified" and
+/// pins it to the JWT base before validation. Required because
+/// `V1RerankReqInput` has no model field at all and always lands here
+/// with `model == "default"` after the `From` conversion — a JWT caller
+/// could otherwise never satisfy the scope check.
+fn pin_and_check_model_string(
+    claims: &Option<RftClaims>,
+    model: &mut String,
+) -> Result<(), Response> {
+    let Some(claims) = claims else {
+        return Ok(());
+    };
+
+    if model.is_empty() || model == DEFAULT_MODEL_NAME {
+        match claims.model.as_deref() {
+            Some(base) if !base.is_empty() => {
+                *model = base.to_string();
+            }
+            _ => {
+                warn!(
+                    run_id = %claims.run_id,
+                    "rejecting JWT request: rerank body has no model and JWT has no base model claim"
+                );
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    "request omits `model` and JWT has no base model to fall back to",
+                )
+                    .into_response());
+            }
+        }
+    }
+
+    if claims.allows_model(model) {
+        return Ok(());
+    }
+
+    warn!(
+        run_id = %claims.run_id,
+        requested_model = %model,
+        "rejecting rerank request: model outside JWT scope"
+    );
+    Err((
+        StatusCode::FORBIDDEN,
+        format!(
+            "run {} is not authorized to access model {:?}",
+            claims.run_id, model
+        ),
+    )
+        .into_response())
+}
+
+/// JSON-body variant for the transparent proxy / `/v1/responses`. Same
+/// semantics as [`pin_and_check_model`]: pins missing/empty `model` to
+/// the JWT base, then validates against the allowlist.
+fn pin_and_check_model_json(
+    claims: &Option<RftClaims>,
+    body: &mut serde_json::Value,
+) -> Result<(), Response> {
+    let Some(claims) = claims else {
+        return Ok(());
+    };
+
+    let current = body
+        .get("model")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+
+    let resolved = match current {
+        Some(m) => m,
+        None => {
+            let Some(base) = claims
+                .model
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+            else {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    "request omits `model` and JWT has no base model to fall back to",
+                )
+                    .into_response());
+            };
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert("model".to_string(), serde_json::Value::String(base.clone()));
+            }
+            base
+        }
+    };
+
+    if claims.allows_model(&resolved) {
+        return Ok(());
+    }
+
+    warn!(
+        run_id = %claims.run_id,
+        requested_model = %resolved,
+        "rejecting request: model outside JWT scope (json body)"
+    );
+    Err((
+        StatusCode::FORBIDDEN,
+        format!(
+            "run {} is not authorized to access model {:?}",
+            claims.run_id, resolved
+        ),
+    )
+        .into_response())
+}
+
+/// Reject `lora_path` overrides on JWT-authenticated requests. The vLLM
+/// `lora_path` extension lets a caller point at any LoRA on disk, which
+/// would bypass the JWT's `lora` claim. We hard-reject so failures are
+/// loud rather than silent.
+fn enforce_no_lora_path_override<T>(
+    claims: &Option<RftClaims>,
+    lora_path: &Option<T>,
+) -> Result<(), Response> {
+    if claims.is_some() && lora_path.is_some() {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "lora_path override is not allowed with a run-scoped JWT",
+        )
+            .into_response());
+    }
+    Ok(())
+}
+
+/// JSON-body variant. An explicit `"lora_path": null` is treated as
+/// absent — only a non-null override is rejected — to stay consistent
+/// with the typed handlers, where `Option<LoRAPath>` deserializes
+/// `null` to `None`.
+fn enforce_no_lora_path_override_json(
+    claims: &Option<RftClaims>,
+    body: &serde_json::Value,
+) -> Result<(), Response> {
+    if claims.is_none() {
+        return Ok(());
+    }
+    match body.get("lora_path") {
+        Some(v) if !v.is_null() => Err((
+            StatusCode::FORBIDDEN,
+            "lora_path override is not allowed with a run-scoped JWT",
+        )
+            .into_response()),
+        _ => Ok(()),
+    }
+}
+
 // Generation endpoints
 // The RouterTrait now accepts optional headers and typed body directly
 async fn generate(
@@ -263,6 +622,13 @@ async fn generate(
         Ok(c) => c,
         Err(response) => return response,
     };
+    // GenerateRequest has no `model` field — dispatch is implicit, so
+    // there is nothing to pin or scope-check. We still have to refuse
+    // `lora_path` overrides, otherwise a JWT caller could point at any
+    // LoRA on disk via this endpoint.
+    if let Err(response) = enforce_no_lora_path_override(&claims, &body.lora_path) {
+        return response;
+    }
     let run_id = run_id_from_claims(&claims);
 
     state
@@ -274,12 +640,18 @@ async fn generate(
 async fn v1_chat_completions(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
-    Json(body): Json<ChatCompletionRequest>,
+    Json(mut body): Json<ChatCompletionRequest>,
 ) -> Response {
     let claims = match authorize_request(&state, &headers).await {
         Ok(c) => c,
         Err(response) => return response,
     };
+    if let Err(response) = pin_and_check_model(&claims, &mut body.model) {
+        return response;
+    }
+    if let Err(response) = enforce_no_lora_path_override(&claims, &body.lora_path) {
+        return response;
+    }
     let run_id = run_id_from_claims(&claims);
 
     state
@@ -291,12 +663,18 @@ async fn v1_chat_completions(
 async fn v1_completions(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
-    Json(body): Json<CompletionRequest>,
+    Json(mut body): Json<CompletionRequest>,
 ) -> Response {
     let claims = match authorize_request(&state, &headers).await {
         Ok(c) => c,
         Err(response) => return response,
     };
+    if let Err(response) = pin_and_check_model(&claims, &mut body.model) {
+        return response;
+    }
+    if let Err(response) = enforce_no_lora_path_override(&claims, &body.lora_path) {
+        return response;
+    }
     let run_id = run_id_from_claims(&claims);
 
     state
@@ -308,9 +686,13 @@ async fn v1_completions(
 async fn rerank(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
-    Json(body): Json<RerankRequest>,
+    Json(mut body): Json<RerankRequest>,
 ) -> Response {
-    if let Err(response) = authorize_request(&state, &headers).await {
+    let claims = match authorize_request(&state, &headers).await {
+        Ok(c) => c,
+        Err(response) => return response,
+    };
+    if let Err(response) = pin_and_check_model_string(&claims, &mut body.model) {
         return response;
     }
 
@@ -322,22 +704,37 @@ async fn v1_rerank(
     headers: http::HeaderMap,
     Json(body): Json<V1RerankReqInput>,
 ) -> Response {
-    if let Err(response) = authorize_request(&state, &headers).await {
+    let claims = match authorize_request(&state, &headers).await {
+        Ok(c) => c,
+        Err(response) => return response,
+    };
+    // V1RerankReqInput has no `model` field; the From conversion fills
+    // in `DEFAULT_MODEL_NAME`, which `pin_and_check_model_string` will
+    // then rewrite to the JWT base when claims are present.
+    let mut converted: RerankRequest = body.into();
+    if let Err(response) = pin_and_check_model_string(&claims, &mut converted.model) {
         return response;
     }
 
     state
         .router
-        .route_rerank(Some(&headers), &body.into(), None)
+        .route_rerank(Some(&headers), &converted, None)
         .await
 }
 
 async fn v1_responses(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
-    Json(body): Json<serde_json::Value>,
+    Json(mut body): Json<serde_json::Value>,
 ) -> Response {
-    if let Err(response) = authorize_request(&state, &headers).await {
+    let claims = match authorize_request(&state, &headers).await {
+        Ok(c) => c,
+        Err(response) => return response,
+    };
+    if let Err(response) = pin_and_check_model_json(&claims, &mut body) {
+        return response;
+    }
+    if let Err(response) = enforce_no_lora_path_override_json(&claims, &body) {
         return response;
     }
 
@@ -350,9 +747,13 @@ async fn v1_responses(
 async fn v1_embeddings(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
-    Json(body): Json<EmbeddingRequest>,
+    Json(mut body): Json<EmbeddingRequest>,
 ) -> Response {
-    if let Err(response) = authorize_request(&state, &headers).await {
+    let claims = match authorize_request(&state, &headers).await {
+        Ok(c) => c,
+        Err(response) => return response,
+    };
+    if let Err(response) = pin_and_check_model(&claims, &mut body.model) {
         return response;
     }
 
