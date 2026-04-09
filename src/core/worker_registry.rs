@@ -146,11 +146,17 @@ impl WorkerRegistry {
             // Remove from URL mapping
             self.url_to_id.remove(worker.url());
 
-            // Collect all models this worker was indexed under
-            let models_to_clean: Vec<String> = match self.known_models.remove(worker.url()) {
+            // Collect all models this worker was indexed under.
+            // Always include worker.model_id() in case re-registration changed
+            // the immutable label before sync_worker_models updated known_models.
+            let mut models_to_clean: Vec<String> = match self.known_models.remove(worker.url()) {
                 Some((_, models)) => models,
-                None => vec![worker.model_id().to_string()],
+                None => Vec::new(),
             };
+            let base_model = worker.model_id().to_string();
+            if !models_to_clean.contains(&base_model) {
+                models_to_clean.push(base_model);
+            }
 
             // Remove from all model indexes (base model + LoRA adapters)
             let worker_url = worker.url();
