@@ -674,4 +674,118 @@ mod tests {
         assert_eq!(llama_workers_after.len(), 1);
         assert_eq!(llama_workers_after[0].url(), "http://worker2:8080");
     }
+
+    /// Simulates the autoscale scenario from issue #1092:
+    ///
+    /// - worker1 (inference-0) serves base model + LoRA adapter
+    /// - worker2 (inference-1) scales up with only the base model
+    /// - Requests for the LoRA model should only route to worker1
+    ///
+    /// The health checker calls `fetch_models_from_worker` which returns
+    /// ALL models from `/v1/models` (base + LoRAs), but then only takes
+    /// the first one via `models.into_iter().next()`. This means LoRA
+    /// adapters are never indexed and can't be routed to.
+    #[test]
+    fn test_lora_adapter_routing_after_autoscale() {
+        let registry = WorkerRegistry::new();
+
+        // worker1 = inference-0: has the base model
+        let mut labels1 = HashMap::new();
+        labels1.insert(
+            "model_id".to_string(),
+            "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string(),
+        );
+        let worker1 = WorkerFactory::create_regular_with_labels(
+            "http://inference-0:8000".to_string(),
+            labels1,
+            CircuitBreakerConfig::default(),
+        );
+        registry.register(Arc::from(worker1));
+
+        // worker2 = inference-1: autoscaled replica, also has base model only
+        let mut labels2 = HashMap::new();
+        labels2.insert(
+            "model_id".to_string(),
+            "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string(),
+        );
+        let worker2 = WorkerFactory::create_regular_with_labels(
+            "http://inference-1:8000".to_string(),
+            labels2,
+            CircuitBreakerConfig::default(),
+        );
+        registry.register(Arc::from(worker2));
+
+        // Both workers serve the base model
+        assert_eq!(
+            registry
+                .get_by_model_fast("Qwen/Qwen3-30B-A3B-Instruct-2507")
+                .len(),
+            2
+        );
+
+        // Simulate what the health checker does when inference-0's /v1/models
+        // returns ["Qwen/Qwen3-30B-A3B-Instruct-2507", "rft-s7lpo1teyeaarb2m28e5s81a"].
+        // Currently it only takes the FIRST model, so the LoRA is never indexed.
+        //
+        // This is the bug: update_worker_model replaces the worker's model,
+        // it doesn't ADD models. Even if we called it for the LoRA, it would
+        // remove the worker from the base model index.
+        registry.update_worker_model(
+            "http://inference-0:8000",
+            "Qwen/Qwen3-30B-A3B-Instruct-2507",
+        );
+
+        // The LoRA adapter should be routable to inference-0 (which has it loaded).
+        // This FAILS because the registry has no concept of multiple models per worker.
+        let lora_workers = registry.get_by_model_fast("rft-s7lpo1teyeaarb2m28e5s81a");
+        assert_eq!(
+            lora_workers.len(),
+            1,
+            "LoRA adapter should be routable to inference-0, but no workers found"
+        );
+        assert_eq!(lora_workers[0].url(), "http://inference-0:8000");
+
+        // The base model should still be routable to BOTH workers
+        let base_workers = registry.get_by_model_fast("Qwen/Qwen3-30B-A3B-Instruct-2507");
+        assert_eq!(
+            base_workers.len(),
+            2,
+            "Base model should be routable to both workers"
+        );
+    }
+
+    /// Tests that update_worker_model is lossy: calling it with a LoRA model
+    /// removes the worker from the base model index entirely.
+    #[test]
+    fn test_update_worker_model_is_lossy_for_multi_model_workers() {
+        let registry = WorkerRegistry::new();
+
+        let mut labels = HashMap::new();
+        labels.insert("model_id".to_string(), "base-model".to_string());
+        let worker = WorkerFactory::create_regular_with_labels(
+            "http://worker1:8000".to_string(),
+            labels,
+            CircuitBreakerConfig::default(),
+        );
+        registry.register(Arc::from(worker));
+
+        // Initially indexed under base-model
+        assert_eq!(registry.get_by_model_fast("base-model").len(), 1);
+
+        // Simulate updating to a LoRA adapter (what would happen if the health
+        // checker iterated all models instead of just the first)
+        registry.update_worker_model("http://worker1:8000", "rft-lora-adapter");
+
+        // Worker is now indexed under the LoRA...
+        assert_eq!(registry.get_by_model_fast("rft-lora-adapter").len(), 1);
+
+        // ...but LOST from the base model index. This is the fundamental problem:
+        // a worker can only be indexed under ONE model at a time.
+        let base_workers = registry.get_by_model_fast("base-model");
+        assert_eq!(
+            base_workers.len(),
+            1,
+            "Worker should still be indexed under base-model, but it was removed"
+        );
+    }
 }

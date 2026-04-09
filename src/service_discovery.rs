@@ -1058,16 +1058,16 @@ mod tests {
         async fn get_model_info(&self, _req: axum::extract::Request<axum::body::Body>) -> axum::response::Response {
             axum::http::StatusCode::OK.into_response()
         }
-        async fn route_generate(&self, _h: Option<&axum::http::HeaderMap>, _b: &crate::protocols::spec::GenerateRequest, _m: Option<&str>) -> axum::response::Response {
+        async fn route_generate(&self, _h: Option<&axum::http::HeaderMap>, _b: &crate::protocols::spec::GenerateRequest, _m: Option<&str>, _r: Option<&str>) -> axum::response::Response {
             axum::http::StatusCode::OK.into_response()
         }
-        async fn route_chat(&self, _h: Option<&axum::http::HeaderMap>, _b: &crate::protocols::spec::ChatCompletionRequest, _m: Option<&str>) -> axum::response::Response {
+        async fn route_chat(&self, _h: Option<&axum::http::HeaderMap>, _b: &crate::protocols::spec::ChatCompletionRequest, _m: Option<&str>, _r: Option<&str>) -> axum::response::Response {
             axum::http::StatusCode::OK.into_response()
         }
-        async fn route_completion(&self, _h: Option<&axum::http::HeaderMap>, _b: &crate::protocols::spec::CompletionRequest, _m: Option<&str>) -> axum::response::Response {
+        async fn route_completion(&self, _h: Option<&axum::http::HeaderMap>, _b: &crate::protocols::spec::CompletionRequest, _m: Option<&str>, _r: Option<&str>) -> axum::response::Response {
             axum::http::StatusCode::OK.into_response()
         }
-        async fn route_responses(&self, _h: Option<&axum::http::HeaderMap>, _b: &crate::protocols::spec::ResponsesRequest, _m: Option<&str>) -> axum::response::Response {
+        async fn route_responses(&self, _h: Option<&axum::http::HeaderMap>, _b: &crate::protocols::spec::ResponsesRequest, _m: Option<&str>, _r: Option<&str>) -> axum::response::Response {
             axum::http::StatusCode::OK.into_response()
         }
         async fn get_response(&self, _h: Option<&axum::http::HeaderMap>, _id: &str) -> axum::response::Response {
