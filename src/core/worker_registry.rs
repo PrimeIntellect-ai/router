@@ -146,18 +146,24 @@ impl WorkerRegistry {
             // Remove from URL mapping
             self.url_to_id.remove(worker.url());
 
-            // Remove from model index (both ID-based and optimized)
-            if let Some(mut model_workers) = self.model_workers.get_mut(worker.model_id()) {
-                model_workers.retain(|id| id != worker_id);
-            }
+            // Collect all models this worker was indexed under
+            let models_to_clean: Vec<String> = match self.known_models.remove(worker.url()) {
+                Some((_, models)) => models,
+                None => vec![worker.model_id().to_string()],
+            };
 
-            // Remove from optimized model index
-            if let Some(model_index_entry) = self.model_index.get(worker.model_id()) {
-                let worker_url = worker.url();
-                model_index_entry
-                    .write()
-                    .expect("RwLock for model_index is poisoned")
-                    .retain(|w| w.url() != worker_url);
+            // Remove from all model indexes (base model + LoRA adapters)
+            let worker_url = worker.url();
+            for model in &models_to_clean {
+                if let Some(mut ids) = self.model_workers.get_mut(model.as_str()) {
+                    ids.retain(|id| *id != *worker_id);
+                }
+                if let Some(entry) = self.model_index.get(model.as_str()) {
+                    match entry.write() {
+                        Ok(mut vec) => vec.retain(|w| w.url() != worker_url),
+                        Err(e) => warn!("Poisoned model_index lock for '{}': {}", model, e),
+                    }
+                }
             }
 
             // Remove from type index
@@ -804,6 +810,46 @@ mod tests {
             registry.get_by_model_fast("rft-lora-adapter").len(),
             0,
             "Evicted LoRA should have no workers"
+        );
+    }
+
+    /// Tests that removing a worker cleans up all model indexes including LoRAs.
+    #[test]
+    fn test_remove_worker_cleans_up_lora_indexes() {
+        let registry = WorkerRegistry::new();
+
+        let mut labels = HashMap::new();
+        labels.insert("model_id".to_string(), "base-model".to_string());
+        let worker = WorkerFactory::create_regular_with_labels(
+            "http://worker1:8000".to_string(),
+            labels,
+            CircuitBreakerConfig::default(),
+        );
+        registry.register(Arc::from(worker));
+
+        // Worker has base model + LoRA
+        registry.sync_worker_models(
+            "http://worker1:8000",
+            &[
+                "base-model".to_string(),
+                "rft-lora-adapter".to_string(),
+            ],
+        );
+        assert_eq!(registry.get_by_model_fast("rft-lora-adapter").len(), 1);
+
+        // Remove the worker (simulates KEDA scale-down)
+        registry.remove_by_url("http://worker1:8000");
+
+        // Both base model and LoRA indexes should be empty
+        assert_eq!(
+            registry.get_by_model_fast("base-model").len(),
+            0,
+            "Base model index should be empty after worker removal"
+        );
+        assert_eq!(
+            registry.get_by_model_fast("rft-lora-adapter").len(),
+            0,
+            "LoRA index should be empty after worker removal"
         );
     }
 }
