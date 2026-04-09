@@ -24,6 +24,7 @@ jobs:
           BRANCH: ${{ github.event.pull_request.head.ref }}
         run: |
           VERSION="${BRANCH#release/}"
+          VERSION="${VERSION#v}"
           echo "tag=v${VERSION}" >> $GITHUB_OUTPUT
 
       - name: Create and push tag
