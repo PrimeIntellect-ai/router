@@ -73,10 +73,11 @@ pub struct WorkerRegistry {
     /// URL to worker ID mapping (for backward compatibility)
     url_to_id: Arc<DashMap<String, WorkerId>>,
 
-    /// Tracks the last-known model_id per worker URL.
+    /// Tracks the last-known model IDs per worker URL.
     /// Used by the health checker to detect model changes, since
     /// the Worker trait's model_id() reads from immutable metadata.
-    known_models: Arc<DashMap<String, String>>,
+    /// A worker can serve multiple models (e.g. base model + LoRA adapters).
+    known_models: Arc<DashMap<String, Vec<String>>>,
 }
 
 impl WorkerRegistry {
@@ -283,59 +284,71 @@ impl WorkerRegistry {
     /// `new_model_id`. No-op if the model hasn't changed or the worker
     /// is not in the registry.
     pub fn update_worker_model(&self, url: &str, new_model_id: &str) {
+        self.sync_worker_models(url, &[new_model_id.to_string()]);
+    }
+
+    /// Sync a worker's model index to match the given set of models.
+    ///
+    /// Removes the worker from model indexes it no longer serves, and adds
+    /// it to indexes for newly discovered models. This supports workers that
+    /// serve multiple models (e.g. a base model + LoRA adapters).
+    pub fn sync_worker_models(&self, url: &str, new_models: &[String]) {
         let Some(worker) = self.get_by_url(url) else {
             return;
         };
-
-        // Use known_models to track the current model, since Worker::model_id()
-        // reads from immutable metadata and can't be updated after construction.
-        let old_model_id = match self.known_models.get(url) {
-            Some(entry) => entry.clone(),
-            None => worker.model_id().to_string(),
-        };
-
-        if old_model_id == new_model_id {
-            return;
-        }
 
         let Some(worker_id) = self.url_to_id.get(url).map(|id| id.clone()) else {
             return;
         };
 
-        info!(
-            "Model changed on {}: '{}' -> '{}'",
-            url, old_model_id, new_model_id
-        );
+        let old_models: Vec<String> = match self.known_models.get(url) {
+            Some(entry) => entry.clone(),
+            None => vec![worker.model_id().to_string()],
+        };
 
-        // Record the new model so the next refresh cycle sees it as current
-        self.known_models
-            .insert(url.to_string(), new_model_id.to_string());
-
-        // Remove from old indexes
-        if let Some(mut ids) = self.model_workers.get_mut(&old_model_id) {
-            ids.retain(|id| *id != worker_id);
+        if old_models == new_models {
+            return;
         }
-        if let Some(entry) = self.model_index.get(&old_model_id) {
-            match entry.write() {
-                Ok(mut vec) => vec.retain(|w| w.url() != url),
-                Err(e) => warn!("Poisoned model_index lock for '{}': {}", old_model_id, e),
+
+        let old_set: std::collections::HashSet<&str> =
+            old_models.iter().map(|s| s.as_str()).collect();
+        let new_set: std::collections::HashSet<&str> =
+            new_models.iter().map(|s| s.as_str()).collect();
+
+        // Remove from indexes for models no longer served
+        for removed in old_set.difference(&new_set) {
+            info!("Model removed on {}: '{}'", url, removed);
+            if let Some(mut ids) = self.model_workers.get_mut(*removed) {
+                ids.retain(|id| *id != worker_id);
+            }
+            if let Some(entry) = self.model_index.get(*removed) {
+                match entry.write() {
+                    Ok(mut vec) => vec.retain(|w| w.url() != url),
+                    Err(e) => warn!("Poisoned model_index lock for '{}': {}", removed, e),
+                }
             }
         }
 
-        // Insert into new indexes
-        self.model_workers
-            .entry(new_model_id.to_string())
-            .or_default()
-            .push(worker_id);
-        match self
-            .model_index
-            .entry(new_model_id.to_string())
-            .or_insert_with(|| Arc::new(RwLock::new(Vec::new())))
-            .write()
-        {
-            Ok(mut vec) => vec.push(worker.clone()),
-            Err(e) => warn!("Poisoned model_index lock for '{}': {}", new_model_id, e),
+        // Add to indexes for newly discovered models
+        for added in new_set.difference(&old_set) {
+            info!("Model added on {}: '{}'", url, added);
+            self.model_workers
+                .entry(added.to_string())
+                .or_default()
+                .push(worker_id.clone());
+            match self
+                .model_index
+                .entry(added.to_string())
+                .or_insert_with(|| Arc::new(RwLock::new(Vec::new())))
+                .write()
+            {
+                Ok(mut vec) => vec.push(worker.clone()),
+                Err(e) => warn!("Poisoned model_index lock for '{}': {}", added, e),
+            }
         }
+
+        // Record current models for next refresh cycle
+        self.known_models.insert(url.to_string(), new_models.to_vec());
     }
 
     /// Get all model IDs with workers
@@ -509,7 +522,7 @@ impl WorkerRegistry {
                 if check_count % MODEL_REFRESH_INTERVAL == 0 {
                     // Deduplicate by base URL so DP workers (@0, @1, …)
                     // sharing the same endpoint only trigger one fetch.
-                    let mut fetched: std::collections::HashMap<String, Option<String>> =
+                    let mut fetched: std::collections::HashMap<String, Vec<String>> =
                         std::collections::HashMap::new();
 
                     for worker in &workers {
@@ -517,19 +530,18 @@ impl WorkerRegistry {
                             continue;
                         }
                         let base_url = strip_dp_rank(worker.url()).to_string();
-                        let new_model = match fetched.entry(base_url.clone()) {
+                        let new_models = match fetched.entry(base_url.clone()) {
                             std::collections::hash_map::Entry::Occupied(e) => e.get().clone(),
                             std::collections::hash_map::Entry::Vacant(e) => {
                                 let models =
                                     crate::core::worker::fetch_models_from_worker(&base_url)
                                         .await;
-                                let first = models.into_iter().next();
-                                e.insert(first.clone());
-                                first
+                                e.insert(models.clone());
+                                models
                             }
                         };
-                        if let Some(ref model) = new_model {
-                            registry.update_worker_model(worker.url(), model);
+                        if !new_models.is_empty() {
+                            registry.sync_worker_models(worker.url(), &new_models);
                         }
                     }
                 }
@@ -680,11 +692,6 @@ mod tests {
     /// - worker1 (inference-0) serves base model + LoRA adapter
     /// - worker2 (inference-1) scales up with only the base model
     /// - Requests for the LoRA model should only route to worker1
-    ///
-    /// The health checker calls `fetch_models_from_worker` which returns
-    /// ALL models from `/v1/models` (base + LoRAs), but then only takes
-    /// the first one via `models.into_iter().next()`. This means LoRA
-    /// adapters are never indexed and can't be routed to.
     #[test]
     fn test_lora_adapter_routing_after_autoscale() {
         let registry = WorkerRegistry::new();
@@ -723,29 +730,31 @@ mod tests {
             2
         );
 
-        // Simulate what the health checker does when inference-0's /v1/models
-        // returns ["Qwen/Qwen3-30B-A3B-Instruct-2507", "rft-s7lpo1teyeaarb2m28e5s81a"].
-        // Currently it only takes the FIRST model, so the LoRA is never indexed.
-        //
-        // This is the bug: update_worker_model replaces the worker's model,
-        // it doesn't ADD models. Even if we called it for the LoRA, it would
-        // remove the worker from the base model index.
-        registry.update_worker_model(
+        // Simulate health checker: inference-0's /v1/models returns base + LoRA
+        registry.sync_worker_models(
             "http://inference-0:8000",
-            "Qwen/Qwen3-30B-A3B-Instruct-2507",
+            &[
+                "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string(),
+                "rft-s7lpo1teyeaarb2m28e5s81a".to_string(),
+            ],
         );
 
-        // The LoRA adapter should be routable to inference-0 (which has it loaded).
-        // This FAILS because the registry has no concept of multiple models per worker.
+        // inference-1 only has the base model
+        registry.sync_worker_models(
+            "http://inference-1:8000",
+            &["Qwen/Qwen3-30B-A3B-Instruct-2507".to_string()],
+        );
+
+        // LoRA adapter should only route to inference-0
         let lora_workers = registry.get_by_model_fast("rft-s7lpo1teyeaarb2m28e5s81a");
         assert_eq!(
             lora_workers.len(),
             1,
-            "LoRA adapter should be routable to inference-0, but no workers found"
+            "LoRA adapter should be routable to inference-0"
         );
         assert_eq!(lora_workers[0].url(), "http://inference-0:8000");
 
-        // The base model should still be routable to BOTH workers
+        // Base model should still be routable to BOTH workers
         let base_workers = registry.get_by_model_fast("Qwen/Qwen3-30B-A3B-Instruct-2507");
         assert_eq!(
             base_workers.len(),
@@ -754,10 +763,11 @@ mod tests {
         );
     }
 
-    /// Tests that update_worker_model is lossy: calling it with a LoRA model
-    /// removes the worker from the base model index entirely.
+    /// Tests that sync_worker_models correctly handles LoRA eviction:
+    /// when a LoRA is unloaded, the worker is removed from that model's index
+    /// but stays in the base model index.
     #[test]
-    fn test_update_worker_model_is_lossy_for_multi_model_workers() {
+    fn test_sync_worker_models_lora_eviction() {
         let registry = WorkerRegistry::new();
 
         let mut labels = HashMap::new();
@@ -769,23 +779,31 @@ mod tests {
         );
         registry.register(Arc::from(worker));
 
-        // Initially indexed under base-model
+        // Worker loads a LoRA adapter
+        registry.sync_worker_models(
+            "http://worker1:8000",
+            &[
+                "base-model".to_string(),
+                "rft-lora-adapter".to_string(),
+            ],
+        );
         assert_eq!(registry.get_by_model_fast("base-model").len(), 1);
-
-        // Simulate updating to a LoRA adapter (what would happen if the health
-        // checker iterated all models instead of just the first)
-        registry.update_worker_model("http://worker1:8000", "rft-lora-adapter");
-
-        // Worker is now indexed under the LoRA...
         assert_eq!(registry.get_by_model_fast("rft-lora-adapter").len(), 1);
 
-        // ...but LOST from the base model index. This is the fundamental problem:
-        // a worker can only be indexed under ONE model at a time.
-        let base_workers = registry.get_by_model_fast("base-model");
+        // LoRA gets evicted — worker now only serves base model
+        registry.sync_worker_models(
+            "http://worker1:8000",
+            &["base-model".to_string()],
+        );
         assert_eq!(
-            base_workers.len(),
+            registry.get_by_model_fast("base-model").len(),
             1,
-            "Worker should still be indexed under base-model, but it was removed"
+            "Worker should still serve base model after LoRA eviction"
+        );
+        assert_eq!(
+            registry.get_by_model_fast("rft-lora-adapter").len(),
+            0,
+            "Evicted LoRA should have no workers"
         );
     }
 }
