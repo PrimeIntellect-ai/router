@@ -21,8 +21,15 @@ git pull --ff-only origin main
 sed -i.bak "s/^version = \".*\"/version = \"$VERSION\"/" pyproject.toml
 rm -f pyproject.toml.bak
 
+# Bump version in Cargo.toml
+sed -i.bak "s/^version = \".*\"/version = \"$VERSION\"/" Cargo.toml
+rm -f Cargo.toml.bak
+
+# Update Cargo.lock to reflect the new version
+cargo check --quiet 2>/dev/null
+
 # Commit, tag, push
-git add pyproject.toml
+git add pyproject.toml Cargo.toml Cargo.lock
 git commit -m "release: v${VERSION}"
 git tag "v${VERSION}"
 git push origin main "v${VERSION}"
