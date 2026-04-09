@@ -25,8 +25,8 @@ rm -f pyproject.toml.bak
 sed -i.bak "s/^version = \".*\"/version = \"$VERSION\"/" Cargo.toml
 rm -f Cargo.toml.bak
 
-# Update Cargo.lock
-cargo update -p vllm_router_rs --precise "$VERSION" 2>/dev/null || cargo generate-lockfile
+# Update Cargo.lock to reflect the new version
+cargo check --quiet 2>/dev/null
 
 # Commit, tag, push
 git add pyproject.toml Cargo.toml Cargo.lock
