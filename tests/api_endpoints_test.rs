@@ -432,7 +432,7 @@ mod generation_tests {
 
     #[tokio::test]
     async fn test_v1_chat_completions_tokens_forwards_correct_path() {
-        let port = 18105;
+        let port = 18109;
         let ctx = TestContext::new(vec![MockWorkerConfig {
             port,
             worker_type: WorkerType::Regular,
