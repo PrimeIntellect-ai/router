@@ -488,16 +488,41 @@ async fn chat_completions_handler(
     }
 }
 
-/// Thin wrapper: captures the tokens-specific path, then delegates to chat_completions_handler.
+/// Handles /v1/chat/completions/tokens (TITO) — mirrors chat_completions_handler
+/// but captures the tokens-specific path so tests can verify correct routing.
 async fn chat_completions_tokens_handler(
-    state: State<Arc<RwLock<MockWorkerConfig>>>,
+    State(config): State<Arc<RwLock<MockWorkerConfig>>>,
     headers: axum::http::HeaderMap,
-    payload: Json<serde_json::Value>,
+    Json(_payload): Json<serde_json::Value>,
 ) -> Response {
-    let config = state.0.read().await;
+    let config = config.read().await;
     capture_request(config.port, "/v1/chat/completions/tokens", &headers);
-    drop(config);
-    chat_completions_handler(state, headers, payload).await
+
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    Json(json!({
+        "id": format!("chatcmpl-{}", Uuid::new_v4()),
+        "object": "chat.completion",
+        "created": timestamp,
+        "model": "mock-model",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": "mock TITO response"
+            },
+            "finish_reason": "stop"
+        }],
+        "usage": {
+            "prompt_tokens": 10,
+            "completion_tokens": 5,
+            "total_tokens": 15
+        }
+    }))
+    .into_response()
 }
 
 async fn completions_handler(
