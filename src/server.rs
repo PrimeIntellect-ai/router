@@ -660,6 +660,29 @@ async fn v1_chat_completions(
         .await
 }
 
+async fn v1_chat_completions_tokens(
+    State(state): State<Arc<AppState>>,
+    headers: http::HeaderMap,
+    Json(mut body): Json<ChatCompletionRequest>,
+) -> Response {
+    let claims = match authorize_request(&state, &headers).await {
+        Ok(c) => c,
+        Err(response) => return response,
+    };
+    if let Err(response) = pin_and_check_model(&claims, &mut body.model) {
+        return response;
+    }
+    if let Err(response) = enforce_no_lora_path_override(&claims, &body.lora_path) {
+        return response;
+    }
+    let run_id = run_id_from_claims(&claims);
+
+    state
+        .router
+        .route_chat_tokens(Some(&headers), &body, None, run_id.as_deref())
+        .await
+}
+
 async fn v1_completions(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
@@ -1182,6 +1205,10 @@ pub fn build_app_with_request_tracing(
     let protected_routes = Router::new()
         .route("/generate", post(generate))
         .route("/v1/chat/completions", post(v1_chat_completions))
+        .route(
+            "/v1/chat/completions/tokens",
+            post(v1_chat_completions_tokens),
+        )
         .route("/v1/completions", post(v1_completions))
         .route("/rerank", post(rerank))
         .route("/v1/rerank", post(v1_rerank))

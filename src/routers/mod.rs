@@ -82,6 +82,18 @@ pub trait RouterTrait: Send + Sync + Debug + WorkerManagement {
         run_id: Option<&str>,
     ) -> Response;
 
+    /// Route a chat completion tokens (TITO) request.
+    /// Defaults to route_chat; override to forward to /v1/chat/completions/tokens.
+    async fn route_chat_tokens(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &ChatCompletionRequest,
+        model_id: Option<&str>,
+        run_id: Option<&str>,
+    ) -> Response {
+        self.route_chat(headers, body, model_id, run_id).await
+    }
+
     /// Route a completion request
     async fn route_completion(
         &self,

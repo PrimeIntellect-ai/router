@@ -612,6 +612,29 @@ impl RouterTrait for RouterManager {
         }
     }
 
+    async fn route_chat_tokens(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &ChatCompletionRequest,
+        _model_id: Option<&str>,
+        _run_id: Option<&str>,
+    ) -> Response {
+        let model_id = body.model.as_deref();
+        let router = self.select_router_for_request(headers, model_id);
+
+        if let Some(router) = router {
+            router
+                .route_chat_tokens(headers, body, model_id, _run_id)
+                .await
+        } else {
+            let msg = match model_id {
+                Some(m) => format!("Model '{}' not found or no router available", m),
+                None => "No routers registered to handle this request".to_string(),
+            };
+            (StatusCode::NOT_FOUND, msg).into_response()
+        }
+    }
+
     /// Route a completion request
     async fn route_completion(
         &self,

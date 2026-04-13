@@ -1535,6 +1535,17 @@ impl RouterTrait for Router {
             .await
     }
 
+    async fn route_chat_tokens(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &ChatCompletionRequest,
+        model_id: Option<&str>,
+        run_id: Option<&str>,
+    ) -> Response {
+        self.route_typed_request(headers, body, "/v1/chat/completions/tokens", model_id, run_id)
+            .await
+    }
+
     async fn route_completion(
         &self,
         headers: Option<&HeaderMap>,
