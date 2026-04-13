@@ -2150,6 +2150,44 @@ impl RouterTrait for PDRouter {
         self.execute_dual_dispatch(headers, body, context).await
     }
 
+    async fn route_chat_tokens(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &ChatCompletionRequest,
+        model_id: Option<&str>,
+        run_id: Option<&str>,
+    ) -> Response {
+        let is_stream = body.stream;
+        let return_logprob = body.logprobs;
+
+        let request_text = if self.policies_need_request_text() {
+            body.messages.first().and_then(|msg| match msg {
+                ChatMessage::User { content, .. } => match content {
+                    UserMessageContent::Text(text) => Some(text.clone()),
+                    UserMessageContent::Parts(_) => None,
+                },
+                ChatMessage::System { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+        } else {
+            None
+        };
+
+        let batch_size = Self::get_chat_batch_size(body);
+
+        let context = PDRequestContext {
+            route: "/v1/chat/completions/tokens",
+            batch_size,
+            is_stream,
+            return_logprob,
+            request_text,
+            model_id,
+            run_id,
+        };
+
+        self.execute_dual_dispatch(headers, body, context).await
+    }
+
     async fn route_completion(
         &self,
         headers: Option<&HeaderMap>,

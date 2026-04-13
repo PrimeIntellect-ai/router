@@ -1270,109 +1270,44 @@ impl VllmPDRouter {
     pub fn worker_registry(&self) -> &crate::core::WorkerRegistry {
         &self.pd_router.worker_registry
     }
-}
 
-// Delegate most RouterTrait methods to the underlying PDRouter,
-// but override specific ones for vLLM behavior
-#[async_trait]
-impl RouterTrait for VllmPDRouter {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
-    async fn health(&self, req: Request<Body>) -> Response {
-        self.pd_router.health(req).await
-    }
-
-    async fn health_generate(&self, req: Request<Body>) -> Response {
-        self.pd_router.health_generate(req).await
-    }
-
-    async fn get_server_info(&self, req: Request<Body>) -> Response {
-        self.pd_router.get_server_info(req).await
-    }
-
-    async fn get_models(&self, req: Request<Body>) -> Response {
-        self.pd_router.get_models(req).await
-    }
-
-    async fn get_model_info(&self, req: Request<Body>) -> Response {
-        self.pd_router.get_model_info(req).await
-    }
-
-    async fn route_generate(
-        &self,
-        headers: Option<&HeaderMap>,
-        body: &crate::protocols::spec::GenerateRequest,
-        model_id: Option<&str>,
-        run_id: Option<&str>,
-    ) -> Response {
-        self.pd_router
-            .route_generate(headers, body, model_id, run_id)
-            .await
-    }
-
-    // Override OpenAI-compatible routes for vLLM two-stage processing
-    async fn route_chat(
+    /// Internal helper for routing chat requests with a configurable backend path.
+    async fn route_chat_with_path(
         &self,
         headers: Option<&HeaderMap>,
         body: &crate::protocols::spec::ChatCompletionRequest,
-        _model_id: Option<&str>,
         run_id: Option<&str>,
+        route: &str,
     ) -> Response {
         info!(
             "vLLM route_chat called, use_discovery={}",
             self.use_discovery
         );
 
+        let request_json = match serde_json::to_value(body) {
+            Ok(json) => {
+                debug!(
+                    "Serialized chat request: {}",
+                    serde_json::to_string_pretty(&json).unwrap_or_default()
+                );
+                json
+            }
+            Err(e) => {
+                return (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Serialization error: {}", e),
+                )
+                    .into_response()
+            }
+        };
+
         if self.use_discovery {
-            // Discovery mode - use vLLM-specific two-stage processing
             info!("Using service discovery mode, processing vLLM two-stage request");
-
-            // Convert to generic request and use vLLM processing
-            let request_json = match serde_json::to_value(body) {
-                Ok(json) => {
-                    debug!(
-                        "Serialized chat request: {}",
-                        serde_json::to_string_pretty(&json).unwrap_or_default()
-                    );
-                    json
-                }
-                Err(e) => {
-                    return (
-                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Serialization error: {}", e),
-                    )
-                        .into_response()
-                }
-            };
-
-            // Process vLLM two-stage request with service discovery
-            self.process_vllm_request(request_json, "/v1/chat/completions", headers, run_id)
+            self.process_vllm_request(request_json, route, headers, run_id)
                 .await
         } else {
-            // Direct URL mode - implement routing logic here (not delegating to PDRouter)
             info!("Using direct URL mode with VllmPDRouter's own routing logic");
 
-            // Convert request to JSON
-            let request_json = match serde_json::to_value(body) {
-                Ok(json) => {
-                    debug!(
-                        "Serialized chat request: {}",
-                        serde_json::to_string_pretty(&json).unwrap_or_default()
-                    );
-                    json
-                }
-                Err(e) => {
-                    return (
-                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Serialization error: {}", e),
-                    )
-                        .into_response()
-                }
-            };
-
-            // Get prefill and decode workers from worker_registry
             let prefill_workers = self.pd_router.worker_registry.get_prefill_workers();
             let decode_workers = self.pd_router.worker_registry.get_decode_workers();
 
@@ -1395,7 +1330,6 @@ impl RouterTrait for VllmPDRouter {
                     .into_response();
             }
 
-            // Select workers using policy with headers for consistent hash
             let request_text = serde_json::to_string(&request_json).ok();
             let request_str = request_text.as_deref();
             let request_headers: Option<HashMap<String, String>> = headers.map(|h| {
@@ -1446,8 +1380,6 @@ impl RouterTrait for VllmPDRouter {
 
             let prefill_worker = &prefill_workers[prefill_idx];
             let decode_worker = &decode_workers[decode_idx];
-            // Load tracking is handled inside process_vllm_two_stage_request for fine-grained
-            // tracking: prefill load only during prefill phase, decode load only during decode phase.
 
             info!(
                 "Chat: Selected prefill={} [policy:{}], decode={} [policy:{}]",
@@ -1457,13 +1389,12 @@ impl RouterTrait for VllmPDRouter {
                 decode_policy.name()
             );
 
-            // Execute dual dispatch with vLLM two-stage processing
             let resp = match self
                 .process_vllm_two_stage_request(
                     request_json,
                     prefill_worker.clone(),
                     decode_worker.clone(),
-                    "/v1/chat/completions",
+                    route,
                     headers,
                     run_id,
                 )
@@ -1484,6 +1415,70 @@ impl RouterTrait for VllmPDRouter {
             };
             resp
         }
+    }
+}
+
+// Delegate most RouterTrait methods to the underlying PDRouter,
+// but override specific ones for vLLM behavior
+#[async_trait]
+impl RouterTrait for VllmPDRouter {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    async fn health(&self, req: Request<Body>) -> Response {
+        self.pd_router.health(req).await
+    }
+
+    async fn health_generate(&self, req: Request<Body>) -> Response {
+        self.pd_router.health_generate(req).await
+    }
+
+    async fn get_server_info(&self, req: Request<Body>) -> Response {
+        self.pd_router.get_server_info(req).await
+    }
+
+    async fn get_models(&self, req: Request<Body>) -> Response {
+        self.pd_router.get_models(req).await
+    }
+
+    async fn get_model_info(&self, req: Request<Body>) -> Response {
+        self.pd_router.get_model_info(req).await
+    }
+
+    async fn route_generate(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &crate::protocols::spec::GenerateRequest,
+        model_id: Option<&str>,
+        run_id: Option<&str>,
+    ) -> Response {
+        self.pd_router
+            .route_generate(headers, body, model_id, run_id)
+            .await
+    }
+
+    // Override OpenAI-compatible routes for vLLM two-stage processing
+    async fn route_chat(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &crate::protocols::spec::ChatCompletionRequest,
+        _model_id: Option<&str>,
+        run_id: Option<&str>,
+    ) -> Response {
+        self.route_chat_with_path(headers, body, run_id, "/v1/chat/completions")
+            .await
+    }
+
+    async fn route_chat_tokens(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &crate::protocols::spec::ChatCompletionRequest,
+        _model_id: Option<&str>,
+        run_id: Option<&str>,
+    ) -> Response {
+        self.route_chat_with_path(headers, body, run_id, "/v1/chat/completions/tokens")
+            .await
     }
 
     async fn route_completion(
