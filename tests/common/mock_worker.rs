@@ -81,6 +81,10 @@ impl MockWorker {
             .route("/get_model_info", get(model_info_handler))
             .route("/generate", post(generate_handler))
             .route("/v1/chat/completions", post(chat_completions_handler))
+            .route(
+                "/v1/chat/completions/tokens",
+                post(chat_completions_tokens_handler),
+            )
             .route("/v1/completions", post(completions_handler))
             .route("/v1/rerank", post(rerank_handler))
             .route("/v1/responses", post(responses_handler))
@@ -482,6 +486,43 @@ async fn chat_completions_handler(
         }))
         .into_response()
     }
+}
+
+/// Handles /v1/chat/completions/tokens (TITO) — mirrors chat_completions_handler
+/// but captures the tokens-specific path so tests can verify correct routing.
+async fn chat_completions_tokens_handler(
+    State(config): State<Arc<RwLock<MockWorkerConfig>>>,
+    headers: axum::http::HeaderMap,
+    Json(_payload): Json<serde_json::Value>,
+) -> Response {
+    let config = config.read().await;
+    capture_request(config.port, "/v1/chat/completions/tokens", &headers);
+
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    Json(json!({
+        "id": format!("chatcmpl-{}", Uuid::new_v4()),
+        "object": "chat.completion",
+        "created": timestamp,
+        "model": "mock-model",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": "mock TITO response"
+            },
+            "finish_reason": "stop"
+        }],
+        "usage": {
+            "prompt_tokens": 10,
+            "completion_tokens": 5,
+            "total_tokens": 15
+        }
+    }))
+    .into_response()
 }
 
 async fn completions_handler(

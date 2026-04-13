@@ -1847,6 +1847,46 @@ impl PDRouter {
         );
         Ok(bytes::Bytes::from(merged_str))
     }
+
+    /// Internal helper for routing chat requests with a configurable backend path.
+    async fn route_chat_with_path(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &ChatCompletionRequest,
+        model_id: Option<&str>,
+        run_id: Option<&str>,
+        route: &'static str,
+    ) -> Response {
+        let is_stream = body.stream;
+        let return_logprob = body.logprobs;
+
+        let request_text = if self.policies_need_request_text() {
+            body.messages.first().and_then(|msg| match msg {
+                ChatMessage::User { content, .. } => match content {
+                    UserMessageContent::Text(text) => Some(text.clone()),
+                    UserMessageContent::Parts(_) => None,
+                },
+                ChatMessage::System { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+        } else {
+            None
+        };
+
+        let batch_size = Self::get_chat_batch_size(body);
+
+        let context = PDRequestContext {
+            route,
+            batch_size,
+            is_stream,
+            return_logprob,
+            request_text,
+            model_id,
+            run_id,
+        };
+
+        self.execute_dual_dispatch(headers, body, context).await
+    }
 }
 
 // Helper functions
@@ -2114,40 +2154,19 @@ impl RouterTrait for PDRouter {
         model_id: Option<&str>,
         run_id: Option<&str>,
     ) -> Response {
-        // Extract parameters
-        let is_stream = body.stream;
-        let return_logprob = body.logprobs;
+        self.route_chat_with_path(headers, body, model_id, run_id, "/v1/chat/completions")
+            .await
+    }
 
-        // Extract text for cache-aware routing
-        let request_text = if self.policies_need_request_text() {
-            body.messages.first().and_then(|msg| match msg {
-                ChatMessage::User { content, .. } => match content {
-                    UserMessageContent::Text(text) => Some(text.clone()),
-                    UserMessageContent::Parts(_) => None,
-                },
-                ChatMessage::System { content, .. } => Some(content.clone()),
-                _ => None,
-            })
-        } else {
-            None
-        };
-
-        // Calculate batch size
-        let batch_size = Self::get_chat_batch_size(body);
-
-        // Create context
-        let context = PDRequestContext {
-            route: "/v1/chat/completions",
-            batch_size,
-            is_stream,
-            return_logprob,
-            request_text,
-            model_id,
-            run_id,
-        };
-
-        // Execute with retry and bootstrap injection
-        self.execute_dual_dispatch(headers, body, context).await
+    async fn route_chat_tokens(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &ChatCompletionRequest,
+        model_id: Option<&str>,
+        run_id: Option<&str>,
+    ) -> Response {
+        self.route_chat_with_path(headers, body, model_id, run_id, "/v1/chat/completions/tokens")
+            .await
     }
 
     async fn route_completion(
