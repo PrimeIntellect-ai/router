@@ -81,6 +81,10 @@ impl MockWorker {
             .route("/get_model_info", get(model_info_handler))
             .route("/generate", post(generate_handler))
             .route("/v1/chat/completions", post(chat_completions_handler))
+            .route(
+                "/v1/chat/completions/tokens",
+                post(chat_completions_tokens_handler),
+            )
             .route("/v1/completions", post(completions_handler))
             .route("/v1/rerank", post(rerank_handler))
             .route("/v1/responses", post(responses_handler))
@@ -471,6 +475,93 @@ async fn chat_completions_handler(
                 "message": {
                     "role": "assistant",
                     "content": "This is a mock chat response."
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "total_tokens": 15
+            }
+        }))
+        .into_response()
+    }
+}
+
+async fn chat_completions_tokens_handler(
+    State(config): State<Arc<RwLock<MockWorkerConfig>>>,
+    headers: axum::http::HeaderMap,
+    Json(payload): Json<serde_json::Value>,
+) -> Response {
+    let config = config.read().await;
+
+    // Capture request with the tokens-specific path
+    capture_request(config.port, "/v1/chat/completions/tokens", &headers);
+
+    if should_fail(&config).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "error": {
+                    "message": "Random failure for testing",
+                    "type": "internal_error",
+                    "code": "internal_error"
+                }
+            })),
+        )
+            .into_response();
+    }
+
+    if config.response_delay_ms > 0 {
+        tokio::time::sleep(tokio::time::Duration::from_millis(config.response_delay_ms)).await;
+    }
+
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    let is_stream = payload
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    if is_stream {
+        let request_id = format!("chatcmpl-{}", Uuid::new_v4());
+
+        let stream = stream::once(async move {
+            let chunk = json!({
+                "id": request_id,
+                "object": "chat.completion.chunk",
+                "created": timestamp,
+                "model": "mock-model",
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "content": "This is a mock TITO response."
+                    },
+                    "finish_reason": null
+                }]
+            });
+
+            Ok::<_, Infallible>(Event::default().data(chunk.to_string()))
+        })
+        .chain(stream::once(async { Ok(Event::default().data("[DONE]")) }));
+
+        Sse::new(stream)
+            .keep_alive(KeepAlive::default())
+            .into_response()
+    } else {
+        Json(json!({
+            "id": format!("chatcmpl-{}", Uuid::new_v4()),
+            "object": "chat.completion",
+            "created": timestamp,
+            "model": "mock-model",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "This is a mock TITO response."
                 },
                 "finish_reason": "stop"
             }],

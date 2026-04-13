@@ -5,7 +5,10 @@ use axum::{
     extract::Request,
     http::{header::CONTENT_TYPE, StatusCode},
 };
-use common::mock_worker::{HealthStatus, MockWorker, MockWorkerConfig, WorkerType};
+use common::mock_worker::{
+    clear_captured_requests, get_captured_requests, HealthStatus, MockWorker, MockWorkerConfig,
+    WorkerType,
+};
 use reqwest::Client;
 use serde_json::json;
 use std::sync::Arc;
@@ -423,6 +426,54 @@ mod generation_tests {
             .unwrap();
         let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(body_json.get("choices").is_some());
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_v1_chat_completions_tokens_forwards_correct_path() {
+        let port = 18105;
+        let ctx = TestContext::new(vec![MockWorkerConfig {
+            port,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+
+        let app = ctx.create_app().await;
+        clear_captured_requests(port);
+
+        let payload = json!({
+            "model": "test-model",
+            "messages": [
+                {"role": "user", "content": "Hello!"}
+            ],
+            "stream": false
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions/tokens")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Verify the backend received /v1/chat/completions/tokens, not /v1/chat/completions
+        let captured = get_captured_requests(port);
+        assert!(
+            !captured.is_empty(),
+            "Mock worker should have received a request"
+        );
+        assert_eq!(
+            captured[0].path, "/v1/chat/completions/tokens",
+            "Request must be forwarded to /v1/chat/completions/tokens, got: {}",
+            captured[0].path
+        );
 
         ctx.shutdown().await;
     }
