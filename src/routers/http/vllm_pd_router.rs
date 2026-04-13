@@ -1302,12 +1302,17 @@ impl VllmPDRouter {
         };
 
         if self.use_discovery {
+            // Discovery mode - use vLLM-specific two-stage processing
             info!("Using service discovery mode, processing vLLM two-stage request");
+
+            // Process vLLM two-stage request with service discovery
             self.process_vllm_request(request_json, route, headers, run_id)
                 .await
         } else {
+            // Direct URL mode - implement routing logic here (not delegating to PDRouter)
             info!("Using direct URL mode with VllmPDRouter's own routing logic");
 
+            // Get prefill and decode workers from worker_registry
             let prefill_workers = self.pd_router.worker_registry.get_prefill_workers();
             let decode_workers = self.pd_router.worker_registry.get_decode_workers();
 
@@ -1330,6 +1335,7 @@ impl VllmPDRouter {
                     .into_response();
             }
 
+            // Select workers using policy with headers for consistent hash
             let request_text = serde_json::to_string(&request_json).ok();
             let request_str = request_text.as_deref();
             let request_headers: Option<HashMap<String, String>> = headers.map(|h| {
@@ -1380,6 +1386,8 @@ impl VllmPDRouter {
 
             let prefill_worker = &prefill_workers[prefill_idx];
             let decode_worker = &decode_workers[decode_idx];
+            // Load tracking is handled inside process_vllm_two_stage_request for fine-grained
+            // tracking: prefill load only during prefill phase, decode load only during decode phase.
 
             info!(
                 "Chat: Selected prefill={} [policy:{}], decode={} [policy:{}]",
@@ -1389,6 +1397,7 @@ impl VllmPDRouter {
                 decode_policy.name()
             );
 
+            // Execute dual dispatch with vLLM two-stage processing
             let resp = match self
                 .process_vllm_two_stage_request(
                     request_json,
