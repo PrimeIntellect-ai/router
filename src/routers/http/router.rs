@@ -593,13 +593,6 @@ impl Router {
                     false
                 };
 
-                // Keep a clone for potential cleanup on retry
-                let worker_for_cleanup = if load_incremented {
-                    Some(worker.clone())
-                } else {
-                    None
-                };
-
                 let response = self
                     .send_typed_request(
                         headers,
@@ -616,18 +609,6 @@ impl Router {
                 // should count against the circuit breaker. This matches pd_router.rs behavior.
                 let status = response.status();
                 worker.record_outcome(status.is_success() || status.is_client_error());
-
-                // For retryable failures, we need to decrement load since send_typed_request
-                // won't have done it (it only decrements on success or non-retryable failures)
-                if is_retryable_status(response.status()) && load_incremented {
-                    if let Some(cleanup_worker) = worker_for_cleanup {
-                        cleanup_worker.decrement_load();
-                        RouterMetrics::set_running_requests(
-                            cleanup_worker.url(),
-                            cleanup_worker.load(),
-                        );
-                    }
-                }
 
                 response
             },
@@ -966,7 +947,10 @@ impl Router {
                 let mut decremented = false;
                 let mut usage_extractor =
                     stream_run_id.map(usage_metrics::SseUsageExtractor::new);
-                while let Some(chunk) = stream.next().await {
+                while let Ok(Some(chunk)) = tokio::time::timeout(
+                    std::time::Duration::from_secs(300),
+                    stream.next(),
+                ).await {
                     match chunk {
                         Ok(bytes) => {
                             // Extract per-run usage from streaming chunks.
