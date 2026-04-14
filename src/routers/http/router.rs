@@ -966,7 +966,10 @@ impl Router {
                 let mut decremented = false;
                 let mut usage_extractor =
                     stream_run_id.map(usage_metrics::SseUsageExtractor::new);
-                while let Some(chunk) = stream.next().await {
+                while let Ok(Some(chunk)) = tokio::time::timeout(
+                    std::time::Duration::from_secs(300),
+                    stream.next(),
+                ).await {
                     match chunk {
                         Ok(bytes) => {
                             // Extract per-run usage from streaming chunks.
