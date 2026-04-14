@@ -954,7 +954,7 @@ impl Router {
                     stream_run_id.map(usage_metrics::SseUsageExtractor::new);
                 loop {
                     match tokio::time::timeout(
-                        std::time::Duration::from_secs(60),
+                        std::time::Duration::from_secs(300),
                         stream.next(),
                     ).await {
                         Ok(Some(chunk)) => {
@@ -995,11 +995,11 @@ impl Router {
                         Err(_elapsed) => {
                             // Upstream stalled for 60s — notify client and bail
                             tracing::warn!(
-                                "Stream from {} timed out after 60s of inactivity, closing",
+                                "Stream from {} timed out after 300s of inactivity, closing",
                                 worker_url
                             );
                             let _ = tx.send(Err(
-                                "stream timeout: upstream worker did not send data for 60 seconds".to_string()
+                                "stream timeout: upstream worker did not send data for 300 seconds".to_string()
                             ));
                             break;
                         }
