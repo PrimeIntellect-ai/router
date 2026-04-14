@@ -201,6 +201,11 @@ impl Router {
         self.worker_registry.get_all_urls()
     }
 
+    /// Get all registered workers (for testing/diagnostics)
+    pub fn get_workers(&self) -> Vec<Arc<dyn Worker>> {
+        self.worker_registry.get_all()
+    }
+
     /// Get worker URLs for a specific model
     pub fn get_worker_urls_for_model(&self, model_id: Option<&str>) -> Vec<String> {
         let workers = match model_id {
@@ -947,36 +952,55 @@ impl Router {
                 let mut decremented = false;
                 let mut usage_extractor =
                     stream_run_id.map(usage_metrics::SseUsageExtractor::new);
-                while let Ok(Some(chunk)) = tokio::time::timeout(
-                    std::time::Duration::from_secs(300),
-                    stream.next(),
-                ).await {
-                    match chunk {
-                        Ok(bytes) => {
-                            // Extract per-run usage from streaming chunks.
-                            // Buffered across chunks because TCP segment
-                            // boundaries can split SSE lines.
-                            if let Some(extractor) = usage_extractor.as_mut() {
-                                extractor.push_chunk(&bytes);
-                            }
-                            // Check for stream end marker
-                            if bytes
-                                .as_ref()
-                                .windows(12)
-                                .any(|window| window == b"data: [DONE]")
-                            {
-                                if let Some(worker) = registry.get_by_url(&worker_url) {
-                                    worker.decrement_load();
-                                    RouterMetrics::set_running_requests(&worker_url, worker.load());
-                                    decremented = true;
+                loop {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(60),
+                        stream.next(),
+                    ).await {
+                        Ok(Some(chunk)) => {
+                            match chunk {
+                                Ok(bytes) => {
+                                    // Extract per-run usage from streaming chunks.
+                                    // Buffered across chunks because TCP segment
+                                    // boundaries can split SSE lines.
+                                    if let Some(extractor) = usage_extractor.as_mut() {
+                                        extractor.push_chunk(&bytes);
+                                    }
+                                    // Check for stream end marker
+                                    if bytes
+                                        .as_ref()
+                                        .windows(12)
+                                        .any(|window| window == b"data: [DONE]")
+                                    {
+                                        if let Some(worker) = registry.get_by_url(&worker_url) {
+                                            worker.decrement_load();
+                                            RouterMetrics::set_running_requests(&worker_url, worker.load());
+                                            decremented = true;
+                                        }
+                                    }
+                                    if tx.send(Ok(bytes)).is_err() {
+                                        break;
+                                    }
+                                }
+                                Err(e) => {
+                                    let _ = tx.send(Err(format!("Stream error: {}", e)));
+                                    break;
                                 }
                             }
-                            if tx.send(Ok(bytes)).is_err() {
-                                break;
-                            }
                         }
-                        Err(e) => {
-                            let _ = tx.send(Err(format!("Stream error: {}", e)));
+                        Ok(None) => {
+                            // Stream ended normally
+                            break;
+                        }
+                        Err(_elapsed) => {
+                            // Upstream stalled for 60s — notify client and bail
+                            tracing::warn!(
+                                "Stream from {} timed out after 60s of inactivity, closing",
+                                worker_url
+                            );
+                            let _ = tx.send(Err(
+                                "stream timeout: upstream worker did not send data for 60 seconds".to_string()
+                            ));
                             break;
                         }
                     }

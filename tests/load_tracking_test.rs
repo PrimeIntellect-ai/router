@@ -255,17 +255,11 @@ async fn setup_cache_aware_router(
 /// Helper to get total internal load counter across all workers.
 /// This reads the router's own AtomicUsize load_counter, NOT the vLLM /get_load endpoint.
 fn get_total_internal_load(router: &Arc<dyn RouterTrait>) -> usize {
-    let _urls = router.get_worker_urls();
-    // Downcast to the concrete Router type to access worker_registry
-    use vllm_router_rs::routers::router_manager::RouterManager;
-    if let Some(rm) = router.as_any().downcast_ref::<RouterManager>() {
-        rm.get_workers_for_request(None)
-            .iter()
-            .map(|w| w.load())
-            .sum()
+    use vllm_router_rs::routers::http::router::Router;
+    if let Some(r) = router.as_any().downcast_ref::<Router>() {
+        r.get_workers().iter().map(|w| w.load()).sum()
     } else {
-        // Fallback: sum loads from workers found by URL
-        0
+        panic!("expected Router type for load tracking test");
     }
 }
 
