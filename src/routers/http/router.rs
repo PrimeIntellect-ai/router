@@ -927,7 +927,11 @@ impl Router {
                     } else {
                         StatusCode::INTERNAL_SERVER_ERROR
                     };
-                    if load_incremented {
+                    // For rewritten 400s (input validation), decrement load here
+                    // since the caller only decrements for retryable statuses
+                    // (400 is not retryable) and we bypass the normal non-streaming
+                    // cleanup. For genuine 500s, the caller's retry closure handles it.
+                    if status == StatusCode::BAD_REQUEST && load_incremented {
                         if let Some(worker) = self.worker_registry.get_by_url(worker_url) {
                             worker.decrement_load();
                             RouterMetrics::set_running_requests(worker_url, worker.load());
@@ -943,12 +947,6 @@ impl Router {
                         "Failed to read 500 response body from worker_url={}: {}",
                         worker_url, e
                     );
-                    if load_incremented {
-                        if let Some(worker) = self.worker_registry.get_by_url(worker_url) {
-                            worker.decrement_load();
-                            RouterMetrics::set_running_requests(worker_url, worker.load());
-                        }
-                    }
                     return (
                         StatusCode::INTERNAL_SERVER_ERROR,
                         format!("Failed to read upstream response: {}", e),
