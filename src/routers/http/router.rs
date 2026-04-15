@@ -909,28 +909,41 @@ impl Router {
         let status = StatusCode::from_u16(res.status().as_u16())
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
 
+        // vLLM returns 500 for input validation errors (e.g. prompt exceeding
+        // max context length) that are really client errors. These are always
+        // synchronous JSON bodies even when the client requested streaming.
+        // Read the body, rewrite to 400, and return so the circuit breaker
+        // doesn't penalise the worker for bad input.
+        if status == StatusCode::INTERNAL_SERVER_ERROR {
+            let response_headers = header_utils::preserve_response_headers(res.headers());
+            let body = res.bytes().await.unwrap_or_default();
+            let status = if is_vllm_input_validation_error(&body) {
+                tracing::debug!(
+                    "Rewriting vLLM input validation 500 to 400 for worker_url={}",
+                    worker_url
+                );
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            if load_incremented {
+                if let Some(worker) = self.worker_registry.get_by_url(worker_url) {
+                    worker.decrement_load();
+                    RouterMetrics::set_running_requests(worker_url, worker.load());
+                }
+            }
+            let mut response = Response::new(axum::body::Body::from(body));
+            *response.status_mut() = status;
+            *response.headers_mut() = response_headers;
+            return response;
+        }
+
         if !is_stream {
             // For non-streaming requests, preserve headers
             let response_headers = header_utils::preserve_response_headers(res.headers());
 
             let response = match res.bytes().await {
                 Ok(body) => {
-                    // vLLM returns 500 for input validation errors (e.g. prompt
-                    // exceeding max context length) that are really client errors.
-                    // Correct the status to 400 so the circuit breaker doesn't
-                    // penalise the worker for bad input.
-                    let status = if status == StatusCode::INTERNAL_SERVER_ERROR
-                        && is_vllm_input_validation_error(&body)
-                    {
-                        tracing::debug!(
-                            "Rewriting vLLM input validation 500 to 400 for worker_url={}",
-                            worker_url
-                        );
-                        StatusCode::BAD_REQUEST
-                    } else {
-                        status
-                    };
-
                     // Record per-run billing metrics on success. The request
                     // counter and the token counters are recorded
                     // independently, because some upstream responses omit
