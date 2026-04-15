@@ -49,6 +49,25 @@ pub struct Router {
     _load_monitor_handle: Option<Arc<tokio::task::JoinHandle<()>>>,
 }
 
+/// Check if a 500 response body is actually a vLLM input validation error
+/// that should be treated as a 400 (client error) instead.
+///
+/// vLLM incorrectly returns 500 for several request validation failures
+/// (e.g. prompt exceeding max context length). These should not count as
+/// backend failures for circuit breaker purposes.
+fn is_vllm_input_validation_error(body: &[u8]) -> bool {
+    const PATTERNS: &[&str] = &[
+        "exceeds the model's maximum context length",
+        "Please reduce the length of the input prompt",
+        "This model's maximum context length is",
+    ];
+
+    if let Ok(text) = std::str::from_utf8(body) {
+        return PATTERNS.iter().any(|p| text.contains(p));
+    }
+    false
+}
+
 impl Router {
     /// Create a new router with injected policy and client
     #[allow(clippy::too_many_arguments)]
@@ -896,6 +915,22 @@ impl Router {
 
             let response = match res.bytes().await {
                 Ok(body) => {
+                    // vLLM returns 500 for input validation errors (e.g. prompt
+                    // exceeding max context length) that are really client errors.
+                    // Correct the status to 400 so the circuit breaker doesn't
+                    // penalise the worker for bad input.
+                    let status = if status == StatusCode::INTERNAL_SERVER_ERROR
+                        && is_vllm_input_validation_error(&body)
+                    {
+                        tracing::debug!(
+                            "Rewriting vLLM input validation 500 to 400 for worker_url={}",
+                            worker_url
+                        );
+                        StatusCode::BAD_REQUEST
+                    } else {
+                        status
+                    };
+
                     // Record per-run billing metrics on success. The request
                     // counter and the token counters are recorded
                     // independently, because some upstream responses omit
@@ -1885,6 +1920,23 @@ mod tests {
             _worker_loads: Arc::new(rx),
             _load_monitor_handle: None,
         }
+    }
+
+    #[test]
+    fn test_is_vllm_input_validation_error() {
+        // Prompt too long error from vLLM
+        let body = br#"{"error":{"message":"The prompt is 65537 tokens, which exceeds the model's maximum context length of 65536 tokens. Please reduce the length of the input prompt.","type":"Internal Server Error","param":null,"code":500}}"#;
+        assert!(is_vllm_input_validation_error(body));
+
+        // Actual server error should not match
+        let body = br#"{"error":{"message":"CUDA out of memory","type":"Internal Server Error","param":null,"code":500}}"#;
+        assert!(!is_vllm_input_validation_error(body));
+
+        // Empty body
+        assert!(!is_vllm_input_validation_error(b""));
+
+        // Non-UTF8
+        assert!(!is_vllm_input_validation_error(&[0xFF, 0xFE]));
     }
 
     #[test]
