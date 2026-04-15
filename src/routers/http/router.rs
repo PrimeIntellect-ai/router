@@ -916,26 +916,46 @@ impl Router {
         // doesn't penalise the worker for bad input.
         if status == StatusCode::INTERNAL_SERVER_ERROR {
             let response_headers = header_utils::preserve_response_headers(res.headers());
-            let body = res.bytes().await.unwrap_or_default();
-            let status = if is_vllm_input_validation_error(&body) {
-                tracing::debug!(
-                    "Rewriting vLLM input validation 500 to 400 for worker_url={}",
-                    worker_url
-                );
-                StatusCode::BAD_REQUEST
-            } else {
-                StatusCode::INTERNAL_SERVER_ERROR
-            };
-            if load_incremented {
-                if let Some(worker) = self.worker_registry.get_by_url(worker_url) {
-                    worker.decrement_load();
-                    RouterMetrics::set_running_requests(worker_url, worker.load());
+            match res.bytes().await {
+                Ok(body) => {
+                    let status = if is_vllm_input_validation_error(&body) {
+                        tracing::debug!(
+                            "Rewriting vLLM input validation 500 to 400 for worker_url={}",
+                            worker_url
+                        );
+                        StatusCode::BAD_REQUEST
+                    } else {
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    };
+                    if load_incremented {
+                        if let Some(worker) = self.worker_registry.get_by_url(worker_url) {
+                            worker.decrement_load();
+                            RouterMetrics::set_running_requests(worker_url, worker.load());
+                        }
+                    }
+                    let mut response = Response::new(axum::body::Body::from(body));
+                    *response.status_mut() = status;
+                    *response.headers_mut() = response_headers;
+                    return response;
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "Failed to read 500 response body from worker_url={}: {}",
+                        worker_url, e
+                    );
+                    if load_incremented {
+                        if let Some(worker) = self.worker_registry.get_by_url(worker_url) {
+                            worker.decrement_load();
+                            RouterMetrics::set_running_requests(worker_url, worker.load());
+                        }
+                    }
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Failed to read upstream response: {}", e),
+                    )
+                        .into_response();
                 }
             }
-            let mut response = Response::new(axum::body::Body::from(body));
-            *response.status_mut() = status;
-            *response.headers_mut() = response_headers;
-            return response;
         }
 
         if !is_stream {
