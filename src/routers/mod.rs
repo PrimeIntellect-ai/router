@@ -185,7 +185,7 @@ pub trait RouterTrait: Send + Sync + Debug + WorkerManagement {
     /// `run_id` is the JWT-derived run identifier when available. Implementations
     /// that forward to backends emitting an OpenAI-style `usage` block (e.g.
     /// vLLM's `/v1/generate`) should record per-run token counters when set —
-    /// otherwise the catch-all path silently bypasses billing attribution.
+    /// otherwise the catch-all path silently skips per-run usage attribution.
     async fn route_transparent(
         &self,
         _headers: Option<&HeaderMap>,

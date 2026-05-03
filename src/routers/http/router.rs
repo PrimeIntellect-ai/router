@@ -913,11 +913,14 @@ impl Router {
                     } else {
                         StatusCode::INTERNAL_SERVER_ERROR
                     };
-                    // For rewritten 400s (input validation), decrement load here
-                    // since the caller only decrements for retryable statuses
-                    // (400 is not retryable) and we bypass the normal non-streaming
-                    // cleanup. For genuine 500s, the caller's retry closure handles it.
-                    if status == StatusCode::BAD_REQUEST && load_incremented {
+                    // Decrement load on this early-return path (both rewritten
+                    // 400s and genuine 500s) — we bypass the normal
+                    // non-streaming cleanup at the bottom of this function,
+                    // and the caller's retry closure no longer decrements
+                    // (#23 removed that to avoid double-decrement once
+                    // send_typed_request owned the lifecycle). Without this,
+                    // each retry attempt's increment leaks → phantom load.
+                    if load_incremented {
                         if let Some(worker) = self.worker_registry.get_by_url(worker_url) {
                             worker.decrement_load();
                             RouterMetrics::set_running_requests(worker_url, worker.load());
@@ -1913,8 +1916,9 @@ impl RouterTrait for Router {
                 }
 
                 // Per-run attribution paths. Without this, the catch-all
-                // bypasses billing — notably vLLM's `/v1/generate` (renderer
-                // rollouts) which has no explicit route on the router.
+                // skips usage metrics — notably for vLLM's `/v1/generate`
+                // (renderer rollouts), which has no explicit route on the
+                // router.
                 //
                 // SSE responses must keep streaming chunk-by-chunk so clients
                 // get incremental tokens; we tee usage extraction off the same
