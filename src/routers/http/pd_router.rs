@@ -2511,6 +2511,11 @@ impl RouterTrait for PDRouter {
                 let status = StatusCode::from_u16(response.status().as_u16())
                     .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                 let resp_headers = response.headers().clone();
+                let is_streaming = resp_headers
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                    .map(|ct| ct.starts_with("text/event-stream"))
+                    .unwrap_or(false);
 
                 let mut response_builder = Response::builder().status(status);
                 for (name, value) in resp_headers.iter() {
@@ -2519,49 +2524,84 @@ impl RouterTrait for PDRouter {
                     }
                 }
 
-                if let Some(rid) = run_id {
-                    let body_bytes = match response.bytes().await {
-                        Ok(b) => b,
-                        Err(e) => {
-                            return (
-                                StatusCode::BAD_GATEWAY,
-                                format!("Failed to read upstream response: {}", e),
-                            )
-                                .into_response();
+                // SSE responses keep streaming chunk-by-chunk so clients get
+                // incremental tokens; usage is teed off the same stream via
+                // SseUsageExtractor. Non-SSE buffers once. No run_id → pass
+                // through unchanged.
+                match (run_id, is_streaming) {
+                    (Some(rid), true) => {
+                        if status.is_success() {
+                            usage_metrics::record_run_request(rid);
                         }
-                    };
-
-                    if status.is_success() {
-                        let is_streaming = resp_headers
-                            .get(reqwest::header::CONTENT_TYPE)
-                            .and_then(|v| v.to_str().ok())
-                            .map(|ct| ct.starts_with("text/event-stream"))
-                            .unwrap_or(false);
-                        usage_metrics::record_run_request(rid);
-                        usage_metrics::extract_and_record_usage_buffered(
-                            rid,
-                            &body_bytes,
-                            is_streaming,
-                        );
+                        let stream_run_id =
+                            status.is_success().then(|| rid.to_string());
+                        let stream = response.bytes_stream();
+                        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                        tokio::spawn(async move {
+                            let mut stream = stream;
+                            let mut usage_extractor = stream_run_id
+                                .map(usage_metrics::SseUsageExtractor::new);
+                            while let Some(chunk) = stream.next().await {
+                                match chunk {
+                                    Ok(bytes) => {
+                                        if let Some(extractor) = usage_extractor.as_mut() {
+                                            extractor.push_chunk(&bytes);
+                                        }
+                                        if tx.send(Ok(bytes)).is_err() {
+                                            break;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        let _ = tx.send(Err(format!("Stream error: {}", e)));
+                                        break;
+                                    }
+                                }
+                            }
+                        });
+                        let body = Body::from_stream(UnboundedReceiverStream::new(rx));
+                        match response_builder.body(body) {
+                            Ok(response) => response,
+                            Err(e) => (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                format!("Failed to build response: {}", e),
+                            )
+                                .into_response(),
+                        }
                     }
-
-                    match response_builder.body(Body::from(body_bytes)) {
-                        Ok(response) => response,
-                        Err(e) => (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("Failed to build response: {}", e),
-                        )
-                            .into_response(),
+                    (Some(rid), false) => {
+                        let body_bytes = match response.bytes().await {
+                            Ok(b) => b,
+                            Err(e) => {
+                                return (
+                                    StatusCode::BAD_GATEWAY,
+                                    format!("Failed to read upstream response: {}", e),
+                                )
+                                    .into_response();
+                            }
+                        };
+                        if status.is_success() {
+                            usage_metrics::record_run_request(rid);
+                            usage_metrics::extract_and_record_usage(rid, &body_bytes);
+                        }
+                        match response_builder.body(Body::from(body_bytes)) {
+                            Ok(response) => response,
+                            Err(e) => (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                format!("Failed to build response: {}", e),
+                            )
+                                .into_response(),
+                        }
                     }
-                } else {
-                    let body = Body::from_stream(response.bytes_stream());
-                    match response_builder.body(body) {
-                        Ok(response) => response,
-                        Err(e) => (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("Failed to build response: {}", e),
-                        )
-                            .into_response(),
+                    (None, _) => {
+                        let body = Body::from_stream(response.bytes_stream());
+                        match response_builder.body(body) {
+                            Ok(response) => response,
+                            Err(e) => (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                format!("Failed to build response: {}", e),
+                            )
+                                .into_response(),
+                        }
                     }
                 }
             }

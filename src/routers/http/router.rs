@@ -1899,6 +1899,11 @@ impl RouterTrait for Router {
             Ok(response) => {
                 let status = response.status();
                 let resp_headers = response.headers().clone();
+                let is_streaming = resp_headers
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                    .map(|ct| ct.starts_with("text/event-stream"))
+                    .unwrap_or(false);
 
                 let mut response_builder = Response::builder().status(status.as_u16());
                 for (name, value) in resp_headers.iter() {
@@ -1907,58 +1912,95 @@ impl RouterTrait for Router {
                     }
                 }
 
-                // When the request carries a run_id, buffer the body so we can
-                // extract the OpenAI-style `usage` block and increment per-run
-                // counters — matching what `route_typed_request` does for the
-                // explicitly-registered routes. Without this, paths that hit
-                // the catch-all (notably vLLM's `/v1/generate` used by the
-                // renderer rollout client) silently bypass billing.
+                // Per-run attribution paths. Without this, the catch-all
+                // bypasses billing — notably vLLM's `/v1/generate` (renderer
+                // rollouts) which has no explicit route on the router.
                 //
-                // Unauthenticated / non-JWT traffic preserves the previous
-                // pure-streaming behaviour.
-                if let Some(rid) = run_id {
-                    let body_bytes = match response.bytes().await {
-                        Ok(b) => b,
-                        Err(e) => {
-                            return (
-                                StatusCode::BAD_GATEWAY,
-                                format!("Failed to read upstream response: {}", e),
-                            )
-                                .into_response();
+                // SSE responses must keep streaming chunk-by-chunk so clients
+                // get incremental tokens; we tee usage extraction off the same
+                // stream via SseUsageExtractor (mirrors the streaming branch
+                // of `route_typed_request`).
+                //
+                // Non-SSE responses (e.g. `/v1/generate` JSON) buffer once,
+                // small enough that buffering doesn't hurt and lets us parse
+                // the `usage` block before forwarding.
+                //
+                // Unauthenticated / non-JWT traffic falls through to pure
+                // pass-through, preserving prior behaviour.
+                match (run_id, is_streaming) {
+                    (Some(rid), true) => {
+                        if status.is_success() {
+                            usage_metrics::record_run_request(rid);
                         }
-                    };
-
-                    if status.is_success() {
-                        let is_streaming = resp_headers
-                            .get(reqwest::header::CONTENT_TYPE)
-                            .and_then(|v| v.to_str().ok())
-                            .map(|ct| ct.starts_with("text/event-stream"))
-                            .unwrap_or(false);
-                        usage_metrics::record_run_request(rid);
-                        usage_metrics::extract_and_record_usage_buffered(
-                            rid,
-                            &body_bytes,
-                            is_streaming,
-                        );
+                        let stream_run_id =
+                            status.is_success().then(|| rid.to_string());
+                        let stream = response.bytes_stream();
+                        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                        tokio::spawn(async move {
+                            let mut stream = stream;
+                            let mut usage_extractor = stream_run_id
+                                .map(usage_metrics::SseUsageExtractor::new);
+                            while let Some(chunk) = stream.next().await {
+                                match chunk {
+                                    Ok(bytes) => {
+                                        if let Some(extractor) = usage_extractor.as_mut() {
+                                            extractor.push_chunk(&bytes);
+                                        }
+                                        if tx.send(Ok(bytes)).is_err() {
+                                            break;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        let _ = tx.send(Err(format!("Stream error: {}", e)));
+                                        break;
+                                    }
+                                }
+                            }
+                        });
+                        let body = Body::from_stream(UnboundedReceiverStream::new(rx));
+                        match response_builder.body(body) {
+                            Ok(response) => response,
+                            Err(e) => (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                format!("Failed to build response: {}", e),
+                            )
+                                .into_response(),
+                        }
                     }
-
-                    match response_builder.body(Body::from(body_bytes)) {
-                        Ok(response) => response,
-                        Err(e) => (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("Failed to build response: {}", e),
-                        )
-                            .into_response(),
+                    (Some(rid), false) => {
+                        let body_bytes = match response.bytes().await {
+                            Ok(b) => b,
+                            Err(e) => {
+                                return (
+                                    StatusCode::BAD_GATEWAY,
+                                    format!("Failed to read upstream response: {}", e),
+                                )
+                                    .into_response();
+                            }
+                        };
+                        if status.is_success() {
+                            usage_metrics::record_run_request(rid);
+                            usage_metrics::extract_and_record_usage(rid, &body_bytes);
+                        }
+                        match response_builder.body(Body::from(body_bytes)) {
+                            Ok(response) => response,
+                            Err(e) => (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                format!("Failed to build response: {}", e),
+                            )
+                                .into_response(),
+                        }
                     }
-                } else {
-                    let body = Body::from_stream(response.bytes_stream());
-                    match response_builder.body(body) {
-                        Ok(response) => response,
-                        Err(e) => (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("Failed to build response: {}", e),
-                        )
-                            .into_response(),
+                    (None, _) => {
+                        let body = Body::from_stream(response.bytes_stream());
+                        match response_builder.body(body) {
+                            Ok(response) => response,
+                            Err(e) => (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                format!("Failed to build response: {}", e),
+                            )
+                                .into_response(),
+                        }
                     }
                 }
             }
