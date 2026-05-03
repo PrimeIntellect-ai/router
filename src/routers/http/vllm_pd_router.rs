@@ -1668,7 +1668,7 @@ impl RouterTrait for VllmPDRouter {
         headers: Option<&HeaderMap>,
         body: &crate::protocols::spec::ResponsesRequest,
         _model_id: Option<&str>,
-        _run_id: Option<&str>,
+        run_id: Option<&str>,
     ) -> Response {
         let request_json = match serde_json::to_value(body) {
             Ok(json) => json,
@@ -1680,7 +1680,7 @@ impl RouterTrait for VllmPDRouter {
                     .into_response()
             }
         };
-        self.route_transparent(headers, "/v1/responses", &Method::POST, request_json)
+        self.route_transparent(headers, "/v1/responses", &Method::POST, request_json, run_id)
             .await
     }
 
@@ -1736,6 +1736,7 @@ impl RouterTrait for VllmPDRouter {
         path: &str,
         method: &Method,
         body: serde_json::Value,
+        run_id: Option<&str>,
     ) -> Response {
         // Only handle POST requests for inference
         if *method != Method::POST {
@@ -1756,8 +1757,7 @@ impl RouterTrait for VllmPDRouter {
 
         if self.use_discovery {
             // Discovery mode - use vLLM-specific two-stage processing.
-            // Transparent proxy has no per-run billing context.
-            self.process_vllm_request(request_json, path, headers, None)
+            self.process_vllm_request(request_json, path, headers, run_id)
                 .await
         } else {
             // Direct URL mode - use worker registry, filtered by availability
@@ -1845,8 +1845,9 @@ impl RouterTrait for VllmPDRouter {
                 decode_worker.url()
             );
 
-            // Execute two-stage processing.
-            // Transparent proxy has no per-run billing context.
+            // Execute two-stage processing. Forward run_id so the catch-all
+            // path attributes vLLM `/v1/generate` (renderer) traffic to the
+            // run, matching the explicitly-routed endpoints.
             match self
                 .process_vllm_two_stage_request(
                     request_json,
@@ -1854,7 +1855,7 @@ impl RouterTrait for VllmPDRouter {
                     decode_worker.clone(),
                     path,
                     headers,
-                    None,
+                    run_id,
                 )
                 .await
             {

@@ -2418,6 +2418,7 @@ impl RouterTrait for PDRouter {
         path: &str,
         method: &Method,
         body: serde_json::Value,
+        run_id: Option<&str>,
     ) -> Response {
         // Only handle POST requests for inference
         if *method != Method::POST {
@@ -2511,23 +2512,57 @@ impl RouterTrait for PDRouter {
                     .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                 let resp_headers = response.headers().clone();
 
-                // Stream the response body
-                let body = Body::from_stream(response.bytes_stream());
                 let mut response_builder = Response::builder().status(status);
-
                 for (name, value) in resp_headers.iter() {
                     if name != "transfer-encoding" && name != "content-length" {
                         response_builder = response_builder.header(name, value);
                     }
                 }
 
-                match response_builder.body(body) {
-                    Ok(response) => response,
-                    Err(e) => (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Failed to build response: {}", e),
-                    )
-                        .into_response(),
+                if let Some(rid) = run_id {
+                    let body_bytes = match response.bytes().await {
+                        Ok(b) => b,
+                        Err(e) => {
+                            return (
+                                StatusCode::BAD_GATEWAY,
+                                format!("Failed to read upstream response: {}", e),
+                            )
+                                .into_response();
+                        }
+                    };
+
+                    if status.is_success() {
+                        let is_streaming = resp_headers
+                            .get(reqwest::header::CONTENT_TYPE)
+                            .and_then(|v| v.to_str().ok())
+                            .map(|ct| ct.starts_with("text/event-stream"))
+                            .unwrap_or(false);
+                        usage_metrics::record_run_request(rid);
+                        usage_metrics::extract_and_record_usage_buffered(
+                            rid,
+                            &body_bytes,
+                            is_streaming,
+                        );
+                    }
+
+                    match response_builder.body(Body::from(body_bytes)) {
+                        Ok(response) => response,
+                        Err(e) => (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("Failed to build response: {}", e),
+                        )
+                            .into_response(),
+                    }
+                } else {
+                    let body = Body::from_stream(response.bytes_stream());
+                    match response_builder.body(body) {
+                        Ok(response) => response,
+                        Err(e) => (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("Failed to build response: {}", e),
+                        )
+                            .into_response(),
+                    }
                 }
             }
             Err(e) => (
