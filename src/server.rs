@@ -215,10 +215,14 @@ async fn transparent_proxy_handler(State(state): State<Arc<AppState>>, req: Requ
         }
     }
 
-    // Route through transparent proxy
+    // Route through transparent proxy. Pass run_id through so backends
+    // emitting an OpenAI-style `usage` block (e.g. vLLM's `/v1/generate`,
+    // hit by the renderer rollout client) get per-run token attribution
+    // — without this, the catch-all path silently skips usage metrics.
+    let run_id = run_id_from_claims(&claims);
     state
         .router
-        .route_transparent(Some(&headers), &path, &method, body_json)
+        .route_transparent(Some(&headers), &path, &method, body_json, run_id.as_deref())
         .await
 }
 
@@ -761,9 +765,16 @@ async fn v1_responses(
         return response;
     }
 
+    let run_id = run_id_from_claims(&claims);
     state
         .router
-        .route_transparent(Some(&headers), "/v1/responses", &http::Method::POST, body)
+        .route_transparent(
+            Some(&headers),
+            "/v1/responses",
+            &http::Method::POST,
+            body,
+            run_id.as_deref(),
+        )
         .await
 }
 

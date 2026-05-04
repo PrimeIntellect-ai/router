@@ -826,12 +826,15 @@ impl RouterTrait for RouterManager {
         path: &str,
         method: &Method,
         body: serde_json::Value,
+        run_id: Option<&str>,
     ) -> Response {
         // Select router based on headers (no model info available for transparent proxy)
         let router = self.select_router_for_request(headers, None);
 
         if let Some(router) = router {
-            router.route_transparent(headers, path, method, body).await
+            router
+                .route_transparent(headers, path, method, body, run_id)
+                .await
         } else {
             // Return 404 when no router is available
             (
