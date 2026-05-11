@@ -4,6 +4,7 @@ use super::dp_utils;
 use super::logprobs_merge;
 use super::pd_router::PDRouter;
 use super::pd_types::{error_chain, PDRouterError};
+use super::routed_experts_merge;
 use super::usage_metrics;
 use super::vllm_service_discovery::{ServiceRegistry, ServiceType};
 use crate::core::{BasicWorker, Worker, WorkerType};
@@ -187,6 +188,30 @@ impl VllmPDRouter {
             obj.remove("stream_options");
         }
         request
+    }
+
+    fn merge_prefill_response_metadata(
+        prefill_json: &Value,
+        decode_json: &mut Value,
+    ) -> Result<(), String> {
+        if let Some(prefill_prompt_token_ids) = prefill_json.get("prompt_token_ids") {
+            if !prefill_prompt_token_ids.is_null() {
+                let decode_obj = decode_json
+                    .as_object_mut()
+                    .ok_or_else(|| "decode response is not a JSON object".to_string())?;
+                decode_obj.insert(
+                    "prompt_token_ids".to_string(),
+                    prefill_prompt_token_ids.clone(),
+                );
+            }
+        }
+
+        let merged = routed_experts_merge::merge_routed_experts_in_json(prefill_json, decode_json)?;
+        if merged {
+            debug!("Successfully merged routed experts from prefill and decode responses");
+        }
+
+        Ok(())
     }
 
     /// Convert service discovery instances to Worker objects for policy selection
@@ -634,13 +659,18 @@ impl VllmPDRouter {
                 warn!("No logprobs were merged (might be expected if logprobs not in response)");
             }
 
+            Self::merge_prefill_response_metadata(&prefill_response_json, &mut decode_json)
+                .map_err(|e| format!("Failed to merge routed experts for vLLM P/D: {}", e))?;
+
             // Serialize merged response
             let merged_body = serde_json::to_vec(&decode_json)
                 .map_err(|e| format!("Failed to serialize merged response: {}", e))?;
 
             let mut response_builder = axum::http::Response::builder().status(status);
             for (name, value) in headers.iter() {
-                response_builder = response_builder.header(name, value);
+                if name != "transfer-encoding" && name != "content-length" {
+                    response_builder = response_builder.header(name, value);
+                }
             }
 
             let response = response_builder
@@ -678,30 +708,36 @@ impl VllmPDRouter {
                 }
             }
 
-            let body = if let Some(prefill_prompt_token_ids) = prefill_response_json.get("prompt_token_ids") {
-                if !prefill_prompt_token_ids.is_null() {
-                    if let Ok(mut decode_json) = serde_json::from_slice::<Value>(&decode_body) {
-                        if let Some(decode_obj) = decode_json.as_object_mut() {
-                            decode_obj.insert(
-                                "prompt_token_ids".to_string(),
-                                prefill_prompt_token_ids.clone(),
-                            );
-                        }
-                        serde_json::to_vec(&decode_json)
-                            .unwrap_or_else(|_| decode_body.to_vec())
-                    } else {
-                        decode_body.to_vec()
-                    }
-                } else {
-                    decode_body.to_vec()
+            let has_prefill_metadata = prefill_response_json
+                .get("prompt_token_ids")
+                .filter(|value| !value.is_null())
+                .is_some()
+                || routed_experts_merge::prefill_has_routed_experts(&prefill_response_json);
+
+            let body = if is_streaming {
+                if routed_experts_merge::prefill_has_routed_experts(&prefill_response_json) {
+                    return Err(
+                        "Failed to merge routed experts for vLLM P/D: streaming responses are not supported"
+                            .to_string(),
+                    );
                 }
+                decode_body.to_vec()
+            } else if has_prefill_metadata {
+                let mut decode_json: Value = serde_json::from_slice(&decode_body)
+                    .map_err(|e| format!("Failed to parse decode response as JSON: {}", e))?;
+                Self::merge_prefill_response_metadata(&prefill_response_json, &mut decode_json)
+                    .map_err(|e| format!("Failed to merge routed experts for vLLM P/D: {}", e))?;
+                serde_json::to_vec(&decode_json)
+                    .map_err(|e| format!("Failed to serialize merged response: {}", e))?
             } else {
                 decode_body.to_vec()
             };
 
             let mut response_builder = axum::http::Response::builder().status(status);
             for (name, value) in headers.iter() {
-                response_builder = response_builder.header(name, value);
+                if name != "transfer-encoding" && name != "content-length" {
+                    response_builder = response_builder.header(name, value);
+                }
             }
 
             let response = response_builder
@@ -1062,6 +1098,11 @@ impl VllmPDRouter {
                 warn!("No logprobs were merged (might be expected if logprobs not in response)");
             }
 
+            Self::merge_prefill_response_metadata(&prefill_response_json, &mut decode_json)
+                .map_err(|e| PDRouterError::NetworkError {
+                    message: format!("Failed to merge routed experts for vLLM P/D: {}", e),
+                })?;
+
             // Serialize merged response
             let merged_body =
                 serde_json::to_vec(&decode_json).map_err(|e| PDRouterError::NetworkError {
@@ -1114,23 +1155,33 @@ impl VllmPDRouter {
                 }
             }
 
-            let body = if let Some(prefill_prompt_token_ids) = prefill_response_json.get("prompt_token_ids") {
-                if !prefill_prompt_token_ids.is_null() {
-                    if let Ok(mut decode_json) = serde_json::from_slice::<Value>(&decode_body) {
-                        if let Some(decode_obj) = decode_json.as_object_mut() {
-                            decode_obj.insert(
-                                "prompt_token_ids".to_string(),
-                                prefill_prompt_token_ids.clone(),
-                            );
-                        }
-                        serde_json::to_vec(&decode_json)
-                            .unwrap_or_else(|_| decode_body.to_vec())
-                    } else {
-                        decode_body.to_vec()
-                    }
-                } else {
-                    decode_body.to_vec()
+            let has_prefill_metadata = prefill_response_json
+                .get("prompt_token_ids")
+                .filter(|value| !value.is_null())
+                .is_some()
+                || routed_experts_merge::prefill_has_routed_experts(&prefill_response_json);
+
+            let body = if is_streaming {
+                if routed_experts_merge::prefill_has_routed_experts(&prefill_response_json) {
+                    return Err(PDRouterError::NetworkError {
+                        message: "Failed to merge routed experts for vLLM P/D: streaming responses are not supported"
+                            .to_string(),
+                    });
                 }
+                decode_body.to_vec()
+            } else if has_prefill_metadata {
+                let mut decode_json: Value = serde_json::from_slice(&decode_body).map_err(|e| {
+                    PDRouterError::NetworkError {
+                        message: format!("Failed to parse decode response as JSON: {}", e),
+                    }
+                })?;
+                Self::merge_prefill_response_metadata(&prefill_response_json, &mut decode_json)
+                    .map_err(|e| PDRouterError::NetworkError {
+                        message: format!("Failed to merge routed experts for vLLM P/D: {}", e),
+                    })?;
+                serde_json::to_vec(&decode_json).map_err(|e| PDRouterError::NetworkError {
+                    message: format!("Failed to serialize merged response: {}", e),
+                })?
             } else {
                 decode_body.to_vec()
             };
