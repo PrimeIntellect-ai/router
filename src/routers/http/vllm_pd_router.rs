@@ -646,6 +646,21 @@ impl VllmPDRouter {
                 }
             }
 
+            if !status.is_success() {
+                let mut response_builder = axum::http::Response::builder().status(status);
+                for (name, value) in headers.iter() {
+                    if name != "transfer-encoding" && name != "content-length" {
+                        response_builder = response_builder.header(name, value);
+                    }
+                }
+
+                let response = response_builder
+                    .body(axum::body::Body::from(decode_body.to_vec()))
+                    .map_err(|e| format!("Failed to build response: {}", e))?;
+
+                return Ok(response);
+            }
+
             // Parse decode response as JSON
             let mut decode_json: Value = serde_json::from_slice(&decode_body)
                 .map_err(|e| format!("Failed to parse decode response as JSON: {}", e))?;
@@ -706,6 +721,21 @@ impl VllmPDRouter {
                         is_streaming,
                     );
                 }
+            }
+
+            if !status.is_success() {
+                let mut response_builder = axum::http::Response::builder().status(status);
+                for (name, value) in headers.iter() {
+                    if name != "transfer-encoding" && name != "content-length" {
+                        response_builder = response_builder.header(name, value);
+                    }
+                }
+
+                let response = response_builder
+                    .body(axum::body::Body::from(decode_body.to_vec()))
+                    .map_err(|e| format!("Failed to build response: {}", e))?;
+
+                return Ok(response);
             }
 
             let has_prefill_metadata = prefill_response_json
@@ -1083,6 +1113,21 @@ impl VllmPDRouter {
                 }
             }
 
+            if !status.is_success() {
+                let mut response_builder = Response::builder().status(status);
+                for (key, value) in headers.iter() {
+                    if key != "transfer-encoding" && key != "content-length" {
+                        response_builder = response_builder.header(key, value);
+                    }
+                }
+
+                return response_builder
+                    .body(Body::from(decode_body.to_vec()))
+                    .map_err(|e| PDRouterError::NetworkError {
+                        message: format!("Failed to build response from {}: {}", decode_url, e),
+                    });
+            }
+
             // Parse decode response as JSON
             let mut decode_json: Value =
                 serde_json::from_slice(&decode_body).map_err(|e| PDRouterError::NetworkError {
@@ -1153,6 +1198,21 @@ impl VllmPDRouter {
                         is_streaming,
                     );
                 }
+            }
+
+            if !status.is_success() {
+                let mut response_builder = Response::builder().status(status);
+                for (key, value) in headers.iter() {
+                    if key != "transfer-encoding" && key != "content-length" {
+                        response_builder = response_builder.header(key, value);
+                    }
+                }
+
+                return response_builder
+                    .body(Body::from(decode_body.to_vec()))
+                    .map_err(|e| PDRouterError::NetworkError {
+                        message: format!("Failed to build response from {}: {}", decode_url, e),
+                    });
             }
 
             let has_prefill_metadata = prefill_response_json
