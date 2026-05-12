@@ -27,7 +27,7 @@ pub fn merge_routed_experts_in_json(
             .to_string()
     })?;
 
-    validate_routed_experts_array(prefill_prompt_routed, "prefill prompt_routed_experts")?;
+    validate_routed_experts_payload(prefill_prompt_routed, "prefill prompt_routed_experts")?;
     if !routed_experts_sum_nonzero(prefill_prompt_routed) {
         return Err("prefill prompt_routed_experts sum to zero".to_string());
     }
@@ -66,11 +66,9 @@ fn validate_completion_routed_experts(decode_json: &Value) -> Result<(), String>
         else {
             continue;
         };
-        validate_routed_experts_array(routed_experts, "decode choice routed_experts")?;
-        if let Some(entries) = routed_experts.as_array() {
-            if !entries.is_empty() && !routed_experts_sum_nonzero(routed_experts) {
-                return Err("decode choice routed_experts sum to zero".to_string());
-            }
+        validate_routed_experts_payload(routed_experts, "decode choice routed_experts")?;
+        if !routed_experts_is_empty(routed_experts) && !routed_experts_sum_nonzero(routed_experts) {
+            return Err("decode choice routed_experts sum to zero".to_string());
         }
     }
 
@@ -108,34 +106,117 @@ fn all_choices_have_completion_routed_experts(decode_json: &Value) -> bool {
         .unwrap_or(false)
 }
 
-fn validate_routed_experts_array(value: &Value, name: &str) -> Result<(), String> {
-    let Some(tokens) = value.as_array() else {
-        return Err(format!("{} must be a JSON array", name));
+fn validate_routed_experts_payload(value: &Value, name: &str) -> Result<(), String> {
+    match value {
+        Value::Object(_) => validate_routed_experts_bytes(value, name),
+        _ => Err(format!("{} must be a base64 routed-experts object", name)),
+    }
+}
+
+fn validate_routed_experts_bytes(value: &Value, name: &str) -> Result<(), String> {
+    let Some(object) = value.as_object() else {
+        return Err(format!("{} must be a base64 object", name));
     };
 
-    for token in tokens {
-        let Some(layers) = token.as_array() else {
-            return Err(format!("{} token entry must be a JSON array", name));
-        };
-        for layer in layers {
-            let Some(experts) = layer.as_array() else {
-                return Err(format!("{} layer entry must be a JSON array", name));
-            };
-            for expert in experts {
-                if expert.as_i64().is_none() {
-                    return Err(format!("{} expert id must be an integer", name));
-                }
-            }
-        }
+    let encoding = object
+        .get("encoding")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("{} encoding must be a string", name))?;
+    if encoding != "base64" {
+        return Err(format!("{} encoding must be base64", name));
+    }
+
+    let dtype = object
+        .get("dtype")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("{} dtype must be a string", name))?;
+    if dtype != "int16" {
+        return Err(format!("{} dtype must be int16", name));
+    }
+
+    let shape = object
+        .get("shape")
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("{} shape must be a JSON array", name))?;
+    if shape.len() != 3 {
+        return Err(format!("{} shape must have 3 dimensions", name));
+    }
+    let num_values = shape.iter().try_fold(1_u64, |acc, dim| {
+        let dim = dim
+            .as_u64()
+            .ok_or_else(|| format!("{} shape entries must be non-negative integers", name))?;
+        acc.checked_mul(dim)
+            .ok_or_else(|| format!("{} shape is too large", name))
+    })?;
+
+    let data = object
+        .get("data")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("{} data must be a string", name))?;
+    validate_base64_data(data, name)?;
+
+    let decoded_len = base64_decoded_len(data, name)?;
+    let expected_len = num_values
+        .checked_mul(2)
+        .ok_or_else(|| format!("{} byte length is too large", name))?;
+    if decoded_len != expected_len {
+        return Err(format!(
+            "{} data byte length {} does not match shape byte length {}",
+            name, decoded_len, expected_len
+        ));
     }
 
     Ok(())
 }
 
+fn validate_base64_data(data: &str, name: &str) -> Result<(), String> {
+    if data.len() % 4 != 0 {
+        return Err(format!("{} data must have a valid base64 length", name));
+    }
+    if !data
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'+' || byte == b'/' || byte == b'=')
+    {
+        return Err(format!("{} data must be standard base64", name));
+    }
+
+    Ok(())
+}
+
+fn base64_decoded_len(data: &str, name: &str) -> Result<u64, String> {
+    let padding = data
+        .as_bytes()
+        .iter()
+        .rev()
+        .take_while(|&&byte| byte == b'=')
+        .count();
+    if padding > 2 {
+        return Err(format!("{} data has invalid base64 padding", name));
+    }
+
+    Ok((data.len() as u64 / 4) * 3 - padding as u64)
+}
+
+fn routed_experts_is_empty(value: &Value) -> bool {
+    match value {
+        Value::Object(object) => object
+            .get("shape")
+            .and_then(Value::as_array)
+            .and_then(|shape| shape.first())
+            .and_then(Value::as_u64)
+            .map(|tokens| tokens == 0)
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
 fn routed_experts_sum_nonzero(value: &Value) -> bool {
     match value {
-        Value::Number(number) => number.as_i64().unwrap_or(0) != 0,
-        Value::Array(array) => array.iter().any(routed_experts_sum_nonzero),
+        Value::Object(object) => object
+            .get("data")
+            .and_then(Value::as_str)
+            .map(|data| data.bytes().any(|byte| byte != b'A' && byte != b'='))
+            .unwrap_or(false),
         _ => false,
     }
 }
@@ -148,17 +229,21 @@ mod tests {
     #[test]
     fn merges_prefill_prompt_routing_and_keeps_decode_choice_routing() {
         let prefill = json!({
-            "prompt_routed_experts": [
-                [[1, 2], [3, 4]],
-                [[5, 6], [7, 8]]
-            ],
-            "choices": [{"routed_experts": [[[99]]]}]
+            "prompt_routed_experts": {
+                "encoding": "base64",
+                "dtype": "int16",
+                "shape": [1, 1, 2],
+                "data": "AQACAA=="
+            }
         });
         let mut decode = json!({
             "choices": [{
-                "routed_experts": [
-                    [[11, 12], [13, 14]]
-                ]
+                "routed_experts": {
+                    "encoding": "base64",
+                    "dtype": "int16",
+                    "shape": [1, 1, 2],
+                    "data": "AwAEAA=="
+                }
             }]
         });
 
@@ -169,13 +254,22 @@ mod tests {
             decode["prompt_routed_experts"],
             prefill["prompt_routed_experts"]
         );
-        assert_eq!(decode["choices"][0]["routed_experts"][0][0][0], 11);
+        assert_eq!(decode["choices"][0]["routed_experts"]["data"], "AwAEAA==");
     }
 
     #[test]
     fn errors_when_decode_has_routing_but_prefill_does_not() {
         let prefill = json!({});
-        let mut decode = json!({"choices": [{"routed_experts": [[[3]]]}]});
+        let mut decode = json!({
+            "choices": [{
+                "routed_experts": {
+                    "encoding": "base64",
+                    "dtype": "int16",
+                    "shape": [1, 1, 2],
+                    "data": "AwAEAA=="
+                }
+            }]
+        });
 
         let err = merge_routed_experts_in_json(&prefill, &mut decode).unwrap_err();
 
@@ -185,12 +279,23 @@ mod tests {
     #[test]
     fn errors_on_zero_sum_prompt_routing() {
         let prefill = json!({
-            "prompt_routed_experts": [
-                [[0]],
-                [[0]]
-            ]
+            "prompt_routed_experts": {
+                "encoding": "base64",
+                "dtype": "int16",
+                "shape": [1, 1, 2],
+                "data": "AAAAAA=="
+            }
         });
-        let mut decode = json!({"choices": [{"routed_experts": [[[3]]]}]});
+        let mut decode = json!({
+            "choices": [{
+                "routed_experts": {
+                    "encoding": "base64",
+                    "dtype": "int16",
+                    "shape": [1, 1, 2],
+                    "data": "AwAEAA=="
+                }
+            }]
+        });
 
         let err = merge_routed_experts_in_json(&prefill, &mut decode).unwrap_err();
 
@@ -200,10 +305,12 @@ mod tests {
     #[test]
     fn errors_when_prefill_has_routing_but_decode_choice_does_not() {
         let prefill = json!({
-            "prompt_routed_experts": [
-                [[1]],
-                [[2]]
-            ]
+            "prompt_routed_experts": {
+                "encoding": "base64",
+                "dtype": "int16",
+                "shape": [1, 1, 2],
+                "data": "AQACAA=="
+            }
         });
         let mut decode = json!({"choices": [{"text": "ok"}]});
 
@@ -221,5 +328,31 @@ mod tests {
 
         assert!(!merged);
         assert!(decode.get("prompt_routed_experts").is_none());
+    }
+
+    #[test]
+    fn errors_on_zero_sum_base64_prompt_routing() {
+        let prefill = json!({
+            "prompt_routed_experts": {
+                "encoding": "base64",
+                "dtype": "int16",
+                "shape": [1, 1, 2],
+                "data": "AAAAAA=="
+            }
+        });
+        let mut decode = json!({
+            "choices": [{
+                "routed_experts": {
+                    "encoding": "base64",
+                    "dtype": "int16",
+                    "shape": [1, 1, 2],
+                    "data": "AwAEAA=="
+                }
+            }]
+        });
+
+        let err = merge_routed_experts_in_json(&prefill, &mut decode).unwrap_err();
+
+        assert!(err.contains("sum to zero"));
     }
 }
