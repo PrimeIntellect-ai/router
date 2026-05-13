@@ -18,8 +18,8 @@ impl RoutedExpertsPrefixCache {
     fn recover_and_store_prompt(
         &self,
         request_json: &Value,
-        payload: &mut Value,
-    ) -> Result<(), String> {
+        payload: &Value,
+    ) -> Result<RoutedExpertsTensor, String> {
         let tokens = prompt_tokens_from_request(request_json)?;
         let prompt_start = routed_experts_prompt_start(request_json)?;
         let mut tensor = decode_routed_experts_value(payload, "prefill routed_experts")?;
@@ -38,11 +38,14 @@ impl RoutedExpertsPrefixCache {
         store_tensor_in_trie(&mut root, &tokens, prompt_start, &tensor);
         drop(root);
 
-        if recovered > 0 {
-            *payload = Value::String(encode_routed_experts_payload(&tensor)?);
+        if recovered > 0 && tensor.has_placeholder_rows() {
+            return Err(
+                "prefill routed_experts still contained placeholder rows after cache recovery"
+                    .to_string(),
+            );
         }
 
-        Ok(())
+        Ok(tensor)
     }
 }
 
@@ -117,6 +120,33 @@ impl RoutedExpertsTensor {
             data: self.data[start * row_width..end * row_width].to_vec(),
         })
     }
+
+    fn empty_like(&self) -> Self {
+        Self {
+            seq_len: 0,
+            layers: self.layers,
+            topk: self.topk,
+            data: Vec::new(),
+        }
+    }
+
+    fn concat_rows(&self, other: &Self) -> Result<Self, String> {
+        if self.layers != other.layers || self.topk != other.topk {
+            return Err(format!(
+                "cannot concatenate routed_experts with shapes ({}, {}, {}) and ({}, {}, {})",
+                self.seq_len, self.layers, self.topk, other.seq_len, other.layers, other.topk
+            ));
+        }
+        let mut data = Vec::with_capacity(self.data.len() + other.data.len());
+        data.extend_from_slice(&self.data);
+        data.extend_from_slice(&other.data);
+        Ok(Self {
+            seq_len: self.seq_len + other.seq_len,
+            layers: self.layers,
+            topk: self.topk,
+            data,
+        })
+    }
 }
 
 pub fn prefill_has_routed_experts(prefill_json: &Value) -> bool {
@@ -148,17 +178,11 @@ pub fn merge_routed_experts_in_json(
                 .to_string(),
         );
     }
-    normalize_decode_routed_experts(decode_json, prompt_len)?;
-
-    let decode_obj = decode_json
-        .as_object_mut()
-        .ok_or_else(|| "decode response is not a JSON object".to_string())?;
-    decode_obj.insert("prompt_routed_experts".to_string(), prompt_routed.clone());
-
-    let prompt_payload = decode_obj
-        .get_mut("prompt_routed_experts")
-        .ok_or_else(|| "decode response prompt_routed_experts was not inserted".to_string())?;
-    prefix_cache.recover_and_store_prompt(request_json, prompt_payload)?;
+    let prompt_tensor = prefix_cache.recover_and_store_prompt(request_json, prompt_routed)?;
+    merge_prompt_into_decode_choices(decode_json, prompt_len, &prompt_tensor)?;
+    if let Some(decode_obj) = decode_json.as_object_mut() {
+        decode_obj.remove("prompt_routed_experts");
+    }
 
     Ok(true)
 }
@@ -206,48 +230,71 @@ fn all_required_decode_choices_have_routed_experts(decode_json: &Value) -> bool 
         .unwrap_or(false)
 }
 
-fn normalize_decode_routed_experts(
+fn merge_prompt_into_decode_choices(
     decode_json: &mut Value,
     prompt_len: usize,
+    prompt_tensor: &RoutedExpertsTensor,
 ) -> Result<(), String> {
     let choices = decode_json
         .get_mut("choices")
         .and_then(Value::as_array_mut)
         .ok_or_else(|| "decode response choices must be an array".to_string())?;
     for choice in choices {
-        let token_ids_len = choice_token_ids_len(choice);
-        if let Some(routed_experts) = choice
-            .get_mut("routed_experts")
+        let expected_completion_len = choice_token_ids_len(choice)
+            .ok_or_else(|| "decode choice must contain token_ids".to_string())?
+            .saturating_sub(1);
+        let completion_tensor = if let Some(routed_experts) = choice
+            .get("routed_experts")
             .filter(|value| !value.is_null())
         {
-            let mut tensor =
-                decode_routed_experts_value(routed_experts, "decode choice routed_experts")?;
-            if tensor.has_placeholder_rows() {
-                return Err("decode choice routed_experts contained placeholder rows".to_string());
-            }
-            let expected_len = token_ids_len
-                .ok_or_else(|| {
-                    "decode choice with routed_experts must contain token_ids".to_string()
-                })?
-                .saturating_sub(1);
-            match tensor.seq_len {
-                len if len == expected_len => {}
-                len if len == prompt_len + expected_len => {
-                    tensor = tensor.slice_rows(prompt_len, prompt_len + expected_len)?;
-                    *routed_experts = Value::String(encode_routed_experts_payload(&tensor)?);
-                }
-                len => {
-                    return Err(format!(
-                        "decode choice routed_experts has {len} rows, expected {expected_len} completion rows or {} full-sequence rows",
-                        prompt_len + expected_len
-                    ));
-                }
-            }
-        } else if decode_choice_requires_routed_experts(choice) {
+            completion_from_decode_routed_experts(
+                routed_experts,
+                prompt_len,
+                prompt_tensor.seq_len,
+                expected_completion_len,
+            )?
+        } else if expected_completion_len == 0 {
+            prompt_tensor.empty_like()
+        } else {
             return Err("decode choice routed_experts is missing".to_string());
+        };
+        if completion_tensor.has_placeholder_rows() {
+            return Err(
+                "decode choice completion routed_experts contained placeholder rows".to_string(),
+            );
         }
+        let merged = prompt_tensor.concat_rows(&completion_tensor)?;
+        if let Some(choice_obj) = choice.as_object_mut() {
+            choice_obj.insert(
+                "routed_experts".to_string(),
+                Value::String(encode_routed_experts_payload(&merged)?),
+            );
+        } else {
+            return Err("decode response choice must be a JSON object".to_string());
+        };
     }
     Ok(())
+}
+
+fn completion_from_decode_routed_experts(
+    routed_experts: &Value,
+    prompt_len: usize,
+    prompt_routed_len: usize,
+    expected_completion_len: usize,
+) -> Result<RoutedExpertsTensor, String> {
+    let tensor = decode_routed_experts_value(routed_experts, "decode choice routed_experts")?;
+    match tensor.seq_len {
+        len if len == expected_completion_len => Ok(tensor),
+        len if len == prompt_routed_len + expected_completion_len
+            || len == prompt_len + expected_completion_len =>
+        {
+            tensor.slice_rows(len - expected_completion_len, len)
+        }
+        len => Err(format!(
+            "decode choice routed_experts has {len} rows, expected {expected_completion_len} completion rows or {} full-sequence rows",
+            prompt_len + expected_completion_len
+        )),
+    }
 }
 
 fn choice_token_ids_len(choice: &Value) -> Option<usize> {
@@ -569,19 +616,14 @@ mod tests {
         let request = json!({"prompt_token_ids": [101, 102]});
 
         assert!(merge_routed_experts_in_json(&prefill, &mut decode, &request, &cache).unwrap());
-        let prompt = decode_routed_experts_value(
-            decode.get("prompt_routed_experts").unwrap(),
-            "merged prompt routed_experts",
-        )
-        .unwrap();
-        let completion = decode_routed_experts_value(
+        assert!(decode.get("prompt_routed_experts").is_none());
+        let merged = decode_routed_experts_value(
             decode["choices"][0].get("routed_experts").unwrap(),
-            "merged decode routed_experts",
+            "merged choice routed_experts",
         )
         .unwrap();
 
-        assert_eq!(prompt.data, vec![10, 11, 20, 21]);
-        assert_eq!(completion.data, vec![30, 31]);
+        assert_eq!(merged.data, vec![10, 11, 20, 21, 30, 31]);
     }
 
     #[test]
@@ -601,12 +643,13 @@ mod tests {
         let mut decode = json!({"choices": [{"token_ids": [7, 8], "routed_experts": completion}]});
 
         merge_routed_experts_in_json(&prefill, &mut decode, &request, &cache).unwrap();
-        let prompt = decode_routed_experts_value(
-            decode.get("prompt_routed_experts").unwrap(),
-            "merged prompt routed_experts",
+        assert!(decode.get("prompt_routed_experts").is_none());
+        let merged = decode_routed_experts_value(
+            decode["choices"][0].get("routed_experts").unwrap(),
+            "merged choice routed_experts",
         )
         .unwrap();
 
-        assert_eq!(prompt.data, vec![10, 11, 20, 21, 30, 31]);
+        assert_eq!(merged.data, vec![10, 11, 20, 21, 30, 31, 40, 41]);
     }
 }
