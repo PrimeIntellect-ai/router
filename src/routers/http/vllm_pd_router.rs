@@ -1816,6 +1816,11 @@ impl RouterTrait for VllmPDRouter {
         self.pd_router.flush_cache().await
     }
 
+    async fn clear_routing_cache(&self) -> Response {
+        self.routed_experts_cache.clear();
+        (StatusCode::OK, "Routing cache cleared").into_response()
+    }
+
     async fn get_worker_loads(&self) -> Response {
         self.pd_router.get_worker_loads().await
     }

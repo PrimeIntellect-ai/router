@@ -158,6 +158,15 @@ pub trait RouterTrait: Send + Sync + Debug + WorkerManagement {
     /// Flush cache on all workers
     async fn flush_cache(&self) -> Response;
 
+    /// Clear router-local routed-experts cache.
+    async fn clear_routing_cache(&self) -> Response {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "clear_routing_cache not supported for this router",
+        )
+            .into_response()
+    }
+
     /// Get worker loads (for monitoring)
     async fn get_worker_loads(&self) -> Response;
 

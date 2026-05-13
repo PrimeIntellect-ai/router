@@ -15,6 +15,10 @@ pub struct RoutedExpertsPrefixCache {
 }
 
 impl RoutedExpertsPrefixCache {
+    pub fn clear(&self) {
+        *self.root.lock() = RoutedExpertsTrieNode::default();
+    }
+
     fn recover_and_store_prompt(
         &self,
         request_json: &Value,

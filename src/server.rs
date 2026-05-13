@@ -1006,6 +1006,17 @@ async fn flush_cache(State(state): State<Arc<AppState>>, headers: http::HeaderMa
     state.router.flush_cache().await
 }
 
+async fn clear_routing_cache(
+    State(state): State<Arc<AppState>>,
+    headers: http::HeaderMap,
+) -> Response {
+    if let Err(response) = authorize_request(&state, &headers).await {
+        return response;
+    }
+
+    state.router.clear_routing_cache().await
+}
+
 async fn get_loads(State(state): State<Arc<AppState>>, headers: http::HeaderMap) -> Response {
     if let Err(response) = authorize_request(&state, &headers).await {
         return response;
@@ -1254,6 +1265,7 @@ pub fn build_app_with_request_tracing(
         .route("/remove_worker", post(remove_worker))
         .route("/list_workers", get(list_workers))
         .route("/flush_cache", post(flush_cache))
+        .route("/clear_routing_cache", post(clear_routing_cache))
         .route("/get_loads", get(get_loads));
 
     // Worker management routes
