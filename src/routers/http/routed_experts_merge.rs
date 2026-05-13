@@ -154,7 +154,7 @@ impl RoutedExpertsTensor {
 }
 
 pub fn prefill_has_routed_experts(prefill_json: &Value) -> bool {
-    prompt_routed_experts(prefill_json).is_some()
+    prefill_choice_routed_experts(prefill_json).is_some()
 }
 
 pub fn merge_routed_experts_in_json(
@@ -165,14 +165,14 @@ pub fn merge_routed_experts_in_json(
 ) -> Result<bool, String> {
     let prompt_tokens = prompt_tokens_from_request(request_json)?;
     let prompt_len = prompt_tokens.len();
-    let prompt_routed = prompt_routed_experts(prefill_json);
+    let prefill_routed = prefill_choice_routed_experts(prefill_json);
     let decode_has_routing = decode_has_routed_experts(decode_json);
 
-    if prompt_routed.is_none() && !decode_has_routing {
+    if prefill_routed.is_none() && !decode_has_routing {
         return Ok(false);
     }
 
-    let prompt_routed = prompt_routed.ok_or_else(|| {
+    let prefill_routed = prefill_routed.ok_or_else(|| {
         "decode response contained routed_experts, but prefill response did not".to_string()
     })?;
 
@@ -182,27 +182,19 @@ pub fn merge_routed_experts_in_json(
                 .to_string(),
         );
     }
-    let prompt_tensor = prefix_cache.recover_and_store_prompt(request_json, prompt_routed)?;
+    let prompt_tensor = prefix_cache.recover_and_store_prompt(request_json, prefill_routed)?;
     merge_prompt_into_decode_choices(decode_json, prompt_len, &prompt_tensor)?;
-    if let Some(decode_obj) = decode_json.as_object_mut() {
-        decode_obj.remove("prompt_routed_experts");
-    }
 
     Ok(true)
 }
 
-fn prompt_routed_experts(prefill_json: &Value) -> Option<&Value> {
+fn prefill_choice_routed_experts(prefill_json: &Value) -> Option<&Value> {
     prefill_json
-        .get("prompt_routed_experts")
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+        .and_then(|choice| choice.get("routed_experts"))
         .filter(|value| !value.is_null())
-        .or_else(|| {
-            prefill_json
-                .get("choices")
-                .and_then(Value::as_array)
-                .and_then(|choices| choices.first())
-                .and_then(|choice| choice.get("routed_experts"))
-                .filter(|value| !value.is_null())
-        })
 }
 
 fn decode_has_routed_experts(decode_json: &Value) -> bool {
@@ -610,7 +602,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_stores_prompt_routed_experts_by_token_prefix() {
+    fn merge_stores_prefill_choice_routing_by_token_prefix() {
         let cache = RoutedExpertsPrefixCache::default();
         let prompt_payload = uint8_payload(2, 1, 2, vec![10, 11, 20, 21]);
         let full_decode_payload = uint8_payload(3, 1, 2, vec![10, 11, 20, 21, 30, 31]);
@@ -620,7 +612,6 @@ mod tests {
         let request = json!({"prompt_token_ids": [101, 102]});
 
         assert!(merge_routed_experts_in_json(&prefill, &mut decode, &request, &cache).unwrap());
-        assert!(decode.get("prompt_routed_experts").is_none());
         let merged = decode_routed_experts_value(
             decode["choices"][0].get("routed_experts").unwrap(),
             "merged choice routed_experts",
@@ -647,7 +638,6 @@ mod tests {
         let mut decode = json!({"choices": [{"token_ids": [7, 8], "routed_experts": completion}]});
 
         merge_routed_experts_in_json(&prefill, &mut decode, &request, &cache).unwrap();
-        assert!(decode.get("prompt_routed_experts").is_none());
         let merged = decode_routed_experts_value(
             decode["choices"][0].get("routed_experts").unwrap(),
             "merged choice routed_experts",
