@@ -306,10 +306,7 @@ async fn filter_models_response(response: Response, claims: &RftClaims) -> Respo
         Ok(b) => b,
         Err(e) => {
             warn!("failed to read /v1/models body for filtering: {e}");
-            return (
-                StatusCode::BAD_GATEWAY,
-                "failed to read upstream models response",
-            )
+            return (StatusCode::BAD_GATEWAY, "failed to read upstream models response")
                 .into_response();
         }
     };
@@ -318,10 +315,7 @@ async fn filter_models_response(response: Response, claims: &RftClaims) -> Respo
         Ok(v) => v,
         Err(e) => {
             warn!("failed to parse /v1/models body for filtering: {e}");
-            return (
-                StatusCode::BAD_GATEWAY,
-                "failed to parse upstream models response",
-            )
+            return (StatusCode::BAD_GATEWAY, "failed to parse upstream models response")
                 .into_response();
         }
     };
@@ -906,7 +900,9 @@ async fn authorize_request(
             Err(_) => {
                 // Not a valid JWT — fall through to API key validation if configured
                 if validation_urls.is_empty() {
-                    return Err((StatusCode::UNAUTHORIZED, AUTH_FAILURE_MESSAGE).into_response());
+                    return Err(
+                        (StatusCode::UNAUTHORIZED, AUTH_FAILURE_MESSAGE).into_response()
+                    );
                 }
             }
         }

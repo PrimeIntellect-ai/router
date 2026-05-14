@@ -688,37 +688,28 @@ impl VllmPDRouter {
                 }
             }
 
-            let has_prompt_token_ids = prefill_response_json
-                .get("prompt_token_ids")
-                .filter(|value| !value.is_null())
-                .is_some();
             let has_routed_experts =
                 routed_experts_merge::prefill_has_routed_experts(&prefill_response_json);
-
-            let body = if is_streaming {
-                if has_routed_experts {
+            let body = if has_routed_experts {
+                if is_streaming {
                     return Err(
                         "P/D routed-experts merge does not support streaming responses".to_string(),
                     );
                 }
-                decode_body.to_vec()
-            } else if has_prompt_token_ids || has_routed_experts {
+
                 let mut decode_json: Value = serde_json::from_slice(&decode_body)
                     .map_err(|e| format!("Failed to parse decode response as JSON: {}", e))?;
-
-                if let Some(prefill_prompt_token_ids) =
-                    prefill_response_json.get("prompt_token_ids")
+                if let Some(prefill_prompt_token_ids) = prefill_response_json
+                    .get("prompt_token_ids")
+                    .filter(|value| !value.is_null())
                 {
-                    if !prefill_prompt_token_ids.is_null() {
-                        if let Some(decode_obj) = decode_json.as_object_mut() {
-                            decode_obj.insert(
-                                "prompt_token_ids".to_string(),
-                                prefill_prompt_token_ids.clone(),
-                            );
-                        }
+                    if let Some(decode_obj) = decode_json.as_object_mut() {
+                        decode_obj.insert(
+                            "prompt_token_ids".to_string(),
+                            prefill_prompt_token_ids.clone(),
+                        );
                     }
                 }
-
                 let routed_merged = routed_experts_merge::merge_routed_experts_in_json(
                     &prefill_response_json,
                     &mut decode_json,
@@ -727,9 +718,27 @@ impl VllmPDRouter {
                 if routed_merged {
                     debug!("Successfully merged routed experts from prefill and decode responses");
                 }
-
                 serde_json::to_vec(&decode_json)
                     .map_err(|e| format!("Failed to serialize decode response: {}", e))?
+            } else if let Some(prefill_prompt_token_ids) =
+                prefill_response_json.get("prompt_token_ids")
+            {
+                if !prefill_prompt_token_ids.is_null() {
+                    if let Ok(mut decode_json) = serde_json::from_slice::<Value>(&decode_body) {
+                        if let Some(decode_obj) = decode_json.as_object_mut() {
+                            decode_obj.insert(
+                                "prompt_token_ids".to_string(),
+                                prefill_prompt_token_ids.clone(),
+                            );
+                        }
+                        serde_json::to_vec(&decode_json)
+                            .unwrap_or_else(|_| decode_body.to_vec())
+                    } else {
+                        decode_body.to_vec()
+                    }
+                } else {
+                    decode_body.to_vec()
+                }
             } else {
                 decode_body.to_vec()
             };
@@ -1160,41 +1169,32 @@ impl VllmPDRouter {
                 }
             }
 
-            let has_prompt_token_ids = prefill_response_json
-                .get("prompt_token_ids")
-                .filter(|value| !value.is_null())
-                .is_some();
             let has_routed_experts =
                 routed_experts_merge::prefill_has_routed_experts(&prefill_response_json);
-
-            let body = if is_streaming {
-                if has_routed_experts {
+            let body = if has_routed_experts {
+                if is_streaming {
                     return Err(PDRouterError::NetworkError {
                         message: "P/D routed-experts merge does not support streaming responses"
                             .to_string(),
                     });
                 }
-                decode_body.to_vec()
-            } else if has_prompt_token_ids || has_routed_experts {
+
                 let mut decode_json: Value = serde_json::from_slice(&decode_body).map_err(|e| {
                     PDRouterError::NetworkError {
                         message: format!("Failed to parse decode response as JSON: {}", e),
                     }
                 })?;
-
-                if let Some(prefill_prompt_token_ids) =
-                    prefill_response_json.get("prompt_token_ids")
+                if let Some(prefill_prompt_token_ids) = prefill_response_json
+                    .get("prompt_token_ids")
+                    .filter(|value| !value.is_null())
                 {
-                    if !prefill_prompt_token_ids.is_null() {
-                        if let Some(decode_obj) = decode_json.as_object_mut() {
-                            decode_obj.insert(
-                                "prompt_token_ids".to_string(),
-                                prefill_prompt_token_ids.clone(),
-                            );
-                        }
+                    if let Some(decode_obj) = decode_json.as_object_mut() {
+                        decode_obj.insert(
+                            "prompt_token_ids".to_string(),
+                            prefill_prompt_token_ids.clone(),
+                        );
                     }
                 }
-
                 let routed_merged = routed_experts_merge::merge_routed_experts_in_json(
                     &prefill_response_json,
                     &mut decode_json,
@@ -1205,10 +1205,28 @@ impl VllmPDRouter {
                 if routed_merged {
                     debug!("Successfully merged routed experts from prefill and decode responses");
                 }
-
                 serde_json::to_vec(&decode_json).map_err(|e| PDRouterError::NetworkError {
                     message: format!("Failed to serialize decode response: {}", e),
                 })?
+            } else if let Some(prefill_prompt_token_ids) =
+                prefill_response_json.get("prompt_token_ids")
+            {
+                if !prefill_prompt_token_ids.is_null() {
+                    if let Ok(mut decode_json) = serde_json::from_slice::<Value>(&decode_body) {
+                        if let Some(decode_obj) = decode_json.as_object_mut() {
+                            decode_obj.insert(
+                                "prompt_token_ids".to_string(),
+                                prefill_prompt_token_ids.clone(),
+                            );
+                        }
+                        serde_json::to_vec(&decode_json)
+                            .unwrap_or_else(|_| decode_body.to_vec())
+                    } else {
+                        decode_body.to_vec()
+                    }
+                } else {
+                    decode_body.to_vec()
+                }
             } else {
                 decode_body.to_vec()
             };
@@ -1758,14 +1776,8 @@ impl RouterTrait for VllmPDRouter {
                     .into_response()
             }
         };
-        self.route_transparent(
-            headers,
-            "/v1/responses",
-            &Method::POST,
-            request_json,
-            run_id,
-        )
-        .await
+        self.route_transparent(headers, "/v1/responses", &Method::POST, request_json, run_id)
+            .await
     }
 
     async fn get_response(&self, headers: Option<&HeaderMap>, response_id: &str) -> Response {
