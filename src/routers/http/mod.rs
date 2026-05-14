@@ -5,6 +5,7 @@ pub mod logprobs_merge;
 pub mod openai_router;
 pub mod pd_router;
 pub mod pd_types;
+pub mod routed_experts_merge;
 pub mod router;
 pub(crate) mod usage_metrics;
 pub mod vllm_pd_router;

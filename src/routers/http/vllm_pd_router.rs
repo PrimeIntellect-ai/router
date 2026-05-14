@@ -4,6 +4,7 @@ use super::dp_utils;
 use super::logprobs_merge;
 use super::pd_router::PDRouter;
 use super::pd_types::{error_chain, PDRouterError};
+use super::routed_experts_merge;
 use super::usage_metrics;
 use super::vllm_service_discovery::{ServiceRegistry, ServiceType};
 use crate::core::{BasicWorker, Worker, WorkerType};
@@ -187,6 +188,66 @@ impl VllmPDRouter {
             obj.remove("stream_options");
         }
         request
+    }
+
+    fn insert_prefill_prompt_token_ids(decode_json: &mut Value, prefill_prompt_token_ids: &Value) {
+        if let Some(decode_obj) = decode_json.as_object_mut() {
+            decode_obj.insert(
+                "prompt_token_ids".to_string(),
+                prefill_prompt_token_ids.clone(),
+            );
+        }
+    }
+
+    fn merge_routed_experts_for_pd(
+        prefill_response_json: &Value,
+        decode_json: &mut Value,
+    ) -> Result<bool, String> {
+        let merged =
+            routed_experts_merge::merge_routed_experts_in_json(prefill_response_json, decode_json)?;
+        if merged {
+            debug!("Successfully merged routed experts from prefill and decode responses");
+        }
+        Ok(merged)
+    }
+
+    fn merge_prefill_response_metadata(
+        prefill_response_json: &Value,
+        decode_body: &[u8],
+        is_streaming: bool,
+    ) -> Result<Vec<u8>, String> {
+        let prefill_prompt_token_ids = prefill_response_json
+            .get("prompt_token_ids")
+            .filter(|value| !value.is_null());
+
+        if routed_experts_merge::prefill_has_routed_experts(prefill_response_json) {
+            if is_streaming {
+                return Err(
+                    "P/D routed-experts merge does not support streaming responses".to_string(),
+                );
+            }
+
+            let mut decode_json: Value = serde_json::from_slice(decode_body)
+                .map_err(|e| format!("Failed to parse decode response as JSON: {}", e))?;
+            if let Some(prefill_prompt_token_ids) = prefill_prompt_token_ids {
+                Self::insert_prefill_prompt_token_ids(&mut decode_json, prefill_prompt_token_ids);
+            }
+            Self::merge_routed_experts_for_pd(prefill_response_json, &mut decode_json)
+                .map_err(|e| format!("Failed to merge routed experts: {}", e))?;
+            return serde_json::to_vec(&decode_json)
+                .map_err(|e| format!("Failed to serialize decode response: {}", e));
+        }
+
+        if let Some(prefill_prompt_token_ids) = prefill_prompt_token_ids {
+            if let Ok(mut decode_json) = serde_json::from_slice::<Value>(decode_body) {
+                Self::insert_prefill_prompt_token_ids(&mut decode_json, prefill_prompt_token_ids);
+                return Ok(
+                    serde_json::to_vec(&decode_json).unwrap_or_else(|_| decode_body.to_vec())
+                );
+            }
+        }
+
+        Ok(decode_body.to_vec())
     }
 
     /// Convert service discovery instances to Worker objects for policy selection
@@ -634,6 +695,9 @@ impl VllmPDRouter {
                 warn!("No logprobs were merged (might be expected if logprobs not in response)");
             }
 
+            Self::merge_routed_experts_for_pd(&prefill_response_json, &mut decode_json)
+                .map_err(|e| format!("Failed to merge routed experts: {}", e))?;
+
             // Serialize merged response
             let merged_body = serde_json::to_vec(&decode_json)
                 .map_err(|e| format!("Failed to serialize merged response: {}", e))?;
@@ -678,26 +742,11 @@ impl VllmPDRouter {
                 }
             }
 
-            let body = if let Some(prefill_prompt_token_ids) = prefill_response_json.get("prompt_token_ids") {
-                if !prefill_prompt_token_ids.is_null() {
-                    if let Ok(mut decode_json) = serde_json::from_slice::<Value>(&decode_body) {
-                        if let Some(decode_obj) = decode_json.as_object_mut() {
-                            decode_obj.insert(
-                                "prompt_token_ids".to_string(),
-                                prefill_prompt_token_ids.clone(),
-                            );
-                        }
-                        serde_json::to_vec(&decode_json)
-                            .unwrap_or_else(|_| decode_body.to_vec())
-                    } else {
-                        decode_body.to_vec()
-                    }
-                } else {
-                    decode_body.to_vec()
-                }
-            } else {
-                decode_body.to_vec()
-            };
+            let body = Self::merge_prefill_response_metadata(
+                &prefill_response_json,
+                &decode_body,
+                is_streaming,
+            )?;
 
             let mut response_builder = axum::http::Response::builder().status(status);
             for (name, value) in headers.iter() {
@@ -1062,6 +1111,12 @@ impl VllmPDRouter {
                 warn!("No logprobs were merged (might be expected if logprobs not in response)");
             }
 
+            Self::merge_routed_experts_for_pd(&prefill_response_json, &mut decode_json).map_err(
+                |e| PDRouterError::NetworkError {
+                    message: format!("Failed to merge routed experts: {}", e),
+                },
+            )?;
+
             // Serialize merged response
             let merged_body =
                 serde_json::to_vec(&decode_json).map_err(|e| PDRouterError::NetworkError {
@@ -1114,26 +1169,12 @@ impl VllmPDRouter {
                 }
             }
 
-            let body = if let Some(prefill_prompt_token_ids) = prefill_response_json.get("prompt_token_ids") {
-                if !prefill_prompt_token_ids.is_null() {
-                    if let Ok(mut decode_json) = serde_json::from_slice::<Value>(&decode_body) {
-                        if let Some(decode_obj) = decode_json.as_object_mut() {
-                            decode_obj.insert(
-                                "prompt_token_ids".to_string(),
-                                prefill_prompt_token_ids.clone(),
-                            );
-                        }
-                        serde_json::to_vec(&decode_json)
-                            .unwrap_or_else(|_| decode_body.to_vec())
-                    } else {
-                        decode_body.to_vec()
-                    }
-                } else {
-                    decode_body.to_vec()
-                }
-            } else {
-                decode_body.to_vec()
-            };
+            let body = Self::merge_prefill_response_metadata(
+                &prefill_response_json,
+                &decode_body,
+                is_streaming,
+            )
+            .map_err(|e| PDRouterError::NetworkError { message: e })?;
 
             let mut response_builder = Response::builder().status(status);
             for (key, value) in headers.iter() {
