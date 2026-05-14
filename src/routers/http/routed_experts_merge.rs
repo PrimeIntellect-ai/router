@@ -280,10 +280,10 @@ fn prompt_token_ids_len_from_prefill_response(prefill_json: &Value) -> Result<us
     let tokens_value = prefill_json
         .get("prompt_token_ids")
         .ok_or_else(|| "prefill routed_experts response requires prompt_token_ids".to_string())?;
-    Ok(tokens_value
+    tokens_value
         .as_array()
         .map(Vec::len)
-        .ok_or_else(|| "prefill response prompt_token_ids must be an array".to_string())?)
+        .ok_or_else(|| "prefill response prompt_token_ids must be an array".to_string())
 }
 
 fn decode_routed_experts_value(value: &Value, name: &str) -> Result<RoutedExpertsTensor, String> {
@@ -437,7 +437,7 @@ fn encode_routed_experts_payload(tensor: &RoutedExpertsTensor) -> Result<String,
     );
     let mut header = header_body.into_bytes();
     let padding = (16 - ((NPY_V1_HEADER_PREFIX_LEN + header.len() + 1) % 16)) % 16;
-    header.extend(std::iter::repeat(b' ').take(padding));
+    header.extend(std::iter::repeat_n(b' ', padding));
     header.push(b'\n');
 
     let header_len = u16::try_from(header.len())
