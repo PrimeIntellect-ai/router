@@ -1,63 +1,10 @@
 //! Routed experts merging utilities for vLLM P/D disaggregation.
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use parking_lot::Mutex;
 use serde_json::Value;
-use std::collections::HashMap;
 
 const NPY_MAGIC: &[u8; 6] = b"\x93NUMPY";
 const NPY_V1_HEADER_PREFIX_LEN: usize = 10;
-const ROUTED_EXPERTS_PROMPT_START: &str = "routed_experts_prompt_start";
-
-#[derive(Debug, Default)]
-pub struct RoutedExpertsPrefixCache {
-    root: Mutex<RoutedExpertsTrieNode>,
-}
-
-impl RoutedExpertsPrefixCache {
-    pub fn clear(&self) {
-        *self.root.lock() = RoutedExpertsTrieNode::default();
-    }
-
-    fn recover_and_store_prompt(
-        &self,
-        request_json: &Value,
-        payload: &Value,
-    ) -> Result<RoutedExpertsTensor, String> {
-        let tokens = prompt_tokens_from_request(request_json)?;
-        let prompt_start = routed_experts_prompt_start(request_json)?;
-        let mut tensor = decode_routed_experts_value(payload, "prefill routed_experts")?;
-
-        if prompt_start + tensor.seq_len > tokens.len() {
-            return Err(format!(
-                "prefill routed_experts length {} with prompt start {} exceeds request token length {}",
-                tensor.seq_len,
-                prompt_start,
-                tokens.len()
-            ));
-        }
-
-        let mut root = self.root.lock();
-        let recovered = fill_placeholders_from_trie(&root, &tokens, prompt_start, &mut tensor)?;
-        store_tensor_in_trie(&mut root, &tokens, prompt_start, &tensor);
-        drop(root);
-
-        if recovered > 0 && tensor.has_placeholder_rows() {
-            return Err(
-                "prefill routed_experts still contained placeholder rows after cache recovery"
-                    .to_string(),
-            );
-        }
-
-        Ok(tensor)
-    }
-}
-
-#[derive(Debug, Default)]
-struct RoutedExpertsTrieNode {
-    row: Option<Vec<i32>>,
-    children: HashMap<i64, RoutedExpertsTrieNode>,
-}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RoutedExpertsTensor {
@@ -70,6 +17,7 @@ struct RoutedExpertsTensor {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RoutedExpertsDtype {
     Uint8,
+    Int16,
     Int32,
 }
 
@@ -77,7 +25,16 @@ impl RoutedExpertsDtype {
     fn item_size(self) -> usize {
         match self {
             Self::Uint8 => 1,
+            Self::Int16 => 2,
             Self::Int32 => 4,
+        }
+    }
+
+    fn descr(self) -> &'static str {
+        match self {
+            Self::Uint8 => "|u1",
+            Self::Int16 => "<i2",
+            Self::Int32 => "<i4",
         }
     }
 }
@@ -94,11 +51,6 @@ impl RoutedExpertsTensor {
 
     fn row(&self, row_idx: usize) -> &[i32] {
         &self.data[self.row_range(row_idx)]
-    }
-
-    fn row_mut(&mut self, row_idx: usize) -> &mut [i32] {
-        let range = self.row_range(row_idx);
-        &mut self.data[range]
     }
 
     fn row_is_placeholder(&self, row_idx: usize) -> bool {
@@ -160,11 +112,7 @@ pub fn prefill_has_routed_experts(prefill_json: &Value) -> bool {
 pub fn merge_routed_experts_in_json(
     prefill_json: &Value,
     decode_json: &mut Value,
-    request_json: &Value,
-    prefix_cache: &RoutedExpertsPrefixCache,
 ) -> Result<bool, String> {
-    let prompt_tokens = prompt_tokens_from_request(request_json)?;
-    let prompt_len = prompt_tokens.len();
     let prefill_routed = prefill_choice_routed_experts(prefill_json);
     let decode_has_routing = decode_has_routed_experts(decode_json);
 
@@ -179,10 +127,23 @@ pub fn merge_routed_experts_in_json(
     if !all_required_decode_choices_have_routed_experts(decode_json) {
         return Err(
             "prefill response contained routed_experts, but decode response did not contain choice routed_experts"
+            .to_string(),
+        );
+    }
+    let prompt_len = prompt_token_ids_len_from_prefill_response(prefill_json)?;
+    let prompt_tensor = decode_routed_experts_value(prefill_routed, "prefill routed_experts")?;
+    if prompt_tensor.seq_len > prompt_len {
+        return Err(format!(
+            "prefill routed_experts has {} rows, but prompt_token_ids has {prompt_len} tokens",
+            prompt_tensor.seq_len
+        ));
+    }
+    if prompt_tensor.has_placeholder_rows() {
+        return Err(
+            "prefill routed_experts contained placeholder rows; external KV routed-experts recovery is not supported"
                 .to_string(),
         );
     }
-    let prompt_tensor = prefix_cache.recover_and_store_prompt(request_json, prefill_routed)?;
     merge_prompt_into_decode_choices(decode_json, prompt_len, &prompt_tensor)?;
 
     Ok(true)
@@ -315,97 +276,14 @@ fn decode_choice_requires_routed_experts(choice: &Value) -> bool {
         .unwrap_or(true)
 }
 
-fn prompt_tokens_from_request(request_json: &Value) -> Result<Vec<i64>, String> {
-    let tokens_value = request_json
+fn prompt_token_ids_len_from_prefill_response(prefill_json: &Value) -> Result<usize, String> {
+    let tokens_value = prefill_json
         .get("prompt_token_ids")
-        .or_else(|| request_json.get("tokens"))
-        .ok_or_else(|| {
-            "routed_experts responses require tokenized request field prompt_token_ids or tokens"
-                .to_string()
-        })?;
-    let tokens = tokens_value
+        .ok_or_else(|| "prefill routed_experts response requires prompt_token_ids".to_string())?;
+    Ok(tokens_value
         .as_array()
-        .ok_or_else(|| "request prompt_token_ids/tokens must be an array".to_string())?;
-
-    tokens
-        .iter()
-        .map(|token| {
-            token.as_i64().ok_or_else(|| {
-                "request prompt_token_ids/tokens must contain integer token ids".to_string()
-            })
-        })
-        .collect()
-}
-
-fn routed_experts_prompt_start(request_json: &Value) -> Result<usize, String> {
-    request_json
-        .get(ROUTED_EXPERTS_PROMPT_START)
-        .map(|value| {
-            value
-                .as_u64()
-                .map(|start| start as usize)
-                .ok_or_else(|| format!("{ROUTED_EXPERTS_PROMPT_START} must be an unsigned integer"))
-        })
-        .unwrap_or(Ok(0))
-}
-
-fn fill_placeholders_from_trie(
-    root: &RoutedExpertsTrieNode,
-    tokens: &[i64],
-    prompt_start: usize,
-    tensor: &mut RoutedExpertsTensor,
-) -> Result<usize, String> {
-    let mut node = Some(root);
-    for token in tokens.iter().take(prompt_start) {
-        node = node.and_then(|current| current.children.get(token));
-    }
-
-    let mut recovered = 0;
-    for row_idx in 0..tensor.seq_len {
-        let token_idx = prompt_start + row_idx;
-        node = node.and_then(|current| current.children.get(&tokens[token_idx]));
-
-        if tensor.row_is_placeholder(row_idx) {
-            let current = node.ok_or_else(|| {
-                format!("missing cached routed_experts for placeholder prompt token row {row_idx}")
-            })?;
-            let cached_row = current.row.as_ref().ok_or_else(|| {
-                format!(
-                    "missing cached routed_experts row for placeholder prompt token row {row_idx}"
-                )
-            })?;
-            if cached_row.len() != tensor.row_width() {
-                return Err(format!(
-                    "cached routed_experts row width {} does not match response row width {}",
-                    cached_row.len(),
-                    tensor.row_width()
-                ));
-            }
-            tensor.row_mut(row_idx).copy_from_slice(cached_row);
-            recovered += 1;
-        }
-    }
-
-    Ok(recovered)
-}
-
-fn store_tensor_in_trie(
-    root: &mut RoutedExpertsTrieNode,
-    tokens: &[i64],
-    prompt_start: usize,
-    tensor: &RoutedExpertsTensor,
-) {
-    let mut node = root;
-    for token in tokens.iter().take(prompt_start) {
-        node = node.children.entry(*token).or_default();
-    }
-    for row_idx in 0..tensor.seq_len {
-        let token_idx = prompt_start + row_idx;
-        node = node.children.entry(tokens[token_idx]).or_default();
-        if !tensor.row_is_placeholder(row_idx) {
-            node.row = Some(tensor.row(row_idx).to_vec());
-        }
-    }
+        .map(Vec::len)
+        .ok_or_else(|| "prefill response prompt_token_ids must be an array".to_string())?)
 }
 
 fn decode_routed_experts_value(value: &Value, name: &str) -> Result<RoutedExpertsTensor, String> {
@@ -477,6 +355,10 @@ fn parse_npy_i32(bytes: &[u8], name: &str) -> Result<RoutedExpertsTensor, String
 
     let data = match dtype {
         RoutedExpertsDtype::Uint8 => data_bytes.iter().map(|value| i32::from(*value)).collect(),
+        RoutedExpertsDtype::Int16 => data_bytes
+            .chunks_exact(2)
+            .map(|chunk| i32::from(i16::from_le_bytes([chunk[0], chunk[1]])))
+            .collect(),
         RoutedExpertsDtype::Int32 => data_bytes
             .chunks_exact(4)
             .map(|chunk| i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
@@ -498,8 +380,11 @@ fn parse_npy_dtype(header: &str, name: &str) -> Result<RoutedExpertsDtype, Strin
     if header.contains("'|u1'") || header.contains("\"|u1\"") {
         return Ok(RoutedExpertsDtype::Uint8);
     }
+    if header.contains("'<i2'") || header.contains("\"<i2\"") {
+        return Ok(RoutedExpertsDtype::Int16);
+    }
     Err(format!(
-        "{name} must be uint8 or little-endian int32 .npy data"
+        "{name} must be uint8, little-endian int16, or little-endian int32 .npy data"
     ))
 }
 
@@ -542,9 +427,13 @@ fn parse_shape(header: &str, name: &str) -> Result<(usize, usize, usize), String
 }
 
 fn encode_routed_experts_payload(tensor: &RoutedExpertsTensor) -> Result<String, String> {
+    let dtype = compact_dtype(&tensor.data);
     let header_body = format!(
-        "{{'descr': '<i4', 'fortran_order': False, 'shape': ({}, {}, {}), }}",
-        tensor.seq_len, tensor.layers, tensor.topk
+        "{{'descr': '{}', 'fortran_order': False, 'shape': ({}, {}, {}), }}",
+        dtype.descr(),
+        tensor.seq_len,
+        tensor.layers,
+        tensor.topk
     );
     let mut header = header_body.into_bytes();
     let padding = (16 - ((NPY_V1_HEADER_PREFIX_LEN + header.len() + 1) % 16)) % 16;
@@ -553,34 +442,55 @@ fn encode_routed_experts_payload(tensor: &RoutedExpertsTensor) -> Result<String,
 
     let header_len = u16::try_from(header.len())
         .map_err(|_| "routed_experts NumPy header is too large for v1 .npy".to_string())?;
-    let mut bytes =
-        Vec::with_capacity(NPY_V1_HEADER_PREFIX_LEN + header.len() + tensor.data.len() * 4);
+    let mut bytes = Vec::with_capacity(
+        NPY_V1_HEADER_PREFIX_LEN + header.len() + tensor.data.len() * dtype.item_size(),
+    );
     bytes.extend_from_slice(NPY_MAGIC);
     bytes.push(1);
     bytes.push(0);
     bytes.extend_from_slice(&header_len.to_le_bytes());
     bytes.extend_from_slice(&header);
     for value in &tensor.data {
-        bytes.extend_from_slice(&value.to_le_bytes());
+        match dtype {
+            RoutedExpertsDtype::Uint8 => {
+                bytes.push(u8::try_from(*value).map_err(|_| {
+                    format!("routed_experts value {value} cannot be encoded as uint8")
+                })?)
+            }
+            RoutedExpertsDtype::Int16 => bytes.extend_from_slice(
+                &i16::try_from(*value)
+                    .map_err(|_| {
+                        format!("routed_experts value {value} cannot be encoded as int16")
+                    })?
+                    .to_le_bytes(),
+            ),
+            RoutedExpertsDtype::Int32 => bytes.extend_from_slice(&value.to_le_bytes()),
+        }
     }
 
     Ok(STANDARD.encode(bytes))
+}
+
+fn compact_dtype(data: &[i32]) -> RoutedExpertsDtype {
+    if data
+        .iter()
+        .all(|value| (0..=i32::from(u8::MAX)).contains(value))
+    {
+        return RoutedExpertsDtype::Uint8;
+    }
+    if data
+        .iter()
+        .all(|value| (i32::from(i16::MIN)..=i32::from(i16::MAX)).contains(value))
+    {
+        return RoutedExpertsDtype::Int16;
+    }
+    RoutedExpertsDtype::Int32
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
-
-    fn payload(seq_len: usize, layers: usize, topk: usize, data: Vec<i32>) -> String {
-        encode_routed_experts_payload(&RoutedExpertsTensor {
-            seq_len,
-            layers,
-            topk,
-            data,
-        })
-        .unwrap()
-    }
 
     fn uint8_payload(seq_len: usize, layers: usize, topk: usize, data: Vec<u8>) -> String {
         let header_body = format!(
@@ -603,15 +513,16 @@ mod tests {
 
     #[test]
     fn merge_stores_prefill_choice_routing_by_token_prefix() {
-        let cache = RoutedExpertsPrefixCache::default();
         let prompt_payload = uint8_payload(2, 1, 2, vec![10, 11, 20, 21]);
         let full_decode_payload = uint8_payload(3, 1, 2, vec![10, 11, 20, 21, 30, 31]);
-        let prefill = json!({"choices": [{"routed_experts": prompt_payload}]});
+        let prefill = json!({
+            "prompt_token_ids": [101, 102],
+            "choices": [{"routed_experts": prompt_payload}],
+        });
         let mut decode =
             json!({"choices": [{"token_ids": [7, 8], "routed_experts": full_decode_payload}]});
-        let request = json!({"prompt_token_ids": [101, 102]});
 
-        assert!(merge_routed_experts_in_json(&prefill, &mut decode, &request, &cache).unwrap());
+        assert!(merge_routed_experts_in_json(&prefill, &mut decode).unwrap());
         let merged = decode_routed_experts_value(
             decode["choices"][0].get("routed_experts").unwrap(),
             "merged choice routed_experts",
@@ -619,31 +530,5 @@ mod tests {
         .unwrap();
 
         assert_eq!(merged.data, vec![10, 11, 20, 21, 30, 31]);
-    }
-
-    #[test]
-    fn merge_recovers_external_kv_placeholders_from_prefix_cache() {
-        let cache = RoutedExpertsPrefixCache::default();
-        let initial_prompt = uint8_payload(3, 1, 2, vec![10, 11, 20, 21, 30, 31]);
-        let completion = uint8_payload(1, 1, 2, vec![40, 41]);
-        let request = json!({"prompt_token_ids": [101, 102, 103]});
-
-        let prefill = json!({"choices": [{"routed_experts": initial_prompt}]});
-        let mut decode =
-            json!({"choices": [{"token_ids": [7, 8], "routed_experts": completion.clone()}]});
-        merge_routed_experts_in_json(&prefill, &mut decode, &request, &cache).unwrap();
-
-        let placeholder_prompt = payload(3, 1, 2, vec![-1, -1, -1, -1, 30, 31]);
-        let prefill = json!({"choices": [{"routed_experts": placeholder_prompt}]});
-        let mut decode = json!({"choices": [{"token_ids": [7, 8], "routed_experts": completion}]});
-
-        merge_routed_experts_in_json(&prefill, &mut decode, &request, &cache).unwrap();
-        let merged = decode_routed_experts_value(
-            decode["choices"][0].get("routed_experts").unwrap(),
-            "merged choice routed_experts",
-        )
-        .unwrap();
-
-        assert_eq!(merged.data, vec![10, 11, 20, 21, 30, 31, 40, 41]);
     }
 }

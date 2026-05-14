@@ -48,8 +48,6 @@ pub struct VllmPDRouter {
     profiling_tasks: Arc<Mutex<HashMap<String, tokio::task::AbortHandle>>>,
     /// Intra-node data parallel size for DP-aware routing (automatically enabled when > 1)
     intra_node_data_parallel_size: usize,
-    /// Router-side prompt routed-experts cache for external KV placeholder recovery.
-    routed_experts_cache: Arc<routed_experts_merge::RoutedExpertsPrefixCache>,
 }
 
 impl VllmPDRouter {
@@ -640,8 +638,6 @@ impl VllmPDRouter {
             let routed_merged = routed_experts_merge::merge_routed_experts_in_json(
                 &prefill_response_json,
                 &mut decode_json,
-                &request_json,
-                &self.routed_experts_cache,
             )
             .map_err(|e| format!("Failed to merge routed experts: {}", e))?;
             if routed_merged {
@@ -726,8 +722,6 @@ impl VllmPDRouter {
                 let routed_merged = routed_experts_merge::merge_routed_experts_in_json(
                     &prefill_response_json,
                     &mut decode_json,
-                    &request_json,
-                    &self.routed_experts_cache,
                 )
                 .map_err(|e| format!("Failed to merge routed experts: {}", e))?;
                 if routed_merged {
@@ -1106,8 +1100,6 @@ impl VllmPDRouter {
             let routed_merged = routed_experts_merge::merge_routed_experts_in_json(
                 &prefill_response_json,
                 &mut decode_json,
-                &original_request,
-                &self.routed_experts_cache,
             )
             .map_err(|e| PDRouterError::NetworkError {
                 message: format!("Failed to merge routed experts: {}", e),
@@ -1206,8 +1198,6 @@ impl VllmPDRouter {
                 let routed_merged = routed_experts_merge::merge_routed_experts_in_json(
                     &prefill_response_json,
                     &mut decode_json,
-                    &original_request,
-                    &self.routed_experts_cache,
                 )
                 .map_err(|e| PDRouterError::NetworkError {
                     message: format!("Failed to merge routed experts: {}", e),
@@ -1279,9 +1269,6 @@ impl VllmPDRouter {
                 profile_timeout_secs: ctx.router_config.profile_timeout_secs,
                 profiling_tasks: Arc::new(Mutex::new(HashMap::new())),
                 intra_node_data_parallel_size: ctx.router_config.intra_node_data_parallel_size,
-                routed_experts_cache: Arc::new(
-                    routed_experts_merge::RoutedExpertsPrefixCache::default(),
-                ),
             })
         } else {
             // Direct URL mode (same as PDRouter)
@@ -1324,9 +1311,6 @@ impl VllmPDRouter {
                 profile_timeout_secs: ctx.router_config.profile_timeout_secs,
                 profiling_tasks: Arc::new(Mutex::new(HashMap::new())),
                 intra_node_data_parallel_size: ctx.router_config.intra_node_data_parallel_size,
-                routed_experts_cache: Arc::new(
-                    routed_experts_merge::RoutedExpertsPrefixCache::default(),
-                ),
             })
         }
     }
@@ -1814,11 +1798,6 @@ impl RouterTrait for VllmPDRouter {
 
     async fn flush_cache(&self) -> Response {
         self.pd_router.flush_cache().await
-    }
-
-    async fn clear_routing_cache(&self) -> Response {
-        self.routed_experts_cache.clear();
-        (StatusCode::OK, "Routing cache cleared").into_response()
     }
 
     async fn get_worker_loads(&self) -> Response {

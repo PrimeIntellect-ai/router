@@ -306,7 +306,10 @@ async fn filter_models_response(response: Response, claims: &RftClaims) -> Respo
         Ok(b) => b,
         Err(e) => {
             warn!("failed to read /v1/models body for filtering: {e}");
-            return (StatusCode::BAD_GATEWAY, "failed to read upstream models response")
+            return (
+                StatusCode::BAD_GATEWAY,
+                "failed to read upstream models response",
+            )
                 .into_response();
         }
     };
@@ -315,7 +318,10 @@ async fn filter_models_response(response: Response, claims: &RftClaims) -> Respo
         Ok(v) => v,
         Err(e) => {
             warn!("failed to parse /v1/models body for filtering: {e}");
-            return (StatusCode::BAD_GATEWAY, "failed to parse upstream models response")
+            return (
+                StatusCode::BAD_GATEWAY,
+                "failed to parse upstream models response",
+            )
                 .into_response();
         }
     };
@@ -900,9 +906,7 @@ async fn authorize_request(
             Err(_) => {
                 // Not a valid JWT — fall through to API key validation if configured
                 if validation_urls.is_empty() {
-                    return Err(
-                        (StatusCode::UNAUTHORIZED, AUTH_FAILURE_MESSAGE).into_response()
-                    );
+                    return Err((StatusCode::UNAUTHORIZED, AUTH_FAILURE_MESSAGE).into_response());
                 }
             }
         }
@@ -1004,17 +1008,6 @@ async fn flush_cache(State(state): State<Arc<AppState>>, headers: http::HeaderMa
     }
 
     state.router.flush_cache().await
-}
-
-async fn clear_routing_cache(
-    State(state): State<Arc<AppState>>,
-    headers: http::HeaderMap,
-) -> Response {
-    if let Err(response) = authorize_request(&state, &headers).await {
-        return response;
-    }
-
-    state.router.clear_routing_cache().await
 }
 
 async fn get_loads(State(state): State<Arc<AppState>>, headers: http::HeaderMap) -> Response {
@@ -1265,7 +1258,6 @@ pub fn build_app_with_request_tracing(
         .route("/remove_worker", post(remove_worker))
         .route("/list_workers", get(list_workers))
         .route("/flush_cache", post(flush_cache))
-        .route("/clear_routing_cache", post(clear_routing_cache))
         .route("/get_loads", get(get_loads));
 
     // Worker management routes
