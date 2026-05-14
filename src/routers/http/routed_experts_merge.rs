@@ -17,15 +17,28 @@ struct RoutedExpertsPayload {
 }
 
 impl RoutedExpertsPayload {
-    fn empty_like(&self) -> Self {
-        Self {
-            seq_len: 0,
+    fn suffix_rows(&self, row_start: usize) -> Result<Self, String> {
+        let row_size = self.layers * self.topk * self.item_size;
+        let byte_start = row_start * row_size;
+        let data = self
+            .data
+            .get(byte_start..)
+            .ok_or_else(|| {
+                format!(
+                    "decode routed_experts has {} rows, expected at least {row_start}",
+                    self.seq_len
+                )
+            })?
+            .to_vec();
+
+        Ok(Self {
+            seq_len: self.seq_len - row_start,
             layers: self.layers,
             topk: self.topk,
             descr: self.descr.clone(),
             item_size: self.item_size,
-            data: Vec::new(),
-        }
+            data,
+        })
     }
 
     fn concat_rows(&self, other: &Self) -> Result<Self, String> {
@@ -83,31 +96,12 @@ pub fn merge_routed_experts_in_json(
         .ok_or_else(|| "decode response choices must be an array".to_string())?;
 
     for choice in choices {
-        let expected_completion_len = choice["token_ids"]
-            .as_array()
-            .ok_or_else(|| "decode choice must contain token_ids".to_string())?
-            .len()
-            .saturating_sub(1);
-
-        let completion = match choice
+        let routed_experts = choice
             .get("routed_experts")
             .filter(|value| !value.is_null())
-        {
-            Some(routed_experts) => {
-                let completion =
-                    decode_routed_experts_value(routed_experts, "decode routed_experts")?;
-                if completion.seq_len != expected_completion_len {
-                    return Err(format!(
-                        "decode routed_experts has {} rows, expected {expected_completion_len}",
-                        completion.seq_len
-                    ));
-                }
-                completion
-            }
-            None if expected_completion_len == 0 => prompt.empty_like(),
-            None => return Err("decode choice routed_experts is missing".to_string()),
-        };
-
+            .ok_or_else(|| "decode choice routed_experts is missing".to_string())?;
+        let decode = decode_routed_experts_value(routed_experts, "decode routed_experts")?;
+        let completion = decode.suffix_rows(prompt.seq_len)?;
         let merged = prompt.concat_rows(&completion)?;
         choice["routed_experts"] = Value::String(encode_routed_experts_payload(&merged)?);
     }
@@ -282,14 +276,13 @@ mod tests {
     }
 
     #[test]
-    fn merge_stores_prefill_choice_routing_by_token_prefix() {
+    fn merge_replaces_decode_prompt_routing_with_prefill_routing() {
         let prompt_payload = uint8_payload(2, 1, 2, &[10, 11, 20, 21]);
-        let completion_payload = uint8_payload(1, 1, 2, &[30, 31]);
+        let decode_payload = uint8_payload(3, 1, 2, &[0, 0, 1, 1, 30, 31]);
         let prefill = json!({
             "choices": [{"routed_experts": prompt_payload}],
         });
-        let mut decode =
-            json!({"choices": [{"token_ids": [7, 8], "routed_experts": completion_payload}]});
+        let mut decode = json!({"choices": [{"routed_experts": decode_payload}]});
 
         assert!(merge_routed_experts_in_json(&prefill, &mut decode).unwrap());
         let merged = decode_routed_experts_value(

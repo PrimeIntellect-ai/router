@@ -216,27 +216,11 @@ impl VllmPDRouter {
         decode_body: &[u8],
         is_streaming: bool,
     ) -> Result<Vec<u8>, String> {
-        let has_routed_experts =
-            routed_experts_merge::prefill_has_routed_experts(prefill_response_json);
-        let Some(prefill_prompt_token_ids) = prefill_response_json.get("prompt_token_ids") else {
-            if has_routed_experts {
-                return Err(
-                    "P/D routed-experts merge requires prefill prompt_token_ids".to_string()
-                );
-            }
-            return Ok(decode_body.to_vec());
-        };
+        let prefill_prompt_token_ids = prefill_response_json
+            .get("prompt_token_ids")
+            .filter(|value| !value.is_null());
 
-        if prefill_prompt_token_ids.is_null() {
-            if has_routed_experts {
-                return Err(
-                    "P/D routed-experts merge requires prefill prompt_token_ids".to_string()
-                );
-            }
-            return Ok(decode_body.to_vec());
-        }
-
-        if has_routed_experts {
+        if routed_experts_merge::prefill_has_routed_experts(prefill_response_json) {
             if is_streaming {
                 return Err(
                     "P/D routed-experts merge does not support streaming responses".to_string(),
@@ -245,19 +229,25 @@ impl VllmPDRouter {
 
             let mut decode_json: Value = serde_json::from_slice(decode_body)
                 .map_err(|e| format!("Failed to parse decode response as JSON: {}", e))?;
-            Self::insert_prefill_prompt_token_ids(&mut decode_json, prefill_prompt_token_ids);
+            if let Some(prefill_prompt_token_ids) = prefill_prompt_token_ids {
+                Self::insert_prefill_prompt_token_ids(&mut decode_json, prefill_prompt_token_ids);
+            }
             Self::merge_routed_experts_for_pd(prefill_response_json, &mut decode_json)
                 .map_err(|e| format!("Failed to merge routed experts: {}", e))?;
             return serde_json::to_vec(&decode_json)
                 .map_err(|e| format!("Failed to serialize decode response: {}", e));
         }
 
-        if let Ok(mut decode_json) = serde_json::from_slice::<Value>(decode_body) {
-            Self::insert_prefill_prompt_token_ids(&mut decode_json, prefill_prompt_token_ids);
-            Ok(serde_json::to_vec(&decode_json).unwrap_or_else(|_| decode_body.to_vec()))
-        } else {
-            Ok(decode_body.to_vec())
+        if let Some(prefill_prompt_token_ids) = prefill_prompt_token_ids {
+            if let Ok(mut decode_json) = serde_json::from_slice::<Value>(decode_body) {
+                Self::insert_prefill_prompt_token_ids(&mut decode_json, prefill_prompt_token_ids);
+                return Ok(
+                    serde_json::to_vec(&decode_json).unwrap_or_else(|_| decode_body.to_vec())
+                );
+            }
         }
+
+        Ok(decode_body.to_vec())
     }
 
     /// Convert service discovery instances to Worker objects for policy selection
