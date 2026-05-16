@@ -84,10 +84,17 @@ pub struct RouterConfig {
     /// Profiling timeout in seconds (for vLLM profiling endpoints)
     #[serde(default = "default_profile_timeout_secs")]
     pub profile_timeout_secs: u64,
+    /// TTL for Decode-side KV metadata cached by vLLM P/D router.
+    #[serde(default = "default_pd_kv_cache_ttl_secs")]
+    pub pd_kv_cache_ttl_secs: u64,
 }
 
 fn default_profile_timeout_secs() -> u64 {
     10
+}
+
+fn default_pd_kv_cache_ttl_secs() -> u64 {
+    0
 }
 
 fn default_history_backend() -> HistoryBackend {
@@ -491,6 +498,7 @@ impl Default for RouterConfig {
             history_backend: default_history_backend(),
             enable_profiling: false,
             profile_timeout_secs: default_profile_timeout_secs(),
+            pd_kv_cache_ttl_secs: default_pd_kv_cache_ttl_secs(),
         }
     }
 }
@@ -1063,6 +1071,7 @@ mod tests {
             history_backend: default_history_backend(),
             enable_profiling: false,
             profile_timeout_secs: default_profile_timeout_secs(),
+            pd_kv_cache_ttl_secs: default_pd_kv_cache_ttl_secs(),
         };
 
         assert!(config.mode.is_pd_mode());
@@ -1131,6 +1140,7 @@ mod tests {
             history_backend: default_history_backend(),
             enable_profiling: false,
             profile_timeout_secs: default_profile_timeout_secs(),
+            pd_kv_cache_ttl_secs: default_pd_kv_cache_ttl_secs(),
         };
 
         assert!(!config.mode.is_pd_mode());
@@ -1195,6 +1205,7 @@ mod tests {
             history_backend: default_history_backend(),
             enable_profiling: false,
             profile_timeout_secs: default_profile_timeout_secs(),
+            pd_kv_cache_ttl_secs: default_pd_kv_cache_ttl_secs(),
         };
 
         assert!(config.has_service_discovery());

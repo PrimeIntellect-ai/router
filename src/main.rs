@@ -134,6 +134,10 @@ struct CliArgs {
     #[arg(long, default_value_t = false)]
     vllm_pd_disaggregation: bool,
 
+    /// TTL in seconds for Decode-side KV metadata cached for bidirectional vLLM P/D transfer
+    #[arg(long, default_value_t = 0)]
+    pd_kv_cache_ttl_secs: u64,
+
     /// ZMQ service discovery address for vLLM P2P NCCL coordination (e.g., "0.0.0.0:30001")
     /// Required for --vllm-pd-disaggregation mode. Workers register their HTTP and ZMQ addresses here.
     #[arg(long)]
@@ -680,6 +684,7 @@ impl CliArgs {
             },
             enable_profiling: self.profile,
             profile_timeout_secs: 10, // Default profiling timeout
+            pd_kv_cache_ttl_secs: self.pd_kv_cache_ttl_secs,
         })
     }
 

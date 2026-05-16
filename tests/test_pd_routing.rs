@@ -196,6 +196,7 @@ mod test_pd_routing {
                 history_backend: vllm_router_rs::config::HistoryBackend::Memory,
                 enable_profiling: false,
                 profile_timeout_secs: 30,
+                pd_kv_cache_ttl_secs: 0,
             };
 
             // Router creation will fail due to health checks, but config should be valid

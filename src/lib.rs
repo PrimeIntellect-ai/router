@@ -104,6 +104,8 @@ struct Router {
     // OpenTelemetry tracing
     enable_trace: bool,
     otlp_traces_endpoint: Option<String>,
+    // vLLM P/D Decode -> Prefill KV metadata cache
+    pd_kv_cache_ttl_secs: u64,
 }
 
 impl Router {
@@ -253,6 +255,7 @@ impl Router {
             history_backend: config::HistoryBackend::Memory,
             enable_profiling: false, // Profiling disabled in Python binding by default
             profile_timeout_secs: 10, // Default profiling timeout
+            pd_kv_cache_ttl_secs: self.pd_kv_cache_ttl_secs,
         })
     }
 }
@@ -327,6 +330,8 @@ impl Router {
         // Tracing defaults
         enable_trace = false,
         otlp_traces_endpoint = None,
+        // vLLM P/D defaults
+        pd_kv_cache_ttl_secs = 0,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -390,6 +395,7 @@ impl Router {
         tokenizer_path: Option<String>,
         enable_trace: bool,
         otlp_traces_endpoint: Option<String>,
+        pd_kv_cache_ttl_secs: u64,
     ) -> PyResult<Self> {
         // Determine connection mode from worker URLs
         let mut all_urls = worker_urls.clone();
@@ -470,6 +476,7 @@ impl Router {
             tokenizer_path,
             enable_trace,
             otlp_traces_endpoint,
+            pd_kv_cache_ttl_secs,
         })
     }
 
