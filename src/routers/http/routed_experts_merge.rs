@@ -5,6 +5,7 @@ use serde_json::{json, Value};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RoutedExpertsPayload {
+    start: usize,
     seq_len: usize,
     layers: usize,
     topk: usize,
@@ -12,28 +13,29 @@ struct RoutedExpertsPayload {
 }
 
 impl RoutedExpertsPayload {
-    fn suffix_rows(&self, row_start: usize) -> Result<Self, String> {
-        if row_start > self.seq_len {
+    fn suffix_rows(&self, row_count: usize) -> Result<Self, String> {
+        if row_count > self.seq_len {
             return Err(format!(
-                "decode routed_experts has {} rows, expected at least {row_start}",
+                "decode routed_experts has {} rows, expected at least {row_count}",
                 self.seq_len
             ));
         }
         let row_size = self.layers * self.topk;
-        let byte_start = row_start * row_size;
+        let byte_start = row_count * row_size;
         let data = self
             .data
             .get(byte_start..)
             .ok_or_else(|| {
                 format!(
-                    "decode routed_experts has {} rows, expected at least {row_start}",
+                    "decode routed_experts has {} rows, expected at least {row_count}",
                     self.seq_len
                 )
             })?
             .to_vec();
 
         Ok(Self {
-            seq_len: self.seq_len - row_start,
+            start: self.start + row_count,
+            seq_len: self.seq_len - row_count,
             layers: self.layers,
             topk: self.topk,
             data,
@@ -47,12 +49,12 @@ impl RoutedExpertsPayload {
                 self.seq_len, self.layers, self.topk, other.seq_len, other.layers, other.topk,
             ));
         }
-
         let mut data = Vec::with_capacity(self.data.len() + other.data.len());
         data.extend_from_slice(&self.data);
         data.extend_from_slice(&other.data);
 
         Ok(Self {
+            start: self.start,
             seq_len: self.seq_len + other.seq_len,
             layers: self.layers,
             topk: self.topk,
@@ -129,6 +131,12 @@ fn decode_routed_experts_value(value: &Value, name: &str) -> Result<RoutedExpert
         .get("data")
         .and_then(Value::as_str)
         .ok_or_else(|| format!("{name} data must be a base64 string"))?;
+    let start = payload
+        .get("start")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| format!("{name} start must be a non-negative integer"))?;
+    let start =
+        usize::try_from(start).map_err(|error| format!("{name} start parse failed: {error}"))?;
     let (seq_len, layers, topk) = parse_shape(payload.get("shape"), name)?;
     let bytes = STANDARD
         .decode(data_payload)
@@ -145,6 +153,7 @@ fn decode_routed_experts_value(value: &Value, name: &str) -> Result<RoutedExpert
     }
 
     Ok(RoutedExpertsPayload {
+        start,
         seq_len,
         layers,
         topk,
@@ -177,6 +186,7 @@ fn encode_routed_experts_payload(payload: &RoutedExpertsPayload) -> Value {
     json!({
         "data": STANDARD.encode(&payload.data),
         "shape": [payload.seq_len, payload.layers, payload.topk],
+        "start": payload.start,
     })
 }
 
@@ -187,6 +197,7 @@ mod tests {
 
     fn uint8_payload(seq_len: usize, layers: usize, topk: usize, data: &[u8]) -> Value {
         let payload = RoutedExpertsPayload {
+            start: 0,
             seq_len,
             layers,
             topk,
