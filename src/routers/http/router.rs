@@ -9,7 +9,7 @@ use crate::otel_http::{self, ClientRequestOptions};
 use crate::policies::{LoadBalancingPolicy, PolicyRegistry};
 use crate::protocols::spec::{
     ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, GenerationRequest,
-    RerankRequest, RerankResponse, RerankResult, ResponsesRequest,
+    RerankRequest, RerankResponse, RerankResult, ResponsesRequest, DEFAULT_MODEL_NAME,
 };
 use crate::routers::header_utils;
 use crate::routers::http::dp_utils;
@@ -154,6 +154,10 @@ impl Router {
                 )
             };
             ctx.worker_registry.register(worker_arc.clone());
+            if !models.is_empty() {
+                ctx.worker_registry
+                    .sync_worker_models(worker_arc.url(), &models);
+            }
 
             // Notify PolicyRegistry about the new worker
             let model_id = worker_arc.model_id();
@@ -538,6 +542,39 @@ impl Router {
         })
     }
 
+    fn normalize_model_id(model_id: Option<&str>) -> Option<&str> {
+        let model = model_id?.trim();
+        (!model.is_empty()).then_some(model)
+    }
+
+    fn body_model_for_route<'a>(route: &str, model_id: Option<&'a str>) -> Option<&'a str> {
+        let model = Self::normalize_model_id(model_id)?;
+        if route == "/v1/rerank" && model == DEFAULT_MODEL_NAME {
+            return None;
+        }
+        Some(model)
+    }
+
+    fn resolve_body_model_filter<'a>(
+        &self,
+        route: &str,
+        model_id: Option<&'a str>,
+        run_id: Option<&str>,
+    ) -> Option<&'a str> {
+        let model = Self::body_model_for_route(route, model_id)?;
+
+        if run_id.is_some() || !self.worker_registry.get_by_model_fast(model).is_empty() {
+            return Some(model);
+        }
+
+        debug!(
+            model_id = %model,
+            route,
+            "body model is not indexed; routing without a model filter"
+        );
+        None
+    }
+
     /// Select worker for a specific model considering circuit breaker state
     fn select_worker_for_model(
         &self,
@@ -586,13 +623,14 @@ impl Router {
         let text = typed_req.extract_text_for_routing();
         let run_id = run_id.map(|s| s.to_string());
 
-        // Fall back to the body's `model` field when the caller doesn't pass one.
-        // Without this, every server.rs handler that calls route_chat/route_completion/etc.
-        // with `None` would dispatch to *any* healthy worker — including pods that don't
-        // have the requested LoRA adapter loaded, producing a 404 from vLLM. The model
-        // index (worker_registry.model_index, populated via sync_worker_models from each
-        // worker's /v1/models) is the right pool to filter against.
-        let effective_model_id = model_id.or_else(|| typed_req.get_model());
+        // Fall back to the body's `model` field when the caller doesn't pass one, but
+        // only use it as a routing filter when the registry has already indexed that
+        // model. This keeps compatibility for generic upstream model validation while
+        // still preventing known LoRA requests from being sent to workers that have not
+        // loaded the adapter. Run-scoped requests keep the body model as a hard filter.
+        let effective_model_id = Self::normalize_model_id(model_id).or_else(|| {
+            self.resolve_body_model_filter(route, typed_req.get_model(), run_id.as_deref())
+        });
 
         let response = RetryExecutor::execute_response_with_retry(
             &self.retry_config,
@@ -1221,6 +1259,10 @@ impl Router {
 
                                 let worker_arc: Arc<dyn Worker> = Arc::new(new_worker);
                                 self.worker_registry.register(worker_arc.clone());
+                                if !models.is_empty() {
+                                    self.worker_registry
+                                        .sync_worker_models(worker_arc.url(), &models);
+                                }
 
                                 // Notify PolicyRegistry about the new worker
                                 let model_id = worker_arc.model_id();
@@ -1258,6 +1300,10 @@ impl Router {
 
                             let worker_arc = Arc::new(new_worker);
                             self.worker_registry.register(worker_arc.clone());
+                            if !models.is_empty() {
+                                self.worker_registry
+                                    .sync_worker_models(worker_arc.url(), &models);
+                            }
 
                             // Notify PolicyRegistry about the new worker
                             let model_id = worker_arc.model_id();
@@ -2327,32 +2373,43 @@ mod tests {
         assert_eq!(base_workers.len(), 2);
     }
 
-    /// Regression test for the bug where v1_chat_completions passed
-    /// `model_id=None` to route_chat even when the request body specified a
-    /// model. With the fallback in route_typed_request, the body's model is
-    /// used. This test exercises the equivalent code path:
-    /// `model_id.or_else(|| typed_req.get_model())`.
     #[test]
-    fn test_effective_model_id_falls_back_to_request_body() {
-        use crate::protocols::spec::{ChatCompletionRequest, GenerationRequest};
+    fn test_body_model_filter_only_uses_indexed_models() {
+        let router = create_test_regular_router();
 
-        // Body asks for a specific LoRA.
-        let with_model: ChatCompletionRequest =
-            serde_json::from_str(r#"{"model":"rft-run-1","messages":[]}"#).unwrap();
-        let no_model: ChatCompletionRequest =
-            serde_json::from_str(r#"{"messages":[]}"#).unwrap();
+        router.worker_registry.sync_worker_models(
+            "http://worker1:8080",
+            &["base-model".to_string(), "rft-run-1".to_string()],
+        );
 
-        // Caller passes None (mirrors server.rs handlers today) — body wins.
-        let effective: Option<&str> = None.or_else(|| with_model.get_model());
-        assert_eq!(effective, Some("rft-run-1"));
-
-        // Explicit caller arg still wins when provided.
-        let effective = Some("explicit").or_else(|| with_model.get_model());
-        assert_eq!(effective, Some("explicit"));
-
-        // No model anywhere yields None (will fall through to get_all()).
-        let effective: Option<&str> = None.or_else(|| no_model.get_model());
-        assert_eq!(effective, None);
+        assert_eq!(
+            router.resolve_body_model_filter(
+                "/v1/chat/completions",
+                Some("rft-run-1"),
+                None,
+            ),
+            Some("rft-run-1")
+        );
+        assert_eq!(
+            router.resolve_body_model_filter(
+                "/v1/chat/completions",
+                Some("not-indexed"),
+                None,
+            ),
+            None
+        );
+        assert_eq!(
+            router.resolve_body_model_filter(
+                "/v1/chat/completions",
+                Some("not-indexed"),
+                Some("run-123"),
+            ),
+            Some("not-indexed")
+        );
+        assert_eq!(
+            router.resolve_body_model_filter("/v1/rerank", Some(DEFAULT_MODEL_NAME), None),
+            None
+        );
     }
 
     async fn start_counting_chat_worker(
@@ -2396,6 +2453,37 @@ mod tests {
                 }
             }),
         );
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        (format!("http://{}", addr), handle)
+    }
+
+    async fn start_model_listing_worker(
+        models: Vec<&'static str>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use axum::{routing::get, Json, Router as AxumRouter};
+        use tokio::net::TcpListener;
+
+        let models: Vec<String> = models.into_iter().map(String::from).collect();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = AxumRouter::new()
+            .route("/health", get(|| async { StatusCode::OK }))
+            .route(
+                "/v1/models",
+                get(move || {
+                    let models = models.clone();
+                    async move {
+                        let data: Vec<serde_json::Value> = models
+                            .iter()
+                            .map(|id| serde_json::json!({"id": id, "object": "model"}))
+                            .collect();
+                        Json(serde_json::json!({"object": "list", "data": data}))
+                    }
+                }),
+            );
         let handle = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
@@ -2466,6 +2554,43 @@ mod tests {
             6,
             "all requests should be routed to the worker indexed for the requested LoRA"
         );
+    }
+
+    #[tokio::test]
+    async fn test_router_new_indexes_all_discovered_models_immediately() {
+        let (url, _handle) =
+            start_model_listing_worker(vec!["base-model", "rft-run-1"]).await;
+        let config = crate::config::types::RouterConfig {
+            mode: crate::config::types::RoutingMode::Regular {
+                worker_urls: vec![url.clone()],
+            },
+            policy: crate::config::types::PolicyConfig::RoundRobin,
+            worker_startup_timeout_secs: 2,
+            worker_startup_check_interval_secs: 1,
+            ..Default::default()
+        };
+        let ctx = Arc::new(
+            crate::server::AppContext::new(
+                config.clone(),
+                Client::new(),
+                config.max_concurrent_requests,
+                config.rate_limit_tokens_per_second,
+                config.api_key_validation_urls.clone(),
+            )
+            .unwrap(),
+        );
+
+        let router = Router::new(vec![url.clone()], &ctx).await.unwrap();
+
+        let base_workers = router.worker_registry.get_by_model_fast("base-model");
+        let lora_workers = router.worker_registry.get_by_model_fast("rft-run-1");
+        assert_eq!(base_workers.len(), 1);
+        assert_eq!(lora_workers.len(), 1);
+
+        let worker = router
+            .select_worker_for_model(Some("rft-run-1"), Some(r#"{"prompt":"x"}"#), None)
+            .expect("LoRA model should be routable immediately after registration");
+        assert_eq!(worker.url(), url);
     }
 
     #[test]
