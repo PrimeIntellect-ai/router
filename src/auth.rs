@@ -110,10 +110,21 @@ impl RftClaims {
     }
 
     /// Whether `requested` is one of the alternate names declared in
-    /// `model_aliases`. Empty entries are ignored so a misconfigured
-    /// claim never authorizes the empty model.
+    /// `model_aliases`. Requires a non-empty base `model` claim: aliases
+    /// exist to rewrite to canonical and there is no canonical without
+    /// a base. Without this gate a JWT with `model_aliases` but no
+    /// `model` would authorize the alias and forward it unchanged to
+    /// vLLM, broadening scope rather than failing closed. Empty alias
+    /// entries are also ignored so a misconfigured claim never
+    /// authorizes the empty model.
     fn is_model_alias(&self, requested: &str) -> bool {
         if requested.is_empty() {
+            return false;
+        }
+        let Some(base) = self.model.as_deref() else {
+            return false;
+        };
+        if base.is_empty() {
             return false;
         }
         self.model_aliases
@@ -310,5 +321,20 @@ mod tests {
         );
         assert!(c.allows_model("rft-abc-step-42"));
         assert_eq!(c.canonical_for_alias("rft-abc-step-42"), None);
+    }
+
+    #[test]
+    fn alias_without_base_model_does_not_authorize() {
+        // Without a non-empty base model the router has no canonical
+        // name to rewrite to, so authorizing the alias would forward an
+        // arbitrary string to vLLM unchanged and broaden JWT scope.
+        // Fail closed instead.
+        let c_no_base = claims_with_aliases(None, Some("rft-abc"), &["sprints/Llama-3.2-1B-Instruct"]);
+        assert!(!c_no_base.allows_model("sprints/Llama-3.2-1B-Instruct"));
+        assert_eq!(c_no_base.canonical_for_alias("sprints/Llama-3.2-1B-Instruct"), None);
+
+        let c_empty_base = claims_with_aliases(Some(""), Some("rft-abc"), &["sprints/Llama-3.2-1B-Instruct"]);
+        assert!(!c_empty_base.allows_model("sprints/Llama-3.2-1B-Instruct"));
+        assert_eq!(c_empty_base.canonical_for_alias("sprints/Llama-3.2-1B-Instruct"), None);
     }
 }
