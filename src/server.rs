@@ -170,7 +170,7 @@ async fn transparent_proxy_handler(State(state): State<Arc<AppState>>, req: Requ
     };
 
     // Parse body as JSON
-    let body_json: serde_json::Value = if body_bytes.is_empty() {
+    let mut body_json: serde_json::Value = if body_bytes.is_empty() {
         serde_json::Value::Null
     } else {
         match serde_json::from_slice(&body_bytes) {
@@ -193,8 +193,9 @@ async fn transparent_proxy_handler(State(state): State<Arc<AppState>>, req: Requ
             .get("model")
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
+            .map(str::to_string)
         {
-            if !claims_ref.allows_model(model) {
+            if !claims_ref.allows_model(&model) {
                 warn!(
                     run_id = %claims_ref.run_id,
                     requested_model = %model,
@@ -208,6 +209,14 @@ async fn transparent_proxy_handler(State(state): State<Arc<AppState>>, req: Requ
                     ),
                 )
                     .into_response();
+            }
+            if let Some(canonical) = claims_ref.canonical_for_alias(&model) {
+                if let Some(obj) = body_json.as_object_mut() {
+                    obj.insert(
+                        "model".to_string(),
+                        serde_json::Value::String(canonical),
+                    );
+                }
             }
         }
         if let Err(response) = enforce_no_lora_path_override_json(&claims, &body_json) {
@@ -445,6 +454,9 @@ fn pin_and_check_model(
 
     let resolved = model.as_deref().unwrap_or("");
     if claims.allows_model(resolved) {
+        if let Some(canonical) = claims.canonical_for_alias(resolved) {
+            *model = Some(canonical);
+        }
         return Ok(());
     }
 
@@ -500,6 +512,9 @@ fn pin_and_check_model_string(
     }
 
     if claims.allows_model(model) {
+        if let Some(canonical) = claims.canonical_for_alias(model) {
+            *model = canonical;
+        }
         return Ok(());
     }
 
@@ -558,6 +573,14 @@ fn pin_and_check_model_json(
     };
 
     if claims.allows_model(&resolved) {
+        if let Some(canonical) = claims.canonical_for_alias(&resolved) {
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert(
+                    "model".to_string(),
+                    serde_json::Value::String(canonical),
+                );
+            }
+        }
         return Ok(());
     }
 
