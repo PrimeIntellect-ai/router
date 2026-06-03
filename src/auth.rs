@@ -125,7 +125,13 @@ impl RftClaims {
     /// the canonical model name (`self.model`) so the request body can
     /// be rewritten before forwarding to vLLM. Returns `None` if the
     /// request already targets the base model or a LoRA — those need to
-    /// pass through unchanged.
+    /// pass through unchanged so vLLM can dispatch the LoRA adapter.
+    ///
+    /// LoRA-shadowing is the load-bearing case: a pathological JWT could
+    /// list the same string in both `lora` (or as a `<lora>-…` step
+    /// adapter) and `model_aliases`. Rewriting such a request to the
+    /// base model would silently swap a LoRA call for a base-model call,
+    /// so we treat LoRA matches as taking precedence over alias matches.
     pub fn canonical_for_alias(&self, requested: &str) -> Option<String> {
         if !self.is_model_alias(requested) {
             return None;
@@ -134,7 +140,30 @@ impl RftClaims {
         if base.is_empty() || base == requested {
             return None;
         }
+        if self.matches_lora(requested) {
+            return None;
+        }
         Some(base.to_string())
+    }
+
+    /// Whether `requested` is authorized via the `lora` claim — either
+    /// an exact match or a `<lora>-<suffix>` step adapter. Mirrors the
+    /// LoRA branch of `allows_model` so `canonical_for_alias` can defer
+    /// to LoRA dispatch when both branches would otherwise authorize.
+    fn matches_lora(&self, requested: &str) -> bool {
+        let Some(lora) = self.lora.as_deref() else {
+            return false;
+        };
+        if lora.is_empty() {
+            return false;
+        }
+        if requested == lora {
+            return true;
+        }
+        if let Some(rest) = requested.strip_prefix(lora) {
+            return rest.starts_with('-');
+        }
+        false
     }
 }
 
@@ -256,5 +285,30 @@ mod tests {
         let c = claims_with_aliases(Some("meta-llama/Llama-3.2-1B-Instruct"), None, &["meta-llama/Llama-3.2-1B-Instruct"]);
         assert!(c.allows_model("meta-llama/Llama-3.2-1B-Instruct"));
         assert_eq!(c.canonical_for_alias("meta-llama/Llama-3.2-1B-Instruct"), None);
+    }
+
+    #[test]
+    fn alias_matching_lora_does_not_rewrite() {
+        // Pathological config: an alias entry collides with the lora
+        // claim. Rewriting would silently swap the LoRA call for a
+        // base-model call, so LoRA matches take precedence.
+        let c = claims_with_aliases(
+            Some("meta-llama/Llama-3.2-1B-Instruct"),
+            Some("rft-abc"),
+            &["rft-abc"],
+        );
+        assert!(c.allows_model("rft-abc"));
+        assert_eq!(c.canonical_for_alias("rft-abc"), None);
+    }
+
+    #[test]
+    fn alias_matching_step_versioned_lora_does_not_rewrite() {
+        let c = claims_with_aliases(
+            Some("meta-llama/Llama-3.2-1B-Instruct"),
+            Some("rft-abc"),
+            &["rft-abc-step-42"],
+        );
+        assert!(c.allows_model("rft-abc-step-42"));
+        assert_eq!(c.canonical_for_alias("rft-abc-step-42"), None);
     }
 }
