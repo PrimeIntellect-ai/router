@@ -13,6 +13,15 @@ struct UsageOnly {
 struct Usage {
     prompt_tokens: Option<u64>,
     completion_tokens: Option<u64>,
+    // vLLM reports the cached-prefix portion of `prompt_tokens` here when
+    // prefix caching is enabled. Older engines and non-vLLM upstreams omit
+    // the field entirely, so it must remain optional and default to zero.
+    prompt_tokens_details: Option<PromptTokensDetails>,
+}
+
+#[derive(serde::Deserialize)]
+struct PromptTokensDetails {
+    cached_tokens: Option<u64>,
 }
 
 /// Parse the `usage` field from a JSON response body and record per-run
@@ -22,10 +31,15 @@ struct Usage {
 pub(crate) fn extract_and_record_usage(run_id: &str, body: &[u8]) {
     if let Ok(parsed) = serde_json::from_slice::<UsageOnly>(body) {
         if let Some(usage) = parsed.usage {
+            let cached = usage
+                .prompt_tokens_details
+                .and_then(|d| d.cached_tokens)
+                .unwrap_or(0);
             RouterMetrics::record_run_usage(
                 run_id,
                 usage.prompt_tokens.unwrap_or(0),
                 usage.completion_tokens.unwrap_or(0),
+                cached,
             );
         }
     }
@@ -202,5 +216,47 @@ mod tests {
         let big = vec![b'x'; MAX_LINE_BUFFER + 16];
         extractor.push_chunk(&big);
         assert!(extractor.buf.len() <= MAX_LINE_BUFFER);
+    }
+
+    #[test]
+    fn parses_cached_prompt_tokens_when_present() {
+        let body = br#"{"usage":{"prompt_tokens":100,"completion_tokens":50,"prompt_tokens_details":{"cached_tokens":40}}}"#;
+        let parsed: UsageOnly = serde_json::from_slice(body).expect("parse usage block");
+        let usage = parsed.usage.expect("usage present");
+        assert_eq!(usage.prompt_tokens, Some(100));
+        assert_eq!(usage.completion_tokens, Some(50));
+        let cached = usage
+            .prompt_tokens_details
+            .and_then(|d| d.cached_tokens)
+            .unwrap_or(0);
+        assert_eq!(cached, 40);
+    }
+
+    #[test]
+    fn cached_prompt_tokens_defaults_to_zero_when_absent() {
+        // Older vLLM versions and non-vLLM upstreams omit
+        // prompt_tokens_details entirely. Must parse cleanly and yield 0.
+        let body = br#"{"usage":{"prompt_tokens":12,"completion_tokens":3}}"#;
+        let parsed: UsageOnly = serde_json::from_slice(body).expect("parse usage block");
+        let usage = parsed.usage.expect("usage present");
+        let cached = usage
+            .prompt_tokens_details
+            .and_then(|d| d.cached_tokens)
+            .unwrap_or(0);
+        assert_eq!(cached, 0);
+    }
+
+    #[test]
+    fn cached_prompt_tokens_field_can_be_missing_within_details() {
+        // Some engines emit prompt_tokens_details for reasoning metadata
+        // without populating cached_tokens. Treat the missing field as 0.
+        let body = br#"{"usage":{"prompt_tokens":5,"completion_tokens":1,"prompt_tokens_details":{}}}"#;
+        let parsed: UsageOnly = serde_json::from_slice(body).expect("parse usage block");
+        let usage = parsed.usage.expect("usage present");
+        let cached = usage
+            .prompt_tokens_details
+            .and_then(|d| d.cached_tokens)
+            .unwrap_or(0);
+        assert_eq!(cached, 0);
     }
 }
