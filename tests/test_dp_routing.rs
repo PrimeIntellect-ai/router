@@ -281,6 +281,7 @@ mod dp_e2e_tests {
             history_backend: vllm_router_rs::config::HistoryBackend::Memory,
             enable_profiling: false,
             profile_timeout_secs: 30,
+            pd_kv_cache_ttl_secs: 0,
         }
     }
 
@@ -330,6 +331,7 @@ mod dp_e2e_tests {
             history_backend: vllm_router_rs::config::HistoryBackend::Memory,
             enable_profiling: false,
             profile_timeout_secs: 30,
+            pd_kv_cache_ttl_secs: 0,
         }
     }
 

@@ -21,6 +21,7 @@ class RouterArgs:
         default_factory=list
     )  # List of (url, bootstrap_port)
     decode_urls: List[str] = dataclasses.field(default_factory=list)
+    pd_kv_cache_ttl_secs: int = 0
 
     # Routing policy
     policy: str = "cache_aware"
@@ -200,6 +201,12 @@ class RouterArgs:
             action="append",
             metavar=("URL",),
             help="Decode server URL. Can be specified multiple times.",
+        )
+        parser.add_argument(
+            f"--{prefix}pd-kv-cache-ttl-secs",
+            type=int,
+            default=RouterArgs.pd_kv_cache_ttl_secs,
+            help="TTL in seconds for Decode-side KV metadata cached for bidirectional vLLM P/D transfer.",
         )
         parser.add_argument(
             f"--{prefix}worker-startup-timeout-secs",

@@ -66,6 +66,7 @@ impl TestContext {
             history_backend: vllm_router_rs::config::HistoryBackend::Memory,
             enable_profiling: false,
             profile_timeout_secs: 30,
+            pd_kv_cache_ttl_secs: 0,
         };
 
         Self::new_with_config(config, worker_configs).await
@@ -1453,6 +1454,7 @@ mod error_tests {
             history_backend: vllm_router_rs::config::HistoryBackend::Memory,
             enable_profiling: false,
             profile_timeout_secs: 30,
+            pd_kv_cache_ttl_secs: 0,
         };
 
         let ctx = TestContext::new_with_config(
@@ -1816,6 +1818,7 @@ mod pd_mode_tests {
             history_backend: vllm_router_rs::config::HistoryBackend::Memory,
             enable_profiling: false,
             profile_timeout_secs: 30,
+            pd_kv_cache_ttl_secs: 0,
         };
 
         // Create app context
@@ -1983,6 +1986,7 @@ mod request_id_tests {
             history_backend: vllm_router_rs::config::HistoryBackend::Memory,
             enable_profiling: false,
             profile_timeout_secs: 30,
+            pd_kv_cache_ttl_secs: 0,
         };
 
         let ctx = TestContext::new_with_config(

@@ -22,10 +22,16 @@ use axum::{
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
+
+#[derive(Debug, Clone)]
+struct CachedDecodeKv {
+    kv_transfer_params: Value,
+    expires_at: Instant,
+}
 
 /// vLLM PD Router that extends PDRouter with vLLM-specific request handling
 #[derive(Debug)]
@@ -48,6 +54,10 @@ pub struct VllmPDRouter {
     profiling_tasks: Arc<Mutex<HashMap<String, tokio::task::AbortHandle>>>,
     /// Intra-node data parallel size for DP-aware routing (automatically enabled when > 1)
     intra_node_data_parallel_size: usize,
+    /// Decode-side KV metadata cached for a later prefill request in the same conversation.
+    decode_kv_cache: Arc<Mutex<HashMap<String, CachedDecodeKv>>>,
+    /// TTL for decode_kv_cache entries. Must be lower than vLLM's NIXL abort timeout.
+    decode_kv_cache_ttl: Duration,
 }
 
 impl VllmPDRouter {
@@ -58,6 +68,154 @@ impl VllmPDRouter {
             "___prefill_addr_{}___decode_addr_{}_{}",
             prefill_addr, decode_addr, uuid
         )
+    }
+
+    fn conversation_key(headers: Option<&HeaderMap>) -> Option<String> {
+        headers
+            .and_then(|headers| headers.get("x-conversation-id"))
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+    }
+
+    fn bidirectional_kv_enabled(&self) -> bool {
+        !self.decode_kv_cache_ttl.is_zero()
+    }
+
+    fn evict_expired_decode_kv_entries(cache: &mut HashMap<String, CachedDecodeKv>, now: Instant) {
+        cache.retain(|_, entry| entry.expires_at > now);
+    }
+
+    async fn take_decode_kv_for_conversation(
+        &self,
+        conversation_key: Option<&str>,
+    ) -> Option<Value> {
+        if self.decode_kv_cache_ttl.is_zero() {
+            return None;
+        }
+
+        let conversation_key = match conversation_key {
+            Some(key) => key,
+            None => {
+                debug!("PD KV cache disabled for request: no conversation key");
+                return None;
+            }
+        };
+
+        let now = Instant::now();
+        let mut cache = self.decode_kv_cache.lock().await;
+        Self::evict_expired_decode_kv_entries(&mut cache, now);
+
+        match cache.remove(conversation_key) {
+            Some(entry) if entry.expires_at > now => {
+                debug!("PD KV cache hit for conversation {}", conversation_key);
+                Some(entry.kv_transfer_params)
+            }
+            Some(_) => {
+                debug!(
+                    "PD KV cache entry expired for conversation {}",
+                    conversation_key
+                );
+                None
+            }
+            None => {
+                debug!("PD KV cache miss for conversation {}", conversation_key);
+                None
+            }
+        }
+    }
+
+    fn default_kv_params_for_prefill() -> Value {
+        json!({
+            "do_remote_decode": true,
+            "do_remote_prefill": false,
+            "remote_engine_id": serde_json::Value::Null,
+            "remote_block_ids": serde_json::Value::Null,
+            "remote_host": serde_json::Value::Null,
+            "remote_port": serde_json::Value::Null
+        })
+    }
+
+    fn kv_params_for_prefill(mut cached_decode_kv: Value) -> Value {
+        if let Some(obj) = cached_decode_kv.as_object_mut() {
+            obj.insert("do_remote_decode".to_string(), json!(true));
+            obj.insert("do_remote_prefill".to_string(), json!(false));
+            return cached_decode_kv;
+        }
+
+        Self::default_kv_params_for_prefill()
+    }
+
+    fn extract_decode_kv_params(decode_body: &[u8], is_streaming: bool) -> Option<Value> {
+        if !is_streaming {
+            return serde_json::from_slice::<Value>(decode_body)
+                .ok()
+                .and_then(|json| json.get("kv_transfer_params").cloned())
+                .filter(Value::is_object);
+        }
+
+        let body = std::str::from_utf8(decode_body).ok()?;
+        let mut latest = None;
+        for line in body.lines() {
+            let Some(data) = line.strip_prefix("data:") else {
+                continue;
+            };
+            let data = data.trim();
+            if data.is_empty() || data == "[DONE]" {
+                continue;
+            }
+            if let Ok(chunk) = serde_json::from_str::<Value>(data) {
+                if let Some(params) = chunk
+                    .get("kv_transfer_params")
+                    .filter(|params| params.is_object())
+                {
+                    latest = Some(params.clone());
+                }
+            }
+        }
+        latest
+    }
+
+    async fn cache_decode_kv_for_conversation(
+        &self,
+        conversation_key: Option<&str>,
+        decode_body: &[u8],
+        is_streaming: bool,
+        status: reqwest::StatusCode,
+    ) {
+        if self.decode_kv_cache_ttl.is_zero() || !status.is_success() {
+            return;
+        }
+
+        let Some(conversation_key) = conversation_key else {
+            return;
+        };
+        let Some(kv_transfer_params) = Self::extract_decode_kv_params(decode_body, is_streaming)
+        else {
+            debug!(
+                "No decode-side kv_transfer_params found for conversation {}",
+                conversation_key
+            );
+            return;
+        };
+
+        let now = Instant::now();
+        let expires_at = now + self.decode_kv_cache_ttl;
+        let mut cache = self.decode_kv_cache.lock().await;
+        Self::evict_expired_decode_kv_entries(&mut cache, now);
+        cache.insert(
+            conversation_key.to_string(),
+            CachedDecodeKv {
+                kv_transfer_params,
+                expires_at,
+            },
+        );
+        debug!(
+            "Cached decode-side KV metadata for conversation {} for {} seconds",
+            conversation_key,
+            self.decode_kv_cache_ttl.as_secs()
+        );
     }
 
     /// Get ZMQ address for a worker URL using service discovery
@@ -427,6 +585,20 @@ impl VllmPDRouter {
             "Generated vLLM request ID for P2P coordination: {}",
             request_id
         );
+        let bidirectional_kv_enabled = self.bidirectional_kv_enabled();
+        let mut kv_transfer_params = Self::default_kv_params_for_prefill();
+        let conversation_key = if bidirectional_kv_enabled {
+            let conversation_key = Self::conversation_key(headers);
+            if let Some(cached_decode_kv) = self
+                .take_decode_kv_for_conversation(conversation_key.as_deref())
+                .await
+            {
+                kv_transfer_params = Self::kv_params_for_prefill(cached_decode_kv);
+            }
+            conversation_key
+        } else {
+            None
+        };
 
         // DO NOT add P2P metadata to internal request_id - let vLLM generate clean internal IDs
         // The P2P metadata will be sent in X-Request-Id header instead
@@ -434,16 +606,7 @@ impl VllmPDRouter {
         // Prepare prefill request (max_tokens=1 to force prefill-only mode)
         let mut prefill_request = Self::prepare_prefill_request(request_json.clone(), path);
 
-        // Add kv_transfer_params for NixlConnector support at top level
-        // This enables the prefill instance to prepare for remote decode
-        prefill_request["kv_transfer_params"] = json!({
-            "do_remote_decode": true,
-            "do_remote_prefill": false,
-            "remote_engine_id": serde_json::Value::Null,
-            "remote_block_ids": serde_json::Value::Null,
-            "remote_host": serde_json::Value::Null,
-            "remote_port": serde_json::Value::Null
-        });
+        prefill_request["kv_transfer_params"] = kv_transfer_params;
 
         debug!("Added kv_transfer_params to prefill request for NixlConnector support");
 
@@ -674,6 +837,16 @@ impl VllmPDRouter {
                 .await
                 .map_err(|e| format!("Failed to read decode response: {}", e))?;
 
+            if bidirectional_kv_enabled {
+                self.cache_decode_kv_for_conversation(
+                    conversation_key.as_deref(),
+                    &decode_body,
+                    is_streaming,
+                    status,
+                )
+                .await;
+            }
+
             // Per-run billing metrics on success.
             if let Some(rid) = run_id {
                 if status.is_success() {
@@ -726,6 +899,16 @@ impl VllmPDRouter {
                 .bytes()
                 .await
                 .map_err(|e| format!("Failed to read decode response: {}", e))?;
+
+            if bidirectional_kv_enabled {
+                self.cache_decode_kv_for_conversation(
+                    conversation_key.as_deref(),
+                    &decode_body,
+                    is_streaming,
+                    status,
+                )
+                .await;
+            }
 
             // Per-run billing metrics on success. This branch also
             // handles `stream=true` requests, in which case the buffered
@@ -792,6 +975,20 @@ impl VllmPDRouter {
             self.get_zmq_address(prefill_worker.base_url(), ServiceType::Prefill);
         let decode_zmq_addr = self.get_zmq_address(decode_worker.base_url(), ServiceType::Decode);
         let request_id = Self::generate_vllm_request_id(&prefill_zmq_addr, &decode_zmq_addr);
+        let bidirectional_kv_enabled = self.bidirectional_kv_enabled();
+        let mut kv_transfer_params = Self::default_kv_params_for_prefill();
+        let conversation_key = if bidirectional_kv_enabled {
+            let conversation_key = Self::conversation_key(headers);
+            if let Some(cached_decode_kv) = self
+                .take_decode_kv_for_conversation(conversation_key.as_deref())
+                .await
+            {
+                kv_transfer_params = Self::kv_params_for_prefill(cached_decode_kv);
+            }
+            conversation_key
+        } else {
+            None
+        };
 
         debug!("Generated vLLM request ID: {}", request_id);
         debug!("🔍 vLLM Proxy Comparison:");
@@ -805,16 +1002,7 @@ impl VllmPDRouter {
         // Stage 1: Prepare prefill request with max_tokens=1 and kv_transfer_params
         let mut prefill_request = Self::prepare_prefill_request(original_request.clone(), path);
 
-        // Add kv_transfer_params for NixlConnector support at top level
-        // This enables the prefill instance to prepare for remote decode
-        prefill_request["kv_transfer_params"] = json!({
-            "do_remote_decode": true,
-            "do_remote_prefill": false,
-            "remote_engine_id": serde_json::Value::Null,
-            "remote_block_ids": serde_json::Value::Null,
-            "remote_host": serde_json::Value::Null,
-            "remote_port": serde_json::Value::Null
-        });
+        prefill_request["kv_transfer_params"] = kv_transfer_params;
 
         debug!("Added kv_transfer_params to prefill request for NixlConnector support");
 
@@ -1088,6 +1276,16 @@ impl VllmPDRouter {
                         ),
                     })?;
 
+            if bidirectional_kv_enabled {
+                self.cache_decode_kv_for_conversation(
+                    conversation_key.as_deref(),
+                    &decode_body,
+                    is_streaming,
+                    status,
+                )
+                .await;
+            }
+
             // Per-run billing metrics on success.
             if let Some(rid) = run_id {
                 if status.is_success() {
@@ -1153,6 +1351,16 @@ impl VllmPDRouter {
                             decode_url, e
                         ),
                     })?;
+
+            if bidirectional_kv_enabled {
+                self.cache_decode_kv_for_conversation(
+                    conversation_key.as_deref(),
+                    &decode_body,
+                    is_streaming,
+                    status,
+                )
+                .await;
+            }
 
             // Per-run billing metrics on success. This branch also
             // handles `stream=true` requests, in which case the buffered
@@ -1232,6 +1440,8 @@ impl VllmPDRouter {
                 profile_timeout_secs: ctx.router_config.profile_timeout_secs,
                 profiling_tasks: Arc::new(Mutex::new(HashMap::new())),
                 intra_node_data_parallel_size: ctx.router_config.intra_node_data_parallel_size,
+                decode_kv_cache: Arc::new(Mutex::new(HashMap::new())),
+                decode_kv_cache_ttl: Duration::from_secs(ctx.router_config.pd_kv_cache_ttl_secs),
             })
         } else {
             // Direct URL mode (same as PDRouter)
@@ -1274,6 +1484,8 @@ impl VllmPDRouter {
                 profile_timeout_secs: ctx.router_config.profile_timeout_secs,
                 profiling_tasks: Arc::new(Mutex::new(HashMap::new())),
                 intra_node_data_parallel_size: ctx.router_config.intra_node_data_parallel_size,
+                decode_kv_cache: Arc::new(Mutex::new(HashMap::new())),
+                decode_kv_cache_ttl: Duration::from_secs(ctx.router_config.pd_kv_cache_ttl_secs),
             })
         }
     }

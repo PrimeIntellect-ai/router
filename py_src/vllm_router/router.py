@@ -76,6 +76,8 @@ class Router:
             If not specified, uses the main policy. Default: None
         decode_policy: Specific load balancing policy for decode nodes (PD mode only).
             If not specified, uses the main policy. Default: None
+        pd_kv_cache_ttl_secs: TTL in seconds for Decode-side KV metadata cached for
+            bidirectional vLLM P/D transfer. Default: 0
         request_id_headers: List of HTTP headers to check for request IDs. If not specified,
             uses common defaults: ['x-request-id', 'x-correlation-id', 'x-trace-id', 'request-id'].
             Example: ['x-my-request-id', 'x-custom-trace-id']. Default: None
