@@ -52,7 +52,7 @@ tracing-subscriber = { version = "0.3", features = [
 tracing-log = "0.2"
 tracing-appender = "0.2.3"
 opentelemetry = "0.27"
-opentelemetry_sdk = { version = "0.27", features = ["trace", "rt-tokio"] }
+opentelemetry_sdk = { version = "0.32", features = ["trace", "rt-tokio"] }
 opentelemetry-otlp = { version = "0.27", features = ["trace", "grpc-tonic"] }
 tracing-opentelemetry = "0.28"
 opentelemetry-http = "0.27"
@@ -103,7 +103,7 @@ http-body-util = "0.1"
 portpicker = "0.1"
 tempfile = "3.8"
 lazy_static = "1.4"
-opentelemetry_sdk = { version = "0.27", features = ["testing"] }
+opentelemetry_sdk = { version = "0.32", features = ["testing"] }
 
 [[bench]]
 name = "request_processing"
