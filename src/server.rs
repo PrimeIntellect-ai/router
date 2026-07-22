@@ -1,7 +1,7 @@
 use crate::{
     auth::{JwtVerifier, RftClaims},
     config::{ConnectionMode, HistoryBackend, RouterConfig, TraceConfig},
-    core::{WorkerRegistry, WorkerType},
+    core::{strip_dp_rank, WorkerRegistry, WorkerType},
     data_connector::{MemoryResponseStorage, NoOpResponseStorage, SharedResponseStorage},
     logging::{self, LoggingConfig},
     metrics::{self, PrometheusConfig},
@@ -22,17 +22,19 @@ use crate::{
     tokenizer::{factory as tokenizer_factory, traits::Tokenizer},
 };
 use axum::{
+    body::to_bytes,
     extract::{DefaultBodyLimit, Path, Query, Request, State},
-    http::StatusCode,
+    http::{header::CONTENT_LENGTH, header::HOST, StatusCode},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
     serve, Json, Router,
 };
+use futures_util::future::join_all;
 use reqwest::Client;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     sync::atomic::{AtomicBool, Ordering},
     sync::Arc,
     time::Duration,
@@ -1014,6 +1016,110 @@ async fn get_loads(State(state): State<Arc<AppState>>, headers: http::HeaderMap)
     state.router.get_worker_loads().await
 }
 
+#[derive(Serialize)]
+struct AdminFanoutResult {
+    url: String,
+    status: Option<u16>,
+    error: Option<String>,
+}
+
+async fn fanout_admin_request(State(state): State<Arc<AppState>>, req: Request) -> Response {
+    let headers = req.headers().clone();
+    if let Err(response) = authorize_request(&state, &headers).await {
+        return response;
+    }
+
+    let method = req.method().clone();
+    let path_and_query = req
+        .uri()
+        .path_and_query()
+        .map(|value| value.as_str().to_string())
+        .unwrap_or_else(|| req.uri().path().to_string());
+    let body = match to_bytes(req.into_body(), usize::MAX).await {
+        Ok(body) => body,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("Failed to read admin request body: {error}"),
+            )
+                .into_response();
+        }
+    };
+
+    let worker_urls = state
+        .context
+        .worker_registry
+        .get_all()
+        .into_iter()
+        .filter(|worker| worker.is_healthy())
+        .map(|worker| {
+            let worker_url = strip_dp_rank(worker.url()).trim_end_matches('/');
+            worker_url
+                .strip_suffix("/v1")
+                .unwrap_or(worker_url)
+                .to_string()
+        })
+        .collect::<BTreeSet<_>>();
+    if worker_urls.is_empty() {
+        return (StatusCode::SERVICE_UNAVAILABLE, "No available workers").into_response();
+    }
+
+    let mut forwarded_headers = headers;
+    forwarded_headers.remove(HOST);
+    forwarded_headers.remove(CONTENT_LENGTH);
+    let api_key = state.context.router_config.api_key.clone();
+    let results = join_all(worker_urls.into_iter().map(|worker_url| {
+        let client = state.context.client.clone();
+        let method = method.clone();
+        let path_and_query = path_and_query.clone();
+        let headers = forwarded_headers.clone();
+        let body = body.clone();
+        let api_key = api_key.clone();
+
+        async move {
+            let url = format!("{worker_url}{path_and_query}");
+            let mut request = client.request(method, &url).headers(headers).body(body);
+            if let Some(api_key) = api_key {
+                request = request.bearer_auth(api_key);
+            }
+
+            match request.send().await {
+                Ok(response) => {
+                    let status = response.status();
+                    let response_body = response.text().await.unwrap_or_default();
+                    AdminFanoutResult {
+                        url: worker_url,
+                        status: Some(status.as_u16()),
+                        error: (!status.is_success()).then_some(response_body),
+                    }
+                }
+                Err(error) => AdminFanoutResult {
+                    url: worker_url,
+                    status: None,
+                    error: Some(error.to_string()),
+                },
+            }
+        }
+    }))
+    .await;
+
+    let success = results.iter().all(|result| {
+        result
+            .status
+            .is_some_and(|status| (200..300).contains(&status))
+    });
+    let status = if success {
+        StatusCode::OK
+    } else {
+        StatusCode::BAD_GATEWAY
+    };
+    (
+        status,
+        Json(json!({ "success": success, "workers": results })),
+    )
+        .into_response()
+}
+
 // ---------- Worker management endpoints (RESTful) ----------
 
 /// POST /workers - Add a new worker with full configuration
@@ -1254,7 +1360,10 @@ pub fn build_app_with_request_tracing(
         .route("/remove_worker", post(remove_worker))
         .route("/list_workers", get(list_workers))
         .route("/flush_cache", post(flush_cache))
-        .route("/get_loads", get(get_loads));
+        .route("/get_loads", get(get_loads))
+        .route("/pause", post(fanout_admin_request))
+        .route("/update_weights", post(fanout_admin_request))
+        .route("/resume", post(fanout_admin_request));
 
     // Worker management routes
     let worker_routes = Router::new()
