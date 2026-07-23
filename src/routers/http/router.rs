@@ -25,9 +25,9 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use futures_util::StreamExt;
+use futures_util::{future::join_all, StreamExt};
 use reqwest::Client;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -357,17 +357,16 @@ impl Router {
                 }
             }
 
-            if healthy_host_count > 0 {
+            if healthy_host_count == unique_hosts_vec.len() {
                 info!(
-                    "{} out of {} unique hosts are healthy (representing {} workers)",
+                    "All {} unique hosts are healthy (representing {} workers)",
                     healthy_host_count,
-                    unique_hosts_vec.len(),
                     worker_urls.len()
                 );
                 return Ok(());
             } else {
                 debug!(
-                   "Waiting for at least 1 of {} unique hosts to become healthy ({} unhealthy: {:?})",
+                    "Waiting for all {} unique hosts to become healthy ({} unhealthy: {:?})",
                     unique_hosts_vec.len(),
                     unhealthy_hosts.len(),
                     unhealthy_hosts
@@ -1199,6 +1198,70 @@ impl Router {
     }
 
     pub async fn add_worker(&self, worker_url: &str) -> Result<String, String> {
+        self.add_worker_with_usability(worker_url, true).await
+    }
+
+    /// Register a Kubernetes-discovered worker without routing requests to it until its first
+    /// successful weight update.
+    pub async fn add_discovered_worker(&self, worker_url: &str) -> Result<String, String> {
+        if self.has_registered_endpoint(worker_url).await {
+            return Ok(format!("Worker endpoint already registered: {worker_url}"));
+        }
+
+        self.add_worker_with_usability(worker_url, false).await
+    }
+
+    async fn has_registered_endpoint(&self, worker_url: &str) -> bool {
+        let Ok(candidate_url) = reqwest::Url::parse(worker_url) else {
+            return false;
+        };
+        let (Some(candidate_host), Some(candidate_port)) =
+            (candidate_url.host_str(), candidate_url.port_or_known_default())
+        else {
+            return false;
+        };
+        let Ok(candidate_addrs) = tokio::net::lookup_host((candidate_host, candidate_port)).await
+        else {
+            return false;
+        };
+        let candidate_ips = candidate_addrs.map(|address| address.ip()).collect::<HashSet<_>>();
+
+        for worker in self.worker_registry.get_all() {
+            let registered_url = strip_dp_rank(worker.url()).trim_end_matches('/');
+            let registered_url = registered_url.strip_suffix("/v1").unwrap_or(registered_url);
+            let Ok(registered_url) = reqwest::Url::parse(registered_url) else {
+                continue;
+            };
+            let (Some(registered_host), Some(registered_port)) = (
+                registered_url.host_str(),
+                registered_url.port_or_known_default(),
+            ) else {
+                continue;
+            };
+            if registered_port != candidate_port {
+                continue;
+            }
+            let Ok(registered_addrs) =
+                tokio::net::lookup_host((registered_host, registered_port)).await
+            else {
+                continue;
+            };
+            if registered_addrs
+                .map(|address| address.ip())
+                .any(|ip| candidate_ips.contains(&ip))
+            {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    async fn add_worker_with_usability(
+        &self,
+        worker_url: &str,
+        usable: bool,
+    ) -> Result<String, String> {
         let start_time = std::time::Instant::now();
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(self.worker_startup_timeout_secs))
@@ -1255,7 +1318,8 @@ impl Router {
                                     WorkerType::Regular,
                                 )
                                 .with_circuit_breaker_config(self.circuit_breaker_config.clone())
-                                .with_labels(labels.clone());
+                                .with_labels(labels.clone())
+                                .with_usable(usable);
 
                                 let worker_arc: Arc<dyn Worker> = Arc::new(new_worker);
                                 self.worker_registry.register(worker_arc.clone());
@@ -1296,7 +1360,8 @@ impl Router {
                                     .with_circuit_breaker_config(
                                         self.circuit_breaker_config.clone(),
                                     )
-                                    .with_labels(labels);
+                                    .with_labels(labels)
+                                    .with_usable(usable);
 
                             let worker_arc = Arc::new(new_worker);
                             self.worker_registry.register(worker_arc.clone());
@@ -1615,21 +1680,30 @@ impl RouterTrait for Router {
 
     async fn health(&self, _req: Request<Body>) -> Response {
         let workers = self.worker_registry.get_all();
-        let unhealthy_servers: Vec<_> = workers
-            .iter()
-            .filter(|w| !w.is_healthy())
-            .map(|w| w.url().to_string())
-            .collect();
-
-        if unhealthy_servers.is_empty() {
-            (StatusCode::OK, "All servers healthy").into_response()
-        } else {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                format!("Unhealthy servers: {:?}", unhealthy_servers),
-            )
-                .into_response()
+        let health = join_all(workers.iter().map(|worker| worker.check_health_async())).await;
+        for (worker, result) in workers.iter().zip(health) {
+            worker.set_healthy(result.is_ok());
         }
+
+        let available_workers = workers.iter().filter(|worker| worker.is_available()).count();
+        if available_workers > 0 {
+            return (
+                StatusCode::OK,
+                format!("{available_workers} workers available"),
+            )
+                .into_response();
+        }
+
+        let unavailable_servers: Vec<_> = workers
+            .iter()
+            .filter(|worker| !worker.is_available())
+            .map(|worker| worker.url().to_string())
+            .collect();
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("No available workers: {unavailable_servers:?}"),
+        )
+            .into_response()
     }
 
     async fn health_generate(&self, req: Request<Body>) -> Response {
@@ -1839,9 +1913,9 @@ impl RouterTrait for Router {
     }
 
     fn readiness(&self) -> Response {
-        // Regular router is ready if it has at least one healthy worker
+        // Regular router is ready if it has at least one routable worker.
         let workers = self.worker_registry.get_all();
-        let healthy_count = workers.iter().filter(|w| w.is_healthy()).count();
+        let healthy_count = workers.iter().filter(|w| w.is_available()).count();
         let total_workers = workers.len();
 
         if healthy_count > 0 {
@@ -2648,12 +2722,11 @@ mod tests {
     #[tokio::test]
     async fn test_wait_for_healthy_workers_partial_health() {
         // One healthy server + one unreachable URL.
-        // The new behaviour succeeds when at least one host is healthy.
         let (healthy_url, _handle) = start_healthy_mock_server().await;
         let unreachable_url = "http://127.0.0.1:1".to_string(); // port 1 is unreachable
 
-        let result = Router::wait_for_healthy_workers(&[healthy_url, unreachable_url], 5, 1).await;
-        assert!(result.is_ok());
+        let result = Router::wait_for_healthy_workers(&[healthy_url, unreachable_url], 2, 1).await;
+        assert!(result.is_err());
     }
 
     /// Helper: start a mock server that returns 503 on /health for a given
@@ -2729,14 +2802,13 @@ mod tests {
         assert_eq!(resp.status().as_u16(), 503);
 
         // ── Step 1: wait_for_healthy_workers (mirrors PDRouter::new startup) ──
-        // This succeeds because the healthy worker responds immediately,
-        // even though the delayed worker is still returning 503.
+        // Startup waits for the delayed worker as well as the immediately healthy worker.
         let result =
             Router::wait_for_healthy_workers(&[healthy_url.clone(), delayed_url.clone()], 10, 1)
                 .await;
         assert!(
             result.is_ok(),
-            "Startup should succeed with at least one healthy worker"
+            "Startup should succeed once all workers are healthy"
         );
 
         // ── Step 2: register workers in the registry (mirrors PDRouter::new) ──

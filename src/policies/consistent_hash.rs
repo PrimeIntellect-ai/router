@@ -246,7 +246,12 @@ impl ConsistentHashPolicy {
 
     /// Update the hash ring when workers change
     fn update_hash_ring(&self, workers: &[Arc<dyn Worker>]) {
-        let worker_urls: Vec<String> = workers.iter().map(|w| w.url().to_string()).collect();
+        let worker_urls: Vec<String> = workers
+            .iter()
+            .filter(|worker| worker.is_available())
+            .map(|worker| worker.url().to_string())
+            .collect();
+        let worker_count = worker_urls.len();
 
         // Check if workers have changed
         {
@@ -280,8 +285,8 @@ impl ConsistentHashPolicy {
 
         info!(
             "Updated consistent hash ring with {} workers and {} virtual nodes",
-            workers.len(),
-            workers.len() as u32 * VIRTUAL_NODES_PER_WORKER
+            worker_count,
+            worker_count as u32 * VIRTUAL_NODES_PER_WORKER
         );
     }
 
@@ -638,7 +643,7 @@ impl LoadBalancingPolicy for ConsistentHashPolicy {
         match selected_idx {
             Some(idx) => {
                 // Verify the worker is healthy
-                if workers[idx].is_healthy() && workers[idx].circuit_breaker().can_execute() {
+                if workers[idx].is_available() {
                     let worker_url = workers[idx].url();
                     debug!(
                         "CONSISTENT_HASH_DEBUG: Selected worker at index {}: {}",

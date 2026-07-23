@@ -282,7 +282,7 @@ pub async fn start_service_discovery(
             let config_clone2 = Arc::clone(&config_arc);
 
             match filtered_stream
-                .try_for_each(move |pod| {
+                .try_for_each_concurrent(Some(32), move |pod| {
                     let tracked_pods_inner = Arc::clone(&tracked_pods_clone2);
                     let router_inner = Arc::clone(&router_clone);
                     let config_inner = Arc::clone(&config_clone2);
@@ -322,6 +322,11 @@ pub async fn start_service_discovery(
                 }
                 Err(err) => {
                     error!("Error in Kubernetes watcher: {}", err);
+                    // A stream error cancels in-flight handlers. Clear their reservations so the
+                    // watcher's initial reconciliation retries every currently healthy pod.
+                    if let Ok(mut tracked) = tracked_pods.lock() {
+                        tracked.clear();
+                    }
                     warn!(
                         "Retrying in {} seconds with exponential backoff",
                         retry_delay.as_secs()
@@ -330,6 +335,7 @@ pub async fn start_service_discovery(
 
                     // Exponential backoff with jitter
                     retry_delay = std::cmp::min(retry_delay * 2, MAX_RETRY_DELAY);
+                    continue;
                 }
             }
 
@@ -424,8 +430,15 @@ async fn handle_pod_event(
                     Err("PD mode enabled but router is not a PDRouter or VllmPDRouter".to_string())
                 }
             } else {
-                // Regular mode or no pod type specified
-                router.add_worker(&worker_url).await
+                // Newly discovered regular workers must receive the current policy weights before
+                // they become eligible for inference traffic.
+                use crate::routers::http::router::Router;
+
+                if let Some(router) = router.as_any().downcast_ref::<Router>() {
+                    router.add_discovered_worker(&worker_url).await
+                } else {
+                    router.add_worker(&worker_url).await
+                }
             };
 
             match result {

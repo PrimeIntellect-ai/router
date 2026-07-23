@@ -317,7 +317,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             workers
                 .iter()
                 .position(|w| w.url() == tenant_url)
-                .filter(|&idx| workers[idx].is_healthy())
+                .filter(|&idx| workers[idx].is_available())
         } else {
             // Low cache match: use worker with minimum load
             healthy_indices

@@ -1030,6 +1030,7 @@ async fn fanout_admin_request(State(state): State<Arc<AppState>>, req: Request) 
     }
 
     let method = req.method().clone();
+    let is_weight_update = req.uri().path() == "/update_weights";
     let path_and_query = req
         .uri()
         .path_and_query()
@@ -1102,6 +1103,30 @@ async fn fanout_admin_request(State(state): State<Arc<AppState>>, req: Request) 
         }
     }))
     .await;
+
+    if is_weight_update {
+        for result in results.iter().filter(|result| {
+            result
+                .status
+                .is_some_and(|status| (200..300).contains(&status))
+        }) {
+            for worker in state.context.worker_registry.get_all() {
+                let registered_url = strip_dp_rank(worker.url()).trim_end_matches('/');
+                let registered_url = registered_url
+                    .strip_suffix("/v1")
+                    .unwrap_or(registered_url);
+                if registered_url == result.url.as_str() {
+                    if !worker.is_usable() {
+                        info!(
+                            "Worker {} received its first weight update and is now usable",
+                            result.url
+                        );
+                    }
+                    worker.set_usable(true);
+                }
+            }
+        }
+    }
 
     let success = results.iter().all(|result| {
         result
@@ -1186,6 +1211,7 @@ async fn list_workers_rest(
                         WorkerType::Decode => "decode",
                     },
                     "is_healthy": worker.is_healthy(),
+                    "is_usable": worker.is_usable(),
                     "load": worker.load(),
                     "connection_mode": format!("{:?}", worker.connection_mode()),
                     "priority": worker.priority(),
