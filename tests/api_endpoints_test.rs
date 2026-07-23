@@ -241,7 +241,7 @@ mod health_tests {
             .await
             .unwrap();
         let body_str = String::from_utf8_lossy(&body);
-        assert!(body_str.contains("All servers healthy"));
+        assert!(body_str.contains("2 workers available"));
 
         ctx.shutdown().await;
     }

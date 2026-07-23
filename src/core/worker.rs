@@ -78,6 +78,12 @@ pub trait Worker: Send + Sync + fmt::Debug {
     /// Set the worker's health status
     fn set_healthy(&self, healthy: bool);
 
+    /// Check whether the worker has the current policy weights and may receive traffic.
+    fn is_usable(&self) -> bool;
+
+    /// Allow or prevent routing traffic to this worker.
+    fn set_usable(&self, usable: bool);
+
     /// Perform an async health check on the worker
     async fn check_health_async(&self) -> WorkerResult<()>;
 
@@ -121,9 +127,9 @@ pub trait Worker: Send + Sync + fmt::Debug {
     /// Get the circuit breaker for this worker
     fn circuit_breaker(&self) -> &CircuitBreaker;
 
-    /// Check if the worker is available (healthy + circuit closed/half-open)
+    /// Check if the worker is available for inference traffic.
     fn is_available(&self) -> bool {
-        self.is_healthy() && self.circuit_breaker().can_execute()
+        self.is_healthy() && self.is_usable() && self.circuit_breaker().can_execute()
     }
 
     /// Record the outcome of a request to this worker
@@ -357,6 +363,7 @@ pub struct BasicWorker {
     load_counter: Arc<AtomicUsize>,
     processed_counter: Arc<AtomicUsize>,
     healthy: Arc<AtomicBool>,
+    usable: Arc<AtomicBool>,
     consecutive_failures: Arc<AtomicUsize>,
     consecutive_successes: Arc<AtomicUsize>,
     circuit_breaker: CircuitBreaker,
@@ -369,6 +376,7 @@ impl fmt::Debug for BasicWorker {
         f.debug_struct("BasicWorker")
             .field("metadata", &self.metadata)
             .field("healthy", &self.healthy.load(Ordering::Relaxed))
+            .field("usable", &self.usable.load(Ordering::Relaxed))
             .field("circuit_breaker", &self.circuit_breaker)
             .field("has_grpc_client", &self.grpc_client.is_some())
             .finish()
@@ -398,6 +406,7 @@ impl BasicWorker {
             load_counter: Arc::new(AtomicUsize::new(0)),
             processed_counter: Arc::new(AtomicUsize::new(0)),
             healthy: Arc::new(AtomicBool::new(true)),
+            usable: Arc::new(AtomicBool::new(true)),
             consecutive_failures: Arc::new(AtomicUsize::new(0)),
             consecutive_successes: Arc::new(AtomicUsize::new(0)),
             circuit_breaker: CircuitBreaker::new(),
@@ -407,6 +416,11 @@ impl BasicWorker {
 
     pub fn with_labels(mut self, labels: std::collections::HashMap<String, String>) -> Self {
         self.metadata.labels = labels;
+        self
+    }
+
+    pub fn with_usable(self, usable: bool) -> Self {
+        self.usable.store(usable, Ordering::Release);
         self
     }
 
@@ -469,6 +483,14 @@ impl Worker for BasicWorker {
     fn set_healthy(&self, healthy: bool) {
         self.healthy.store(healthy, Ordering::Release);
         RouterMetrics::set_worker_health(self.url(), healthy);
+    }
+
+    fn is_usable(&self) -> bool {
+        self.usable.load(Ordering::Acquire)
+    }
+
+    fn set_usable(&self, usable: bool) {
+        self.usable.store(usable, Ordering::Release);
     }
 
     async fn check_health_async(&self) -> WorkerResult<()> {
@@ -631,6 +653,12 @@ impl DPAwareWorker {
         self.base_worker = self.base_worker.with_labels(labels);
         self
     }
+
+    /// Configure whether this worker may receive inference traffic.
+    pub fn with_usable(mut self, usable: bool) -> Self {
+        self.base_worker = self.base_worker.with_usable(usable);
+        self
+    }
 }
 
 #[async_trait]
@@ -653,6 +681,14 @@ impl Worker for DPAwareWorker {
 
     fn set_healthy(&self, healthy: bool) {
         self.base_worker.set_healthy(healthy);
+    }
+
+    fn is_usable(&self) -> bool {
+        self.base_worker.is_usable()
+    }
+
+    fn set_usable(&self, usable: bool) {
+        self.base_worker.set_usable(usable);
     }
 
     async fn check_health_async(&self) -> WorkerResult<()> {
