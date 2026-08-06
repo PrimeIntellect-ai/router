@@ -9,7 +9,8 @@ use crate::otel_http::{self, ClientRequestOptions};
 use crate::policies::{LoadBalancingPolicy, PolicyRegistry};
 use crate::protocols::spec::{
     ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, GenerationRequest,
-    RerankRequest, RerankResponse, RerankResult, ResponsesRequest, DEFAULT_MODEL_NAME,
+    InferenceGenerateRequest, RerankRequest, RerankResponse, RerankResult, ResponsesRequest,
+    DEFAULT_MODEL_NAME,
 };
 use crate::routers::header_utils;
 use crate::routers::http::dp_utils;
@@ -1657,6 +1658,23 @@ impl RouterTrait for Router {
     ) -> Response {
         self.route_typed_request(headers, body, "/generate", model_id, run_id)
             .await
+    }
+
+    async fn route_inference_generate(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &InferenceGenerateRequest,
+        model_id: Option<&str>,
+        run_id: Option<&str>,
+    ) -> Response {
+        self.route_typed_request(
+            headers,
+            body,
+            "/inference/v1/generate",
+            model_id,
+            run_id,
+        )
+        .await
     }
 
     async fn route_chat(

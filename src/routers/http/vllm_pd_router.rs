@@ -1341,7 +1341,6 @@ impl VllmPDRouter {
                     .into_response()
             }
         };
-
         if self.use_discovery {
             // Discovery mode - use vLLM-specific two-stage processing
             info!("Using service discovery mode, processing vLLM two-stage request");
@@ -1506,6 +1505,33 @@ impl RouterTrait for VllmPDRouter {
         self.pd_router
             .route_generate(headers, body, model_id, run_id)
             .await
+    }
+
+    async fn route_inference_generate(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &crate::protocols::spec::InferenceGenerateRequest,
+        _model_id: Option<&str>,
+        run_id: Option<&str>,
+    ) -> Response {
+        let request_json = match serde_json::to_value(body) {
+            Ok(json) => json,
+            Err(e) => {
+                return (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Serialization error: {}", e),
+                )
+                    .into_response()
+            }
+        };
+        self.route_transparent(
+            headers,
+            "/inference/v1/generate",
+            &Method::POST,
+            request_json,
+            run_id,
+        )
+        .await
     }
 
     // Override OpenAI-compatible routes for vLLM two-stage processing

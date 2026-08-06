@@ -359,6 +359,62 @@ async fn test_streaming_request_load_returns_to_zero() {
 }
 
 #[tokio::test]
+async fn test_inference_generate_tracks_in_flight_load() {
+    let (mut workers, router, config) = setup_cache_aware_router(vec![MockWorkerConfig {
+        port: 0,
+        worker_type: WorkerType::Regular,
+        health_status: HealthStatus::Healthy,
+        response_delay_ms: 500,
+        fail_rate: 0.0,
+    }])
+    .await;
+
+    let app = create_test_app(router.clone(), Client::new(), &config);
+    let mut requests = Vec::new();
+    for _ in 0..4 {
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/inference/v1/generate")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "model": "mock-model",
+                    "token_ids": [1, 2, 3],
+                    "sampling_params": {"max_tokens": 1},
+                    "stream": false
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        requests.push(tokio::spawn(app.clone().oneshot(request)));
+    }
+
+    tokio::time::timeout(tokio::time::Duration::from_secs(2), async {
+        while get_total_internal_load(&router) != 4 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("all requests should enter cache-aware load tracking");
+    assert_eq!(
+        get_total_internal_load(&router),
+        4,
+        "/inference/v1/generate requests must participate in cache-aware load tracking"
+    );
+
+    for request in requests {
+        let response = request.await.unwrap().unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let _ = response.into_body().collect().await;
+    }
+    assert_eq!(get_total_internal_load(&router), 0);
+
+    for worker in &mut workers {
+        worker.stop().await;
+    }
+}
+
+#[tokio::test]
 async fn test_failed_request_load_returns_to_zero() {
     let (mut workers, router, config) = setup_cache_aware_router(vec![MockWorkerConfig {
         port: 0,

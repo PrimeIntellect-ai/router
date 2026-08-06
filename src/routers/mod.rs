@@ -10,8 +10,8 @@ use axum::{
 use std::fmt::Debug;
 
 use crate::protocols::spec::{
-    ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, RerankRequest,
-    ResponsesRequest,
+    ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest,
+    InferenceGenerateRequest, RerankRequest, ResponsesRequest,
 };
 
 pub mod factory;
@@ -72,6 +72,34 @@ pub trait RouterTrait: Send + Sync + Debug + WorkerManagement {
         model_id: Option<&str>,
         run_id: Option<&str>,
     ) -> Response;
+
+    /// Route a generate request to vLLM's disaggregated `/inference/v1/generate`.
+    async fn route_inference_generate(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &InferenceGenerateRequest,
+        _model_id: Option<&str>,
+        run_id: Option<&str>,
+    ) -> Response {
+        let request_json = match serde_json::to_value(body) {
+            Ok(json) => json,
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Serialization error: {error}"),
+                )
+                    .into_response()
+            }
+        };
+        self.route_transparent(
+            headers,
+            "/inference/v1/generate",
+            &Method::POST,
+            request_json,
+            run_id,
+        )
+        .await
+    }
 
     /// Route a chat completion request
     async fn route_chat(
