@@ -1971,6 +1971,42 @@ impl GenerationRequest for GenerateRequest {
 }
 
 // ==================================================================
+// =   VLLM SPEC - DISAGG /inference/v1/generate API              =
+// ==================================================================
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct InferenceGenerateRequest {
+    pub token_ids: Vec<i32>,
+
+    #[serde(default)]
+    pub stream: bool,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+
+    #[serde(flatten)]
+    pub other: serde_json::Map<String, serde_json::Value>,
+}
+
+impl GenerationRequest for InferenceGenerateRequest {
+    fn is_stream(&self) -> bool {
+        self.stream
+    }
+
+    fn get_model(&self) -> Option<&str> {
+        self.model.as_deref()
+    }
+
+    fn extract_text_for_routing(&self) -> String {
+        self.token_ids
+            .iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<String>>()
+            .join(" ")
+    }
+}
+
+// ==================================================================
 // =            VLLM SPEC - RERANK API                            =
 // ==================================================================
 
@@ -2371,6 +2407,80 @@ pub enum LoRAPath {
 mod tests {
     use super::*;
     use serde_json;
+
+    // ==================================================================
+    // =  InferenceGenerateRequest (/inference/v1/generate) TESTS       =
+    // ==================================================================
+
+    #[test]
+    fn test_inference_generate_routing_key_from_token_ids() {
+        let body = serde_json::json!({
+            "token_ids": [151644, 8948, 198, 2610],
+            "sampling_params": {"max_tokens": 4096, "seed": 42, "logprobs": 1}
+        });
+        let req: InferenceGenerateRequest = serde_json::from_value(body).unwrap();
+        assert_eq!(req.extract_text_for_routing(), "151644 8948 198 2610");
+    }
+
+    #[test]
+    fn test_inference_generate_lossless_passthrough() {
+        let body = serde_json::json!({
+            "token_ids": [1, 2, 3],
+            "model": "qwen3-30b",
+            "sampling_params": {
+                "max_tokens": 4096,
+                "seed": 42,
+                "logprobs": 1,
+                "temperature": 1.0
+            }
+        });
+        let req: InferenceGenerateRequest = serde_json::from_value(body).unwrap();
+        let forwarded: serde_json::Value = serde_json::to_value(&req).unwrap();
+
+        assert_eq!(forwarded["token_ids"], serde_json::json!([1, 2, 3]));
+        assert_eq!(forwarded["sampling_params"]["max_tokens"], 4096);
+        assert_eq!(forwarded["sampling_params"]["seed"], 42);
+        assert_eq!(forwarded["sampling_params"]["logprobs"], 1);
+        assert_eq!(forwarded["sampling_params"]["temperature"], 1.0);
+        assert_eq!(forwarded["model"], "qwen3-30b");
+    }
+
+    #[test]
+    fn test_inference_generate_same_tokens_same_key_regardless_of_sampling() {
+        let make = |seed: i64| -> InferenceGenerateRequest {
+            serde_json::from_value(serde_json::json!({
+                "token_ids": [151644, 8948, 198],
+                "sampling_params": {"seed": seed}
+            }))
+            .unwrap()
+        };
+        assert_eq!(
+            make(1).extract_text_for_routing(),
+            make(2).extract_text_for_routing()
+        );
+    }
+
+    #[test]
+    fn test_inference_generate_is_stream() {
+        let non_stream: InferenceGenerateRequest =
+            serde_json::from_value(serde_json::json!({"token_ids": [1]})).unwrap();
+        assert!(!non_stream.is_stream());
+
+        let stream: InferenceGenerateRequest =
+            serde_json::from_value(serde_json::json!({"token_ids": [1], "stream": true})).unwrap();
+        assert!(stream.is_stream());
+    }
+
+    #[test]
+    fn test_inference_generate_get_model() {
+        let with_model: InferenceGenerateRequest =
+            serde_json::from_value(serde_json::json!({"token_ids": [1], "model": "m"})).unwrap();
+        assert_eq!(with_model.get_model(), Some("m"));
+
+        let without: InferenceGenerateRequest =
+            serde_json::from_value(serde_json::json!({"token_ids": [1]})).unwrap();
+        assert_eq!(without.get_model(), None);
+    }
 
     // ==================================================================
     // =            RERANK REQUEST TESTS                                =

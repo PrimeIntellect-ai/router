@@ -80,6 +80,7 @@ impl MockWorker {
             .route("/get_server_info", get(server_info_handler))
             .route("/get_model_info", get(model_info_handler))
             .route("/generate", post(generate_handler))
+            .route("/inference/v1/generate", post(inference_generate_handler))
             .route("/v1/chat/completions", post(chat_completions_handler))
             .route(
                 "/v1/chat/completions/tokens",
@@ -298,10 +299,27 @@ async fn generate_handler(
     headers: axum::http::HeaderMap,
     Json(payload): Json<serde_json::Value>,
 ) -> Response {
+    generate_response(config, headers, payload, "/generate").await
+}
+
+async fn inference_generate_handler(
+    State(config): State<Arc<RwLock<MockWorkerConfig>>>,
+    headers: axum::http::HeaderMap,
+    Json(payload): Json<serde_json::Value>,
+) -> Response {
+    generate_response(config, headers, payload, "/inference/v1/generate").await
+}
+
+async fn generate_response(
+    config: Arc<RwLock<MockWorkerConfig>>,
+    headers: axum::http::HeaderMap,
+    payload: serde_json::Value,
+    path: &str,
+) -> Response {
     let config = config.read().await;
 
     // Capture request for test inspection
-    capture_request(config.port, "/generate", &headers);
+    capture_request(config.port, path, &headers);
 
     if should_fail(&config).await {
         return (

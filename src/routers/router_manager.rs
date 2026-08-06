@@ -7,8 +7,8 @@
 use crate::config::RouterConfig;
 use crate::core::{CircuitBreakerConfig, Worker, WorkerFactory, WorkerRegistry, WorkerType};
 use crate::protocols::spec::{
-    ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, RerankRequest,
-    ResponsesRequest,
+    ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest,
+    InferenceGenerateRequest, RerankRequest, ResponsesRequest,
 };
 use crate::protocols::worker_spec::{
     ServerInfo, WorkerApiResponse, WorkerConfigRequest, WorkerErrorResponse, WorkerInfo,
@@ -578,6 +578,29 @@ impl RouterTrait for RouterManager {
             router.route_generate(headers, body, None, _run_id).await
         } else {
             // Return 404 when no router is available for the request
+            (
+                StatusCode::NOT_FOUND,
+                "No router available for this request",
+            )
+                .into_response()
+        }
+    }
+
+    async fn route_inference_generate(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &InferenceGenerateRequest,
+        _model_id: Option<&str>,
+        run_id: Option<&str>,
+    ) -> Response {
+        let model_id = body.model.as_deref();
+        let router = self.select_router_for_request(headers, model_id);
+
+        if let Some(router) = router {
+            router
+                .route_inference_generate(headers, body, model_id, run_id)
+                .await
+        } else {
             (
                 StatusCode::NOT_FOUND,
                 "No router available for this request",

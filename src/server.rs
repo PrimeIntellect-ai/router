@@ -10,7 +10,7 @@ use crate::{
     protocols::{
         spec::{
             ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest,
-            RerankRequest, V1RerankReqInput, DEFAULT_MODEL_NAME,
+            InferenceGenerateRequest, RerankRequest, V1RerankReqInput, DEFAULT_MODEL_NAME,
         },
         worker_spec::{WorkerApiResponse, WorkerConfigRequest, WorkerErrorResponse},
     },
@@ -641,6 +641,46 @@ async fn generate(
         .await
 }
 
+async fn inference_generate(
+    State(state): State<Arc<AppState>>,
+    headers: http::HeaderMap,
+    Json(body): Json<InferenceGenerateRequest>,
+) -> Response {
+    let claims = match authorize_request(&state, &headers).await {
+        Ok(c) => c,
+        Err(response) => return response,
+    };
+    if let Some(claims_ref) = claims.as_ref() {
+        if let Some(model) = body.model.as_deref().filter(|model| !model.is_empty()) {
+            if !claims_ref.allows_model(model) {
+                return (
+                    StatusCode::FORBIDDEN,
+                    format!(
+                        "run {} is not authorized to access model {:?}",
+                        claims_ref.run_id, model
+                    ),
+                )
+                    .into_response();
+            }
+        }
+        if let Some(lora_path) = body.other.get("lora_path") {
+            if !lora_path.is_null() {
+                return (
+                    StatusCode::FORBIDDEN,
+                    "lora_path override is not allowed with a run-scoped JWT",
+                )
+                    .into_response();
+            }
+        }
+    }
+    let run_id = run_id_from_claims(&claims);
+
+    state
+        .router
+        .route_inference_generate(Some(&headers), &body, None, run_id.as_deref())
+        .await
+}
+
 async fn v1_chat_completions(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
@@ -1215,6 +1255,7 @@ pub fn build_app_with_request_tracing(
     // Create routes
     let protected_routes = Router::new()
         .route("/generate", post(generate))
+        .route("/inference/v1/generate", post(inference_generate))
         .route("/v1/chat/completions", post(v1_chat_completions))
         .route(
             "/v1/chat/completions/tokens",
