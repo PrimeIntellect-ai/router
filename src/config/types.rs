@@ -33,6 +33,9 @@ pub struct RouterConfig {
     /// API key validation URLs (if set, incoming requests must validate against them)
     #[serde(default)]
     pub api_key_validation_urls: Vec<String>,
+    /// PEM-encoded RSA public key for JWT verification. When set, Bearer tokens
+    /// are verified as RS256 JWTs and run metadata is extracted for metrics.
+    pub jwt_public_key: Option<String>,
     /// Service discovery configuration (optional)
     pub discovery: Option<DiscoveryConfig>,
     /// Metrics configuration (optional)
@@ -458,6 +461,7 @@ impl Default for RouterConfig {
             intra_node_data_parallel_size: 1,
             api_key: None,
             api_key_validation_urls: vec![],
+            jwt_public_key: None,
             discovery: None,
             metrics: None,
             log_dir: None,
@@ -1025,6 +1029,7 @@ mod tests {
             intra_node_data_parallel_size: 1,
             api_key: None,
             api_key_validation_urls: vec![],
+            jwt_public_key: None,
             discovery: Some(DiscoveryConfig {
                 enabled: true,
                 namespace: Some("vllm".to_string()),
@@ -1091,6 +1096,7 @@ mod tests {
             intra_node_data_parallel_size: 1,
             api_key: None,
             api_key_validation_urls: vec![],
+            jwt_public_key: None,
             discovery: Some(DiscoveryConfig {
                 enabled: true,
                 namespace: None,
@@ -1148,6 +1154,7 @@ mod tests {
             intra_node_data_parallel_size: 1,
             api_key: None,
             api_key_validation_urls: vec![],
+            jwt_public_key: None,
             discovery: Some(DiscoveryConfig {
                 enabled: true,
                 namespace: Some("production".to_string()),

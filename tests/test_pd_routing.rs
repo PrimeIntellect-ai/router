@@ -109,6 +109,7 @@ mod test_pd_routing {
                 intra_node_data_parallel_size: 1,
                 api_key: None,
                 api_key_validation_urls: vec![],
+                jwt_public_key: None,
                 discovery: None,
                 metrics: None,
                 log_dir: None,
