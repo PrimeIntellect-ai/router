@@ -209,6 +209,11 @@ impl Router {
         self.worker_registry.get_all_urls()
     }
 
+    /// Get all registered workers (for testing/diagnostics)
+    pub fn get_workers(&self) -> Vec<Arc<dyn Worker>> {
+        self.worker_registry.get_all()
+    }
+
     /// Get worker URLs for a specific model
     pub fn get_worker_urls_for_model(&self, model_id: Option<&str>) -> Vec<String> {
         let workers = match model_id {
@@ -600,13 +605,6 @@ impl Router {
                     false
                 };
 
-                // Keep a clone for potential cleanup on retry
-                let worker_for_cleanup = if load_incremented {
-                    Some(worker.clone())
-                } else {
-                    None
-                };
-
                 let response = self
                     .send_typed_request(
                         headers,
@@ -624,17 +622,12 @@ impl Router {
                 let status = response.status();
                 worker.record_outcome(status.is_success() || status.is_client_error());
 
-                // For retryable failures, we need to decrement load since send_typed_request
-                // won't have done it (it only decrements on success or non-retryable failures)
-                if is_retryable_status(response.status()) && load_incremented {
-                    if let Some(cleanup_worker) = worker_for_cleanup {
-                        cleanup_worker.decrement_load();
-                        RouterMetrics::set_running_requests(
-                            cleanup_worker.url(),
-                            cleanup_worker.load(),
-                        );
-                    }
-                }
+                // Load lifecycle is owned entirely by send_typed_request: it
+                // decrements on every path (success, error, early return, or
+                // when the streaming forwarder finishes). Decrementing here
+                // too caused a double decrement on retryable failures, which
+                // let the load counter drift and concentrated cache-aware
+                // routing onto phantom-loaded workers.
 
                 response
             },
@@ -917,12 +910,15 @@ impl Router {
                     } else {
                         StatusCode::INTERNAL_SERVER_ERROR
                     };
-                    // Decrement load when returning the rewritten 400: the
-                    // caller's retry cleanup only fires for retryable
-                    // statuses, and 400 is not one. Genuine 500s stay
-                    // retryable, so their load is still released by the
-                    // caller's retry cleanup.
-                    if status == StatusCode::BAD_REQUEST && load_incremented {
+                    // Decrement load on this early-return path (both rewritten
+                    // 400s and genuine 500s) — we bypass the normal
+                    // non-streaming cleanup at the bottom of this function,
+                    // and the caller's retry closure no longer decrements
+                    // (removed to avoid double-decrement now that
+                    // send_typed_request owns the load lifecycle). Without
+                    // this, each retry attempt's increment leaks → phantom
+                    // load.
+                    if load_incremented {
                         if let Some(worker) = self.worker_registry.get_by_url(worker_url) {
                             worker.decrement_load();
                             RouterMetrics::set_running_requests(worker_url, worker.load());
@@ -1023,33 +1019,60 @@ impl Router {
                 let mut stream = stream;
                 let mut decremented = false;
                 let mut usage_extractor = stream_run_id.map(usage_metrics::SseUsageExtractor::new);
-                while let Some(chunk) = stream.next().await {
-                    match chunk {
-                        Ok(bytes) => {
-                            // Extract per-run usage from streaming chunks.
-                            // Buffered across chunks because TCP segment
-                            // boundaries can split SSE lines.
-                            if let Some(extractor) = usage_extractor.as_mut() {
-                                extractor.push_chunk(&bytes);
-                            }
-                            // Check for stream end marker
-                            if bytes
-                                .as_ref()
-                                .windows(12)
-                                .any(|window| window == b"data: [DONE]")
-                            {
-                                if let Some(worker) = registry.get_by_url(&worker_url) {
-                                    worker.decrement_load();
-                                    RouterMetrics::set_running_requests(&worker_url, worker.load());
-                                    decremented = true;
+                loop {
+                    match tokio::time::timeout(std::time::Duration::from_secs(300), stream.next())
+                        .await
+                    {
+                        Ok(Some(chunk)) => {
+                            match chunk {
+                                Ok(bytes) => {
+                                    // Extract per-run usage from streaming chunks.
+                                    // Buffered across chunks because TCP segment
+                                    // boundaries can split SSE lines.
+                                    if let Some(extractor) = usage_extractor.as_mut() {
+                                        extractor.push_chunk(&bytes);
+                                    }
+                                    // Check for stream end marker
+                                    if bytes
+                                        .as_ref()
+                                        .windows(12)
+                                        .any(|window| window == b"data: [DONE]")
+                                    {
+                                        if let Some(worker) = registry.get_by_url(&worker_url) {
+                                            worker.decrement_load();
+                                            RouterMetrics::set_running_requests(
+                                                &worker_url,
+                                                worker.load(),
+                                            );
+                                            decremented = true;
+                                        }
+                                    }
+                                    if tx.send(Ok(bytes)).is_err() {
+                                        break;
+                                    }
+                                }
+                                Err(e) => {
+                                    let _ = tx.send(Err(format!("Stream error: {}", e)));
+                                    break;
                                 }
                             }
-                            if tx.send(Ok(bytes)).is_err() {
-                                break;
-                            }
                         }
-                        Err(e) => {
-                            let _ = tx.send(Err(format!("Stream error: {}", e)));
+                        Ok(None) => {
+                            // Stream ended normally
+                            break;
+                        }
+                        Err(_elapsed) => {
+                            // Upstream stalled — notify client and bail so the
+                            // worker's load slot is released instead of leaking
+                            // for the lifetime of a wedged connection.
+                            tracing::warn!(
+                                "Stream from {} timed out after 300s of inactivity, closing",
+                                worker_url
+                            );
+                            let _ = tx.send(Err(
+                                "stream timeout: upstream worker did not send data for 300 seconds"
+                                    .to_string(),
+                            ));
                             break;
                         }
                     }
