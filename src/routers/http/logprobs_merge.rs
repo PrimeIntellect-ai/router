@@ -60,6 +60,28 @@ pub fn merge_logprobs_in_json(prefill_json: &Value, decode_json: &mut Value) -> 
         }
     }
 
+    // 2b. Merge prompt_token_ids from prefill into decode response (top level).
+    // In disaggregated mode the decode worker does not have prompt token IDs
+    // because prefill happened on a different worker.
+    if let Some(prefill_prompt_token_ids) = prefill_json.get("prompt_token_ids") {
+        if !prefill_prompt_token_ids.is_null() {
+            if let Some(decode_obj) = decode_json.as_object_mut() {
+                decode_obj.insert(
+                    "prompt_token_ids".to_string(),
+                    prefill_prompt_token_ids.clone(),
+                );
+                debug!(
+                    "[LOGPROBS MERGE] Merged prompt_token_ids from prefill: {} tokens",
+                    prefill_prompt_token_ids
+                        .as_array()
+                        .map(|a| a.len())
+                        .unwrap_or(0)
+                );
+                merged = true;
+            }
+        }
+    }
+
     // 3. Try to merge prompt_logprobs in choices (for Completions API)
     // Completions: prompt_logprobs is inside each choice
     if let Some(choices) = decode_json

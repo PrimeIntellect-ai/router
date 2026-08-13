@@ -4,6 +4,7 @@ use super::dp_utils;
 use super::logprobs_merge;
 use super::pd_router::PdRouterBase;
 use super::pd_types::{error_chain, PDRouterError};
+use super::routed_experts_merge;
 use super::usage_metrics;
 use super::vllm_service_discovery::{MoriIOTransferMode, ServiceRegistry, ServiceType};
 use crate::config::KvConnector;
@@ -514,6 +515,83 @@ impl VllmPDRouter {
         request
     }
 
+    fn insert_prefill_prompt_token_ids(decode_json: &mut Value, prefill_prompt_token_ids: &Value) {
+        if let Some(decode_obj) = decode_json.as_object_mut() {
+            decode_obj.insert(
+                "prompt_token_ids".to_string(),
+                prefill_prompt_token_ids.clone(),
+            );
+        }
+    }
+
+    fn merge_routed_experts_for_pd(
+        prefill_response_json: &Value,
+        decode_json: &mut Value,
+    ) -> Result<bool, String> {
+        let merged =
+            routed_experts_merge::merge_routed_experts_in_json(prefill_response_json, decode_json)?;
+        if merged {
+            debug!("Successfully merged routed experts from prefill and decode responses");
+        }
+        Ok(merged)
+    }
+
+    /// Copy prefill-only response metadata (prompt_token_ids, routed_experts)
+    /// into the buffered decode body.
+    ///
+    /// Decode workers re-emit rows for prompt positions they never really
+    /// computed, so routed_experts payloads are stitched: the decode payload's
+    /// first `prompt.seq_len` rows are replaced with the prefill payload.
+    /// If the decode body carries routed_experts but the prefill JSON does not
+    /// (possible in concurrent/WRITE dispatch when a non-JSON prefill body is
+    /// swallowed as None), this fails loud instead of silently returning
+    /// garbage prompt rows — the cheap substring probe below exists to catch
+    /// exactly that case without parsing every response.
+    fn merge_prefill_response_metadata(
+        prefill_response_json: &Value,
+        decode_body: &[u8],
+        is_streaming: bool,
+    ) -> Result<Vec<u8>, String> {
+        let prefill_prompt_token_ids = prefill_response_json
+            .get("prompt_token_ids")
+            .filter(|value| !value.is_null());
+
+        let prefill_has_experts =
+            routed_experts_merge::prefill_has_routed_experts(prefill_response_json);
+        let decode_mentions_experts = std::str::from_utf8(decode_body)
+            .map(|s| s.contains("\"routed_experts\""))
+            .unwrap_or(false);
+
+        if prefill_has_experts || decode_mentions_experts {
+            if is_streaming {
+                return Err(
+                    "P/D routed-experts merge does not support streaming responses".to_string(),
+                );
+            }
+
+            let mut decode_json: Value = serde_json::from_slice(decode_body)
+                .map_err(|e| format!("Failed to parse decode response as JSON: {}", e))?;
+            if let Some(prefill_prompt_token_ids) = prefill_prompt_token_ids {
+                Self::insert_prefill_prompt_token_ids(&mut decode_json, prefill_prompt_token_ids);
+            }
+            Self::merge_routed_experts_for_pd(prefill_response_json, &mut decode_json)
+                .map_err(|e| format!("Failed to merge routed experts: {}", e))?;
+            return serde_json::to_vec(&decode_json)
+                .map_err(|e| format!("Failed to serialize decode response: {}", e));
+        }
+
+        if let Some(prefill_prompt_token_ids) = prefill_prompt_token_ids {
+            if let Ok(mut decode_json) = serde_json::from_slice::<Value>(decode_body) {
+                Self::insert_prefill_prompt_token_ids(&mut decode_json, prefill_prompt_token_ids);
+                return Ok(
+                    serde_json::to_vec(&decode_json).unwrap_or_else(|_| decode_body.to_vec())
+                );
+            }
+        }
+
+        Ok(decode_body.to_vec())
+    }
+
     /// Convert service discovery instances to Worker objects for policy selection
     fn instances_to_workers(instances: &[(String, String)]) -> Vec<Arc<dyn Worker>> {
         instances
@@ -704,6 +782,19 @@ impl VllmPDRouter {
             RouterMetrics::record_pd_decode_error(decode_http);
         }
 
+        // Routed-experts merging requires buffering both responses; refuse
+        // streaming requests up-front rather than silently returning decode's
+        // unmerged (garbage-prompt-rows) payload.
+        if is_streaming
+            && prefill_response_json
+                .map(routed_experts_merge::prefill_has_routed_experts)
+                .unwrap_or(false)
+        {
+            return Err(
+                "P/D routed-experts merge does not support streaming responses".to_string(),
+            );
+        }
+
         if needs_logprobs && !is_streaming {
             debug!("Logprobs requested and non-streaming - merging prefill and decode logprobs");
 
@@ -735,6 +826,11 @@ impl VllmPDRouter {
             } else {
                 warn!("No logprobs were merged (might be expected if logprobs not in response)");
             }
+
+            // Also stitch routed-experts payloads (fails loud if decode
+            // carries routed_experts but the prefill JSON does not).
+            Self::merge_routed_experts_for_pd(prefill_json_ref, &mut decode_json)
+                .map_err(|e| format!("Failed to merge routed experts: {}", e))?;
 
             let merged_body = serde_json::to_vec(&decode_json)
                 .map_err(|e| format!("Failed to serialize merged response: {}", e))?;
@@ -820,7 +916,7 @@ impl VllmPDRouter {
         }
 
         // Non-streaming, no logprobs: read entire body. Drop content-length /
-        // transfer-encoding like the merged branch — later merge steps may
+        // transfer-encoding like the merged branch — the merge below may
         // rewrite this body, and axum recomputes framing either way.
         let decode_headers = decode_response.headers().clone();
         let body = decode_response
@@ -833,6 +929,15 @@ impl VllmPDRouter {
                 usage_metrics::extract_and_record_usage(rid, &body);
             }
         }
+        // Copy prefill-only metadata (prompt_token_ids, routed_experts) into
+        // the decode body; a plain passthrough when neither is present.
+        let body = if status.is_success() {
+            let empty_json = Value::Null;
+            let prefill_json_ref = prefill_response_json.unwrap_or(&empty_json);
+            Self::merge_prefill_response_metadata(prefill_json_ref, &body, is_streaming)?
+        } else {
+            body.to_vec()
+        };
         let mut response_builder = axum::http::Response::builder().status(status);
         for (name, value) in decode_headers.iter() {
             if name != axum::http::header::CONTENT_LENGTH
