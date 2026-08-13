@@ -12,6 +12,7 @@ use crate::protocols::spec::{
 };
 use crate::routers::header_utils;
 use crate::routers::http::dp_utils;
+use crate::routers::http::usage_metrics;
 use crate::routers::{RouterTrait, WorkerManagement};
 use axum::body::to_bytes;
 use axum::{
@@ -775,7 +776,7 @@ impl Router {
         worker_url: &str,
         is_stream: bool,
         load_incremented: bool, // Whether load was incremented for this request
-        _run_id: Option<&str>,  // JWT-derived run id; activated by per-run usage metrics
+        run_id: Option<&str>,   // JWT-derived run id for per-run usage metrics
     ) -> Response {
         let (mut request_builder, extracted_dp_rank, request_url) =
             if self.intra_node_data_parallel_size > 1 {
@@ -885,6 +886,16 @@ impl Router {
 
             let response = match res.bytes().await {
                 Ok(body) => {
+                    // Record per-run billing metrics on success. The request
+                    // counter and the token counters are recorded
+                    // independently, because some upstream responses omit
+                    // the `usage` block entirely.
+                    if let Some(run_id) = run_id {
+                        if status.is_success() {
+                            usage_metrics::record_run_request(run_id);
+                            usage_metrics::extract_and_record_usage(run_id, &body);
+                        }
+                    }
                     let mut response = Response::new(axum::body::Body::from(body));
                     *response.status_mut() = status;
                     *response.headers_mut() = response_headers;
@@ -917,6 +928,19 @@ impl Router {
             // For streaming with load tracking, we need to manually decrement when done
             let registry = Arc::clone(&self.worker_registry);
             let worker_url = worker_url.to_string();
+            // Only record per-run usage on successful responses, matching the
+            // non-streaming path. A non-success status may still carry a body
+            // with a "usage" field that should not be billed.
+            let stream_run_id = if status.is_success() {
+                run_id.map(|s| s.to_string())
+            } else {
+                None
+            };
+            // Count the request once up-front (regardless of whether the
+            // upstream emits a usage block in the stream).
+            if let Some(ref rid) = stream_run_id {
+                usage_metrics::record_run_request(rid);
+            }
 
             // Preserve headers for streaming response
             let mut response_headers = header_utils::preserve_response_headers(res.headers());
@@ -930,9 +954,16 @@ impl Router {
             tokio::spawn(async move {
                 let mut stream = stream;
                 let mut decremented = false;
+                let mut usage_extractor = stream_run_id.map(usage_metrics::SseUsageExtractor::new);
                 while let Some(chunk) = stream.next().await {
                     match chunk {
                         Ok(bytes) => {
+                            // Extract per-run usage from streaming chunks.
+                            // Buffered across chunks because TCP segment
+                            // boundaries can split SSE lines.
+                            if let Some(extractor) = usage_extractor.as_mut() {
+                                extractor.push_chunk(&bytes);
+                            }
                             // Check for stream end marker
                             if bytes
                                 .as_ref()
@@ -972,6 +1003,19 @@ impl Router {
             response
         } else {
             // For requests without load tracking, just stream
+            // Only record per-run usage on successful responses, matching the
+            // non-streaming path.
+            let stream_run_id = if status.is_success() {
+                run_id.map(|s| s.to_string())
+            } else {
+                None
+            };
+            // Count the request once up-front (regardless of whether the
+            // upstream emits a usage block in the stream).
+            if let Some(ref rid) = stream_run_id {
+                usage_metrics::record_run_request(rid);
+            }
+
             // Preserve headers for streaming response
             let mut response_headers = header_utils::preserve_response_headers(res.headers());
             // Ensure we set the correct content-type for SSE
@@ -983,9 +1027,16 @@ impl Router {
             // Spawn task to forward stream
             tokio::spawn(async move {
                 let mut stream = stream;
+                let mut usage_extractor = stream_run_id.map(usage_metrics::SseUsageExtractor::new);
                 while let Some(chunk) = stream.next().await {
                     match chunk {
                         Ok(bytes) => {
+                            // Extract per-run usage from streaming chunks.
+                            // Buffered across chunks because TCP segment
+                            // boundaries can split SSE lines.
+                            if let Some(extractor) = usage_extractor.as_mut() {
+                                extractor.push_chunk(&bytes);
+                            }
                             if tx.send(Ok(bytes)).is_err() {
                                 break;
                             }
@@ -1666,7 +1717,7 @@ impl RouterTrait for Router {
         path: &str,
         method: &Method,
         body: serde_json::Value,
-        _run_id: Option<&str>,
+        run_id: Option<&str>,
     ) -> Response {
         debug!("Transparent proxy: routing {} {} to backend", method, path);
 
@@ -1753,25 +1804,110 @@ impl RouterTrait for Router {
         {
             Ok(response) => {
                 let status = response.status();
-                let headers = response.headers().clone();
+                let resp_headers = response.headers().clone();
+                let is_streaming = resp_headers
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                    .map(|ct| ct.starts_with("text/event-stream"))
+                    .unwrap_or(false);
 
-                // Stream the response body
-                let body = Body::from_stream(response.bytes_stream());
                 let mut response_builder = Response::builder().status(status.as_u16());
-
-                for (name, value) in headers.iter() {
+                for (name, value) in resp_headers.iter() {
                     if name != "transfer-encoding" && name != "content-length" {
                         response_builder = response_builder.header(name, value);
                     }
                 }
 
-                match response_builder.body(body) {
-                    Ok(response) => response,
-                    Err(e) => (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Failed to build response: {}", e),
-                    )
-                        .into_response(),
+                // Per-run attribution paths. Without this, the catch-all
+                // skips usage metrics — notably for vLLM's `/v1/generate`
+                // (renderer rollouts), which has no explicit route on the
+                // router.
+                //
+                // SSE responses must keep streaming chunk-by-chunk so clients
+                // get incremental tokens; we tee usage extraction off the same
+                // stream via SseUsageExtractor (mirrors the streaming branch
+                // of `route_typed_request`).
+                //
+                // Non-SSE responses (e.g. `/v1/generate` JSON) buffer once,
+                // small enough that buffering doesn't hurt and lets us parse
+                // the `usage` block before forwarding.
+                //
+                // Unauthenticated / non-JWT traffic falls through to pure
+                // pass-through, preserving prior behaviour.
+                match (run_id, is_streaming) {
+                    (Some(rid), true) => {
+                        if status.is_success() {
+                            usage_metrics::record_run_request(rid);
+                        }
+                        let stream_run_id = status.is_success().then(|| rid.to_string());
+                        let stream = response.bytes_stream();
+                        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                        tokio::spawn(async move {
+                            let mut stream = stream;
+                            let mut usage_extractor =
+                                stream_run_id.map(usage_metrics::SseUsageExtractor::new);
+                            while let Some(chunk) = stream.next().await {
+                                match chunk {
+                                    Ok(bytes) => {
+                                        if let Some(extractor) = usage_extractor.as_mut() {
+                                            extractor.push_chunk(&bytes);
+                                        }
+                                        if tx.send(Ok(bytes)).is_err() {
+                                            break;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        let _ = tx.send(Err(format!("Stream error: {}", e)));
+                                        break;
+                                    }
+                                }
+                            }
+                        });
+                        let body = Body::from_stream(UnboundedReceiverStream::new(rx));
+                        match response_builder.body(body) {
+                            Ok(response) => response,
+                            Err(e) => (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                format!("Failed to build response: {}", e),
+                            )
+                                .into_response(),
+                        }
+                    }
+                    (Some(rid), false) => {
+                        let body_bytes = match response.bytes().await {
+                            Ok(b) => b,
+                            Err(e) => {
+                                return (
+                                    StatusCode::BAD_GATEWAY,
+                                    format!("Failed to read upstream response: {}", e),
+                                )
+                                    .into_response();
+                            }
+                        };
+                        if status.is_success() {
+                            usage_metrics::record_run_request(rid);
+                            usage_metrics::extract_and_record_usage(rid, &body_bytes);
+                        }
+                        match response_builder.body(Body::from(body_bytes)) {
+                            Ok(response) => response,
+                            Err(e) => (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                format!("Failed to build response: {}", e),
+                            )
+                                .into_response(),
+                        }
+                    }
+                    (None, _) => {
+                        let body = Body::from_stream(response.bytes_stream());
+                        match response_builder.body(body) {
+                            Ok(response) => response,
+                            Err(e) => (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                format!("Failed to build response: {}", e),
+                            )
+                                .into_response(),
+                        }
+                    }
                 }
             }
             Err(e) => (

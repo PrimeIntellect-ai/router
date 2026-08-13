@@ -164,6 +164,22 @@ pub fn init_metrics() {
         "Number of running requests per worker"
     );
 
+    // Token usage metrics (per run, for billing)
+    describe_counter!(
+        "vllm_router_run_prompt_tokens_total",
+        "Total prompt tokens by run ID"
+    );
+    describe_counter!(
+        "vllm_router_run_completion_tokens_total",
+        "Total completion tokens by run ID"
+    );
+    describe_counter!(
+        "vllm_router_run_cached_prompt_tokens_total",
+        "Subset of prompt tokens served from the KV/prefix cache, by run ID. \
+         Always less than or equal to vllm_router_run_prompt_tokens_total for the same run."
+    );
+    describe_counter!("vllm_router_run_requests_total", "Total requests by run ID");
+
     // Tokenizer metrics
     describe_histogram!(
         "vllm_tokenizer_encode_duration_seconds",
@@ -276,6 +292,14 @@ pub fn start_prometheus(config: PrometheusConfig) {
         .expect("failed to set duration bucket")
         .install()
         .expect("failed to install Prometheus metrics exporter");
+    // NOTE: per-run billing counters (`vllm_router_run_*_total`) are
+    // labeled by `run_id` and accumulate one series per RFT run for the
+    // lifetime of the router process. We deliberately do not configure
+    // an `idle_timeout` here: the only timeout the exporter exposes is
+    // a global `MetricKindMask::COUNTER` filter, which would also evict
+    // normal request counters and break `rate()` over long windows. RFT
+    // run volume is low enough that the resulting cardinality growth is
+    // negligible.
 }
 
 pub struct RouterMetrics;
@@ -441,6 +465,39 @@ impl RouterMetrics {
             "worker" => worker.to_string()
         )
         .increment(1);
+    }
+
+    // Per-run token usage metrics (for billing).
+    // Token counters and the request counter are recorded independently:
+    // upstream responses do not always include a `usage` block (especially
+    // streaming), so we still want to count the request even when token
+    // counts are unavailable.
+    //
+    // `cached_prompt_tokens` is the subset of `prompt_tokens` that vLLM
+    // served from its KV/prefix cache (reported via
+    // `usage.prompt_tokens_details.cached_tokens`). It is recorded as a
+    // separate counter rather than subtracted from `prompt_tokens` so the
+    // existing prompt-token billing metric keeps its meaning (total input
+    // tokens) and the cached subset becomes an additive signal the platform
+    // can apply a discount to.
+    pub fn record_run_usage(
+        run_id: &str,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+        cached_prompt_tokens: u64,
+    ) {
+        let labels = [("run_id", run_id.to_string())];
+        counter!("vllm_router_run_prompt_tokens_total", &labels).increment(prompt_tokens);
+        counter!("vllm_router_run_completion_tokens_total", &labels).increment(completion_tokens);
+        if cached_prompt_tokens > 0 {
+            counter!("vllm_router_run_cached_prompt_tokens_total", &labels)
+                .increment(cached_prompt_tokens);
+        }
+    }
+
+    pub fn record_run_request(run_id: &str) {
+        let labels = [("run_id", run_id.to_string())];
+        counter!("vllm_router_run_requests_total", &labels).increment(1);
     }
 
     // Service discovery metrics
