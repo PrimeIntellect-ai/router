@@ -1,0 +1,46 @@
+name: Build and Release Wheel
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+jobs:
+  build-wheel:
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            suffix: amd64
+            manylinux_image: quay.io/pypa/manylinux_2_28_x86_64
+          - runner: image-builder-arm-2204
+            suffix: arm64
+            manylinux_image: quay.io/pypa/manylinux_2_28_aarch64
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build wheel in manylinux container
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}:/workdir" \
+            -w /workdir \
+            ${{ matrix.manylinux_image }} \
+            bash .buildkite/build-wheel.sh
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.suffix }}
+          path: dist/*manylinux*.whl
+
+      - name: Upload wheel to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*manylinux*.whl
