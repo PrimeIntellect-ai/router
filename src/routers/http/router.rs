@@ -1,7 +1,8 @@
 use crate::config::types::RetryConfig;
 use crate::core::{
-    is_retryable_status, BasicWorker, CircuitBreakerConfig, DPAwareWorker, HealthConfig,
-    RetryExecutor, Worker, WorkerRegistry, WorkerType,
+    fetch_models_from_worker, is_retryable_status, strip_dp_rank, BasicWorker,
+    CircuitBreakerConfig, DPAwareWorker, HealthConfig, RetryExecutor, Worker, WorkerRegistry,
+    WorkerType,
 };
 use crate::metrics::RouterMetrics;
 use crate::otel_http::{self, ClientRequestOptions};
@@ -9,6 +10,7 @@ use crate::policies::{LoadBalancingPolicy, PolicyRegistry};
 use crate::protocols::spec::{
     ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, GenerationRequest,
     InferenceGenerateRequest, RerankRequest, RerankResponse, RerankResult, ResponsesRequest,
+    DEFAULT_MODEL_NAME,
 };
 use crate::routers::header_utils;
 use crate::routers::http::dp_utils;
@@ -121,8 +123,16 @@ impl Router {
             success_threshold: ctx.router_config.health_check.success_threshold,
         };
         for url in &worker_urls {
-            // TODO: In IGW mode, fetch model_id from worker's /get_model_info endpoint
-            // For now, create worker without model_id
+            // Fetch model_id from worker's /v1/models endpoint
+            let models = fetch_models_from_worker(strip_dp_rank(url)).await;
+            let mut labels = HashMap::new();
+            if let Some(first_model) = models.first() {
+                labels.insert("model_id".to_string(), first_model.clone());
+                info!("Discovered model '{}' on worker {}", first_model, url);
+            } else {
+                debug!("No model discovered on worker {}, using 'unknown'", url);
+            }
+
             let worker_arc: Arc<dyn Worker> = if dp_size > 1 {
                 let (base_url, dp_rank) = dp_utils::parse_worker_url(url);
                 Arc::new(
@@ -133,16 +143,22 @@ impl Router {
                         WorkerType::Regular,
                     )
                     .with_circuit_breaker_config(core_cb_config.clone())
-                    .with_health_config(health_config.clone()),
+                    .with_health_config(health_config.clone())
+                    .with_labels(labels),
                 )
             } else {
                 Arc::new(
                     BasicWorker::new(url.clone(), WorkerType::Regular)
                         .with_circuit_breaker_config(core_cb_config.clone())
-                        .with_health_config(health_config.clone()),
+                        .with_health_config(health_config.clone())
+                        .with_labels(labels),
                 )
             };
             ctx.worker_registry.register(worker_arc.clone());
+            if !models.is_empty() {
+                ctx.worker_registry
+                    .sync_worker_models(worker_arc.url(), &models);
+            }
 
             // Notify PolicyRegistry about the new worker
             let model_id = worker_arc.model_id();
@@ -527,6 +543,39 @@ impl Router {
         })
     }
 
+    fn normalize_model_id(model_id: Option<&str>) -> Option<&str> {
+        let model = model_id?.trim();
+        (!model.is_empty()).then_some(model)
+    }
+
+    fn body_model_for_route<'a>(route: &str, model_id: Option<&'a str>) -> Option<&'a str> {
+        let model = Self::normalize_model_id(model_id)?;
+        if route == "/v1/rerank" && model == DEFAULT_MODEL_NAME {
+            return None;
+        }
+        Some(model)
+    }
+
+    fn resolve_body_model_filter<'a>(
+        &self,
+        route: &str,
+        model_id: Option<&'a str>,
+        run_id: Option<&str>,
+    ) -> Option<&'a str> {
+        let model = Self::body_model_for_route(route, model_id)?;
+
+        if run_id.is_some() || !self.worker_registry.get_by_model_fast(model).is_empty() {
+            return Some(model);
+        }
+
+        debug!(
+            model_id = %model,
+            route,
+            "body model is not indexed; routing without a model filter"
+        );
+        None
+    }
+
     /// Select worker for a specific model considering circuit breaker state
     fn select_worker_for_model(
         &self,
@@ -574,25 +623,34 @@ impl Router {
         let is_stream = typed_req.is_stream();
         let text = typed_req.extract_text_for_routing();
 
+        // Fall back to the body's `model` field when the caller doesn't pass one, but
+        // only use it as a routing filter when the registry has already indexed that
+        // model. This keeps compatibility for generic upstream model validation while
+        // still preventing known LoRA requests from being sent to workers that have not
+        // loaded the adapter. Run-scoped requests keep the body model as a hard filter.
+        let effective_model_id = Self::normalize_model_id(model_id)
+            .or_else(|| self.resolve_body_model_filter(route, typed_req.get_model(), run_id));
+
         let response = RetryExecutor::execute_response_with_retry(
             &self.retry_config,
             // operation per attempt
             |_: u32| async {
-                let worker = match self.select_worker_for_model(model_id, Some(&text), headers) {
-                    Some(w) => w,
-                    None => {
-                        RouterMetrics::record_request_error(route, "no_available_workers");
-                        return (
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            "No available workers (all circuits open or unhealthy)",
-                        )
-                            .into_response();
-                    }
-                };
+                let worker =
+                    match self.select_worker_for_model(effective_model_id, Some(&text), headers) {
+                        Some(w) => w,
+                        None => {
+                            RouterMetrics::record_request_error(route, "no_available_workers");
+                            return (
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                "No available workers (all circuits open or unhealthy)",
+                            )
+                                .into_response();
+                        }
+                    };
 
                 // Optional load tracking for cache-aware policy
                 // Get the policy for this model to check if it's cache-aware
-                let policy = match model_id {
+                let policy = match effective_model_id {
                     Some(model) => self.policy_registry.get_policy_or_default(model),
                     None => self.policy_registry.get_default_policy(),
                 };
@@ -1172,6 +1230,17 @@ impl Router {
             match client.get(format!("{}/health", worker_url)).send().await {
                 Ok(res) => {
                     if res.status().is_success() {
+                        // Discover models from the worker
+                        let models = fetch_models_from_worker(worker_url).await;
+                        let mut labels = HashMap::new();
+                        if let Some(first_model) = models.first() {
+                            labels.insert("model_id".to_string(), first_model.clone());
+                            info!(
+                                "Discovered model '{}' on worker {}",
+                                first_model, worker_url
+                            );
+                        }
+
                         if self.intra_node_data_parallel_size > 1 {
                             // Expand worker URL into multiple DP-aware URLs based on configured intra_node_data_parallel_size
                             // (e.g., "http://host:8000" → "http://host:8000@0", "@1", etc.)
@@ -1191,7 +1260,6 @@ impl Router {
                                     continue;
                                 }
                                 info!("Added worker: {}", dp_url);
-                                // TODO: In IGW mode, fetch model_id from worker's /get_model_info endpoint
                                 let (base_url, dp_rank) = dp_utils::parse_worker_url(dp_url);
                                 let new_worker = DPAwareWorker::new(
                                     base_url,
@@ -1199,10 +1267,15 @@ impl Router {
                                     self.intra_node_data_parallel_size,
                                     WorkerType::Regular,
                                 )
-                                .with_circuit_breaker_config(self.circuit_breaker_config.clone());
+                                .with_circuit_breaker_config(self.circuit_breaker_config.clone())
+                                .with_labels(labels.clone());
 
                                 let worker_arc: Arc<dyn Worker> = Arc::new(new_worker);
                                 self.worker_registry.register(worker_arc.clone());
+                                if !models.is_empty() {
+                                    self.worker_registry
+                                        .sync_worker_models(worker_arc.url(), &models);
+                                }
 
                                 // Notify PolicyRegistry about the new worker
                                 let model_id = worker_arc.model_id();
@@ -1231,15 +1304,19 @@ impl Router {
                             }
                             info!("Added worker: {}", worker_url);
 
-                            // TODO: In IGW mode, fetch model_id from worker's /get_model_info endpoint
                             let new_worker =
                                 BasicWorker::new(worker_url.to_string(), WorkerType::Regular)
                                     .with_circuit_breaker_config(
                                         self.circuit_breaker_config.clone(),
-                                    );
+                                    )
+                                    .with_labels(labels);
 
                             let worker_arc = Arc::new(new_worker);
                             self.worker_registry.register(worker_arc.clone());
+                            if !models.is_empty() {
+                                self.worker_registry
+                                    .sync_worker_models(worker_arc.url(), &models);
+                            }
 
                             // Notify PolicyRegistry about the new worker
                             let model_id = worker_arc.model_id();
@@ -2264,6 +2341,259 @@ mod tests {
             "Expected distribution across workers, only used: {:?}",
             worker_urls_seen
         );
+    }
+
+    /// Verify select_worker_for_model only picks workers whose model_index
+    /// includes the requested model. This is the safety property the
+    /// `effective_model_id` fallback in route_typed_request depends on: a
+    /// request body that asks for a LoRA adapter must never be dispatched
+    /// to a pod that hasn't loaded it.
+    #[test]
+    fn test_select_worker_filters_to_pods_with_loaded_lora() {
+        let router = create_test_regular_router();
+
+        // Both workers initially serve the base model only (this matches the
+        // state of a freshly-scaled-up vLLM pod before the orchestrator has
+        // pushed the LoRA adapter).
+        router
+            .worker_registry
+            .sync_worker_models("http://worker1:8080", &["base-model".to_string()]);
+        router
+            .worker_registry
+            .sync_worker_models("http://worker2:8080", &["base-model".to_string()]);
+
+        // Simulate orchestrator pushing the LoRA to worker1 only.
+        router.worker_registry.sync_worker_models(
+            "http://worker1:8080",
+            &["base-model".to_string(), "rft-run-1".to_string()],
+        );
+
+        // A request for the LoRA must land on worker1.
+        for _ in 0..20 {
+            let worker = router
+                .select_worker_for_model(Some("rft-run-1"), Some(r#"{"prompt":"x"}"#), None)
+                .expect("a worker is available");
+            assert_eq!(
+                worker.url(),
+                "http://worker1:8080",
+                "LoRA request leaked to a worker without the adapter loaded"
+            );
+        }
+
+        // The base model should still see both workers.
+        let base_workers = router.worker_registry.get_by_model_fast("base-model");
+        assert_eq!(base_workers.len(), 2);
+    }
+
+    #[test]
+    fn test_body_model_filter_only_uses_indexed_models() {
+        let router = create_test_regular_router();
+
+        router.worker_registry.sync_worker_models(
+            "http://worker1:8080",
+            &["base-model".to_string(), "rft-run-1".to_string()],
+        );
+
+        assert_eq!(
+            router.resolve_body_model_filter("/v1/chat/completions", Some("rft-run-1"), None,),
+            Some("rft-run-1")
+        );
+        assert_eq!(
+            router.resolve_body_model_filter("/v1/chat/completions", Some("not-indexed"), None,),
+            None
+        );
+        assert_eq!(
+            router.resolve_body_model_filter(
+                "/v1/chat/completions",
+                Some("not-indexed"),
+                Some("run-123"),
+            ),
+            Some("not-indexed")
+        );
+        assert_eq!(
+            router.resolve_body_model_filter("/v1/rerank", Some(DEFAULT_MODEL_NAME), None),
+            None
+        );
+    }
+
+    async fn start_counting_chat_worker(
+        request_count: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use axum::{routing::post, Json, Router as AxumRouter};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = AxumRouter::new().route(
+            "/v1/chat/completions",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let request_count = request_count.clone();
+                async move {
+                    request_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let model = body
+                        .get("model")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown")
+                        .to_string();
+                    Json(serde_json::json!({
+                        "id": "chatcmpl-test",
+                        "object": "chat.completion",
+                        "created": 0,
+                        "model": model,
+                        "choices": [{
+                            "index": 0,
+                            "message": {
+                                "role": "assistant",
+                                "content": "ok"
+                            },
+                            "finish_reason": "stop"
+                        }],
+                        "usage": {
+                            "prompt_tokens": 1,
+                            "completion_tokens": 1,
+                            "total_tokens": 2
+                        }
+                    }))
+                }
+            }),
+        );
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        (format!("http://{}", addr), handle)
+    }
+
+    async fn start_model_listing_worker(
+        models: Vec<&'static str>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use axum::{routing::get, Json, Router as AxumRouter};
+        use tokio::net::TcpListener;
+
+        let models: Vec<String> = models.into_iter().map(String::from).collect();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = AxumRouter::new()
+            .route("/health", get(|| async { StatusCode::OK }))
+            .route(
+                "/v1/models",
+                get(move || {
+                    let models = models.clone();
+                    async move {
+                        let data: Vec<serde_json::Value> = models
+                            .iter()
+                            .map(|id| serde_json::json!({"id": id, "object": "model"}))
+                            .collect();
+                        Json(serde_json::json!({"object": "list", "data": data}))
+                    }
+                }),
+            );
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        (format!("http://{}", addr), handle)
+    }
+
+    #[tokio::test]
+    async fn test_route_chat_with_body_model_filters_to_loaded_lora_worker() {
+        let base_only_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let lora_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (base_only_url, _base_only_handle) =
+            start_counting_chat_worker(base_only_count.clone()).await;
+        let (lora_url, _lora_handle) = start_counting_chat_worker(lora_count.clone()).await;
+
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        worker_registry.register(Arc::new(BasicWorker::new(
+            base_only_url.clone(),
+            WorkerType::Regular,
+        )));
+        worker_registry.register(Arc::new(BasicWorker::new(
+            lora_url.clone(),
+            WorkerType::Regular,
+        )));
+
+        worker_registry.sync_worker_models(&base_only_url, &["base-model".to_string()]);
+        worker_registry.sync_worker_models(
+            &lora_url,
+            &["base-model".to_string(), "rft-run-1".to_string()],
+        );
+
+        let policy_registry = Arc::new(PolicyRegistry::new(
+            crate::config::types::PolicyConfig::RoundRobin,
+        ));
+        let (_, rx) = tokio::sync::watch::channel(HashMap::new());
+        let router = Router {
+            worker_registry,
+            policy_registry,
+            worker_startup_timeout_secs: 5,
+            worker_startup_check_interval_secs: 1,
+            intra_node_data_parallel_size: 1,
+            api_key: None,
+            client: Client::new(),
+            retry_config: RetryConfig::default(),
+            circuit_breaker_config: CircuitBreakerConfig::default(),
+            _worker_loads: Arc::new(rx),
+            _load_monitor_handle: None,
+        };
+
+        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "rft-run-1",
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .unwrap();
+
+        for _ in 0..6 {
+            let response = router.route_chat(None, &request, None, None).await;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        assert_eq!(
+            base_only_count.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "body model was ignored and the request reached a worker without the LoRA"
+        );
+        assert_eq!(
+            lora_count.load(std::sync::atomic::Ordering::SeqCst),
+            6,
+            "all requests should be routed to the worker indexed for the requested LoRA"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_router_new_indexes_all_discovered_models_immediately() {
+        let (url, _handle) = start_model_listing_worker(vec!["base-model", "rft-run-1"]).await;
+        let config = crate::config::types::RouterConfig {
+            mode: crate::config::types::RoutingMode::Regular {
+                worker_urls: vec![url.clone()],
+            },
+            policy: crate::config::types::PolicyConfig::RoundRobin,
+            worker_startup_timeout_secs: 2,
+            worker_startup_check_interval_secs: 1,
+            ..Default::default()
+        };
+        let ctx = Arc::new(
+            crate::server::AppContext::new(
+                config.clone(),
+                Client::new(),
+                config.max_concurrent_requests,
+                config.rate_limit_tokens_per_second,
+                config.api_key_validation_urls.clone(),
+            )
+            .unwrap(),
+        );
+
+        let router = Router::new(vec![url.clone()], &ctx).await.unwrap();
+
+        let base_workers = router.worker_registry.get_by_model_fast("base-model");
+        let lora_workers = router.worker_registry.get_by_model_fast("rft-run-1");
+        assert_eq!(base_workers.len(), 1);
+        assert_eq!(lora_workers.len(), 1);
+
+        let worker = router
+            .select_worker_for_model(Some("rft-run-1"), Some(r#"{"prompt":"x"}"#), None)
+            .expect("LoRA model should be routable immediately after registration");
+        assert_eq!(worker.url(), url);
     }
 
     #[test]
