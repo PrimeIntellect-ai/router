@@ -543,6 +543,7 @@ impl Router {
         typed_req: &T,
         route: &str,
         model_id: Option<&str>,
+        run_id: Option<&str>,
     ) -> Response {
         let start = Instant::now();
         let is_stream = typed_req.is_stream();
@@ -594,6 +595,7 @@ impl Router {
                         worker.url(),
                         is_stream,
                         load_incremented,
+                        run_id,
                     )
                     .await;
 
@@ -764,6 +766,7 @@ impl Router {
     }
 
     // Send typed request directly without conversion
+    #[allow(clippy::too_many_arguments)]
     async fn send_typed_request<T: serde::Serialize>(
         &self,
         headers: Option<&HeaderMap>,
@@ -772,6 +775,7 @@ impl Router {
         worker_url: &str,
         is_stream: bool,
         load_incremented: bool, // Whether load was incremented for this request
+        _run_id: Option<&str>,  // JWT-derived run id; activated by per-run usage metrics
     ) -> Response {
         let (mut request_builder, extracted_dp_rank, request_url) =
             if self.intra_node_data_parallel_size > 1 {
@@ -1443,8 +1447,9 @@ impl RouterTrait for Router {
         headers: Option<&HeaderMap>,
         body: &GenerateRequest,
         model_id: Option<&str>,
+        run_id: Option<&str>,
     ) -> Response {
-        self.route_typed_request(headers, body, "/generate", model_id)
+        self.route_typed_request(headers, body, "/generate", model_id, run_id)
             .await
     }
 
@@ -1453,8 +1458,9 @@ impl RouterTrait for Router {
         headers: Option<&HeaderMap>,
         body: &InferenceGenerateRequest,
         model_id: Option<&str>,
+        run_id: Option<&str>,
     ) -> Response {
-        self.route_typed_request(headers, body, "/inference/v1/generate", model_id)
+        self.route_typed_request(headers, body, "/inference/v1/generate", model_id, run_id)
             .await
     }
 
@@ -1463,8 +1469,9 @@ impl RouterTrait for Router {
         headers: Option<&HeaderMap>,
         body: &ChatCompletionRequest,
         model_id: Option<&str>,
+        run_id: Option<&str>,
     ) -> Response {
-        self.route_typed_request(headers, body, "/v1/chat/completions", model_id)
+        self.route_typed_request(headers, body, "/v1/chat/completions", model_id, run_id)
             .await
     }
 
@@ -1473,8 +1480,9 @@ impl RouterTrait for Router {
         headers: Option<&HeaderMap>,
         body: &CompletionRequest,
         model_id: Option<&str>,
+        run_id: Option<&str>,
     ) -> Response {
-        self.route_typed_request(headers, body, "/v1/completions", model_id)
+        self.route_typed_request(headers, body, "/v1/completions", model_id, run_id)
             .await
     }
 
@@ -1483,8 +1491,9 @@ impl RouterTrait for Router {
         headers: Option<&HeaderMap>,
         body: &ResponsesRequest,
         model_id: Option<&str>,
+        run_id: Option<&str>,
     ) -> Response {
-        self.route_typed_request(headers, body, "/v1/responses", model_id)
+        self.route_typed_request(headers, body, "/v1/responses", model_id, run_id)
             .await
     }
 
@@ -1507,7 +1516,7 @@ impl RouterTrait for Router {
         // Record embeddings-specific metrics in addition to general request metrics
         let start = Instant::now();
         let res = self
-            .route_typed_request(headers, body, "/v1/embeddings", model_id)
+            .route_typed_request(headers, body, "/v1/embeddings", model_id, None)
             .await;
 
         // Embedding specific metrics
@@ -1532,7 +1541,7 @@ impl RouterTrait for Router {
             return (StatusCode::BAD_REQUEST, e).into_response();
         }
         let response = self
-            .route_typed_request(headers, body, "/v1/rerank", model_id)
+            .route_typed_request(headers, body, "/v1/rerank", model_id, None)
             .await;
         if response.status().is_success() {
             match Self::build_rerank_response(body, response).await {
@@ -1657,6 +1666,7 @@ impl RouterTrait for Router {
         path: &str,
         method: &Method,
         body: serde_json::Value,
+        _run_id: Option<&str>,
     ) -> Response {
         debug!("Transparent proxy: routing {} {} to backend", method, path);
 

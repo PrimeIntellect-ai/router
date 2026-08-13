@@ -554,6 +554,7 @@ impl RouterTrait for RouterManager {
         headers: Option<&HeaderMap>,
         body: &GenerateRequest,
         _model_id: Option<&str>,
+        run_id: Option<&str>,
     ) -> Response {
         // Select router based on headers
         // GenerateRequest doesn't have a model field
@@ -561,7 +562,7 @@ impl RouterTrait for RouterManager {
 
         if let Some(router) = router {
             // In multi-model mode, pass None since GenerateRequest doesn't have model field
-            router.route_generate(headers, body, None).await
+            router.route_generate(headers, body, None, run_id).await
         } else {
             // Return 404 when no router is available for the request
             (
@@ -577,11 +578,14 @@ impl RouterTrait for RouterManager {
         headers: Option<&HeaderMap>,
         body: &InferenceGenerateRequest,
         _model_id: Option<&str>,
+        run_id: Option<&str>,
     ) -> Response {
         let router = self.select_router_for_request(headers, None);
 
         if let Some(router) = router {
-            router.route_inference_generate(headers, body, None).await
+            router
+                .route_inference_generate(headers, body, None, run_id)
+                .await
         } else {
             (
                 StatusCode::NOT_FOUND,
@@ -597,6 +601,7 @@ impl RouterTrait for RouterManager {
         headers: Option<&HeaderMap>,
         body: &ChatCompletionRequest,
         _model_id: Option<&str>,
+        run_id: Option<&str>,
     ) -> Response {
         // Select router based on headers and model.
         // When model is None, select_router_for_request considers all registered
@@ -606,7 +611,7 @@ impl RouterTrait for RouterManager {
         let router = self.select_router_for_request(headers, model_id);
 
         if let Some(router) = router {
-            router.route_chat(headers, body, model_id).await
+            router.route_chat(headers, body, model_id, run_id).await
         } else {
             let msg = match model_id {
                 Some(m) => format!("Model '{}' not found or no router available", m),
@@ -622,6 +627,7 @@ impl RouterTrait for RouterManager {
         headers: Option<&HeaderMap>,
         body: &CompletionRequest,
         _model_id: Option<&str>,
+        run_id: Option<&str>,
     ) -> Response {
         // Select router based on headers and model.
         // When model is None, select_router_for_request considers all registered
@@ -631,7 +637,9 @@ impl RouterTrait for RouterManager {
         let router = self.select_router_for_request(headers, model_id);
 
         if let Some(router) = router {
-            router.route_completion(headers, body, model_id).await
+            router
+                .route_completion(headers, body, model_id, run_id)
+                .await
         } else {
             let msg = match model_id {
                 Some(m) => format!("Model '{}' not found or no router available", m),
@@ -646,6 +654,7 @@ impl RouterTrait for RouterManager {
         _headers: Option<&HeaderMap>,
         _body: &ResponsesRequest,
         _model_id: Option<&str>,
+        _run_id: Option<&str>,
     ) -> Response {
         (
             StatusCode::NOT_IMPLEMENTED,
@@ -805,12 +814,15 @@ impl RouterTrait for RouterManager {
         path: &str,
         method: &Method,
         body: serde_json::Value,
+        run_id: Option<&str>,
     ) -> Response {
         // Select router based on headers (no model info available for transparent proxy)
         let router = self.select_router_for_request(headers, None);
 
         if let Some(router) = router {
-            router.route_transparent(headers, path, method, body).await
+            router
+                .route_transparent(headers, path, method, body, run_id)
+                .await
         } else {
             // Return 404 when no router is available
             (

@@ -142,7 +142,7 @@ async fn transparent_proxy_handler(State(state): State<Arc<AppState>>, req: Requ
     // Route through transparent proxy
     state
         .router
-        .route_transparent(Some(&headers), &path, &method, body_json)
+        .route_transparent(Some(&headers), &path, &method, body_json, None)
         .await
 }
 
@@ -223,7 +223,7 @@ async fn generate(
 
     state
         .router
-        .route_generate(Some(&headers), &body, None)
+        .route_generate(Some(&headers), &body, None, None)
         .await
 }
 
@@ -238,7 +238,7 @@ async fn inference_generate(
 
     state
         .router
-        .route_inference_generate(Some(&headers), &body, None)
+        .route_inference_generate(Some(&headers), &body, None, None)
         .await
 }
 
@@ -251,7 +251,10 @@ async fn v1_chat_completions(
         return response;
     }
 
-    state.router.route_chat(Some(&headers), &body, None).await
+    state
+        .router
+        .route_chat(Some(&headers), &body, None, None)
+        .await
 }
 
 async fn v1_completions(
@@ -265,7 +268,7 @@ async fn v1_completions(
 
     state
         .router
-        .route_completion(Some(&headers), &body, None)
+        .route_completion(Some(&headers), &body, None, None)
         .await
 }
 
@@ -307,7 +310,13 @@ async fn v1_responses(
 
     state
         .router
-        .route_transparent(Some(&headers), "/v1/responses", &http::Method::POST, body)
+        .route_transparent(
+            Some(&headers),
+            "/v1/responses",
+            &http::Method::POST,
+            body,
+            None,
+        )
         .await
 }
 

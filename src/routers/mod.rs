@@ -69,6 +69,7 @@ pub trait RouterTrait: Send + Sync + Debug + WorkerManagement {
         headers: Option<&HeaderMap>,
         body: &GenerateRequest,
         model_id: Option<&str>,
+        run_id: Option<&str>,
     ) -> Response;
 
     /// Route a generate request to vLLM's disaggregated `/inference/v1/generate`.
@@ -77,6 +78,7 @@ pub trait RouterTrait: Send + Sync + Debug + WorkerManagement {
         headers: Option<&HeaderMap>,
         body: &InferenceGenerateRequest,
         model_id: Option<&str>,
+        run_id: Option<&str>,
     ) -> Response;
 
     /// Route a chat completion request
@@ -85,6 +87,7 @@ pub trait RouterTrait: Send + Sync + Debug + WorkerManagement {
         headers: Option<&HeaderMap>,
         body: &ChatCompletionRequest,
         model_id: Option<&str>,
+        run_id: Option<&str>,
     ) -> Response;
 
     /// Route a completion request
@@ -93,6 +96,7 @@ pub trait RouterTrait: Send + Sync + Debug + WorkerManagement {
         headers: Option<&HeaderMap>,
         body: &CompletionRequest,
         model_id: Option<&str>,
+        run_id: Option<&str>,
     ) -> Response;
 
     /// Route a responses request
@@ -101,6 +105,7 @@ pub trait RouterTrait: Send + Sync + Debug + WorkerManagement {
         headers: Option<&HeaderMap>,
         body: &ResponsesRequest,
         model_id: Option<&str>,
+        run_id: Option<&str>,
     ) -> Response;
 
     /// Retrieve a stored/background response by id
@@ -172,12 +177,18 @@ pub trait RouterTrait: Send + Sync + Debug + WorkerManagement {
     /// Route a transparent proxy request (any path/body)
     /// Used for catch-all routing of unmatched paths
     /// Returns the response from the backend or an error response
+    ///
+    /// `run_id` is the JWT-derived run identifier when available. Implementations
+    /// that forward to backends emitting an OpenAI-style `usage` block (e.g.
+    /// vLLM's `/v1/generate`) should record per-run token counters when set —
+    /// otherwise the catch-all path silently skips per-run usage attribution.
     async fn route_transparent(
         &self,
         _headers: Option<&HeaderMap>,
         _path: &str,
         _method: &Method,
         _body: serde_json::Value,
+        _run_id: Option<&str>,
     ) -> Response {
         // Default: not supported - return 404
         (StatusCode::NOT_FOUND, "Not Found").into_response()

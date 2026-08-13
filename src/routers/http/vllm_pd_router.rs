@@ -1796,6 +1796,7 @@ impl RouterTrait for VllmPDRouter {
         headers: Option<&HeaderMap>,
         body: &crate::protocols::spec::GenerateRequest,
         _model_id: Option<&str>,
+        run_id: Option<&str>,
     ) -> Response {
         let request_json = match serde_json::to_value(body) {
             Ok(json) => json,
@@ -1807,7 +1808,7 @@ impl RouterTrait for VllmPDRouter {
                     .into_response()
             }
         };
-        self.route_transparent(headers, "/generate", &Method::POST, request_json)
+        self.route_transparent(headers, "/generate", &Method::POST, request_json, run_id)
             .await
     }
 
@@ -1816,6 +1817,7 @@ impl RouterTrait for VllmPDRouter {
         headers: Option<&HeaderMap>,
         body: &crate::protocols::spec::InferenceGenerateRequest,
         _model_id: Option<&str>,
+        run_id: Option<&str>,
     ) -> Response {
         let request_json = match serde_json::to_value(body) {
             Ok(json) => json,
@@ -1832,6 +1834,7 @@ impl RouterTrait for VllmPDRouter {
             "/inference/v1/generate",
             &Method::POST,
             request_json,
+            run_id,
         )
         .await
     }
@@ -1842,6 +1845,7 @@ impl RouterTrait for VllmPDRouter {
         headers: Option<&HeaderMap>,
         body: &crate::protocols::spec::ChatCompletionRequest,
         _model_id: Option<&str>,
+        _run_id: Option<&str>,
     ) -> Response {
         info!(
             "vLLM route_chat called, use_discovery={}",
@@ -2013,6 +2017,7 @@ impl RouterTrait for VllmPDRouter {
         headers: Option<&HeaderMap>,
         body: &crate::protocols::spec::CompletionRequest,
         _model_id: Option<&str>,
+        _run_id: Option<&str>,
     ) -> Response {
         info!(
             "vLLM route_completion called, use_discovery={}",
@@ -2184,6 +2189,7 @@ impl RouterTrait for VllmPDRouter {
         headers: Option<&HeaderMap>,
         body: &crate::protocols::spec::ResponsesRequest,
         _model_id: Option<&str>,
+        run_id: Option<&str>,
     ) -> Response {
         let request_json = match serde_json::to_value(body) {
             Ok(json) => json,
@@ -2195,8 +2201,14 @@ impl RouterTrait for VllmPDRouter {
                     .into_response()
             }
         };
-        self.route_transparent(headers, "/v1/responses", &Method::POST, request_json)
-            .await
+        self.route_transparent(
+            headers,
+            "/v1/responses",
+            &Method::POST,
+            request_json,
+            run_id,
+        )
+        .await
     }
 
     async fn get_response(&self, headers: Option<&HeaderMap>, response_id: &str) -> Response {
@@ -2234,7 +2246,7 @@ impl RouterTrait for VllmPDRouter {
                     .into_response()
             }
         };
-        self.route_transparent(headers, "/v1/rerank", &Method::POST, request_json)
+        self.route_transparent(headers, "/v1/rerank", &Method::POST, request_json, None)
             .await
     }
 
@@ -2262,6 +2274,7 @@ impl RouterTrait for VllmPDRouter {
         path: &str,
         method: &Method,
         body: serde_json::Value,
+        _run_id: Option<&str>,
     ) -> Response {
         // Only handle POST requests for inference
         if *method != Method::POST {
