@@ -989,6 +989,15 @@ impl Router {
                     return response;
                 }
                 Err(e) => {
+                    // Same lifecycle rule as the Ok branch: this early return
+                    // bypasses the cleanup at the bottom of the function and
+                    // nobody else decrements.
+                    if load_incremented {
+                        if let Some(worker) = self.worker_registry.get_by_url(worker_url) {
+                            worker.decrement_load();
+                            RouterMetrics::set_running_requests(worker_url, worker.load());
+                        }
+                    }
                     tracing::error!(
                         "Failed to read 500 response body from worker_url={}: {}",
                         worker_url,
