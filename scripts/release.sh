@@ -25,11 +25,15 @@ rm -f pyproject.toml.bak
 sed -i.bak "s/^version = \".*\"/version = \"$VERSION\"/" Cargo.toml
 rm -f Cargo.toml.bak
 
+# Bump runtime __version__ (import vllm_router; vllm_router.__version__)
+sed -i.bak "s/^__version__ = \".*\"/__version__ = \"$VERSION\"/" py_src/vllm_router/version.py
+rm -f py_src/vllm_router/version.py.bak
+
 # Update Cargo.lock to reflect the new version
 cargo check --quiet 2>/dev/null
 
 # Commit, tag, push
-git add pyproject.toml Cargo.toml Cargo.lock
+git add pyproject.toml Cargo.toml Cargo.lock py_src/vllm_router/version.py
 git commit -m "release: v${VERSION}"
 git tag "v${VERSION}"
 git push origin main "v${VERSION}"
