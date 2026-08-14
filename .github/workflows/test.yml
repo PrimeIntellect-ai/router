@@ -14,8 +14,6 @@ jobs:
 
       - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: clippy, rustfmt
 
       - uses: Swatinem/rust-cache@v2
 
@@ -25,8 +23,13 @@ jobs:
       - name: Run tests
         run: cargo test
 
+      # Lints run on a pinned stable toolchain (same pin as upstream's
+      # Buildkite) so new nightly lints can't break CI.
+      - name: Install Rust 1.95.0 for lints
+        run: rustup toolchain install 1.95.0 --profile minimal --component clippy,rustfmt --no-self-update
+
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo +1.95.0 clippy --all-targets -- -D warnings
 
       - name: Format check
-        run: cargo fmt --check
+        run: cargo +1.95.0 fmt --check
