@@ -61,6 +61,7 @@ fn is_vllm_input_validation_error(body: &[u8]) -> bool {
         "exceeds the model's maximum context length",
         "Please reduce the length of the input prompt",
         "This model's maximum context length is",
+        "is longer than the maximum model length",
     ];
 
     if let Ok(text) = std::str::from_utf8(body) {
@@ -2096,6 +2097,10 @@ mod tests {
     fn test_is_vllm_input_validation_error() {
         // Prompt too long error from vLLM
         let body = br#"{"error":{"message":"The prompt is 65537 tokens, which exceeds the model's maximum context length of 65536 tokens. Please reduce the length of the input prompt.","type":"Internal Server Error","param":null,"code":500}}"#;
+        assert!(is_vllm_input_validation_error(body));
+
+        // vLLM 0.26+ wording (tokens-in path)
+        let body = br#"{"error":{"message":"The decoder prompt (length 3000) is longer than the maximum model length of 2048. Make sure that `max_model_len` is no smaller than the number of text tokens.","type":"BadRequestError","code":400}}"#;
         assert!(is_vllm_input_validation_error(body));
 
         // Actual server error should not match
