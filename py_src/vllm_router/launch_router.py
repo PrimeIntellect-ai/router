@@ -74,20 +74,20 @@ Examples:
   vllm-router --worker-urls http://worker1:8000 http://worker2:8000
 
   # PD disaggregated mode with same policy for both
-  vllm-router --pd-disaggregation \\
+  vllm-router --vllm-pd-disaggregation \\
     --prefill http://prefill1:8000 9000 --prefill http://prefill2:8000 \\
     --decode http://decode1:8001 --decode http://decode2:8001 \\
     --policy cache_aware
 
   # PD mode with optional bootstrap ports
-  vllm-router --pd-disaggregation \\
+  vllm-router --vllm-pd-disaggregation \\
     --prefill http://prefill1:8000 9000 \\    # With bootstrap port
     --prefill http://prefill2:8000 none \\    # Explicitly no bootstrap port
     --prefill http://prefill3:8000 \\         # Defaults to no bootstrap port
     --decode http://decode1:8001 --decode http://decode2:8001
 
   # PD mode with different policies for prefill and decode
-  vllm-router --pd-disaggregation \\
+  vllm-router --vllm-pd-disaggregation \\
     --prefill http://prefill1:8000 --prefill http://prefill2:8000 \\
     --decode http://decode1:8001 --decode http://decode2:8001 \\
     --prefill-policy cache_aware --decode-policy power_of_two

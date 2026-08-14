@@ -47,7 +47,7 @@
 
 ### Configuration
 ```yaml
---pd-disaggregation
+--vllm-pd-disaggregation
 --intra-node-data-parallel-size 1
 --policy consistent_hash
 --host 0.0.0.0

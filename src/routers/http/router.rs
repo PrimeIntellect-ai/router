@@ -9,7 +9,8 @@ use crate::otel_http::{self, ClientRequestOptions};
 use crate::policies::{LoadBalancingPolicy, PolicyRegistry};
 use crate::protocols::spec::{
     ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, GenerationRequest,
-    RerankRequest, RerankResponse, RerankResult, ResponsesRequest, DEFAULT_MODEL_NAME,
+    InferenceGenerateRequest, RerankRequest, RerankResponse, RerankResult, ResponsesRequest,
+    DEFAULT_MODEL_NAME,
 };
 use crate::routers::header_utils;
 use crate::routers::http::dp_utils;
@@ -60,6 +61,7 @@ fn is_vllm_input_validation_error(body: &[u8]) -> bool {
         "exceeds the model's maximum context length",
         "Please reduce the length of the input prompt",
         "This model's maximum context length is",
+        "is longer than the maximum model length",
     ];
 
     if let Ok(text) = std::str::from_utf8(body) {
@@ -621,36 +623,31 @@ impl Router {
         let start = Instant::now();
         let is_stream = typed_req.is_stream();
         let text = typed_req.extract_text_for_routing();
-        let run_id = run_id.map(|s| s.to_string());
 
         // Fall back to the body's `model` field when the caller doesn't pass one, but
         // only use it as a routing filter when the registry has already indexed that
         // model. This keeps compatibility for generic upstream model validation while
         // still preventing known LoRA requests from being sent to workers that have not
         // loaded the adapter. Run-scoped requests keep the body model as a hard filter.
-        let effective_model_id = Self::normalize_model_id(model_id).or_else(|| {
-            self.resolve_body_model_filter(route, typed_req.get_model(), run_id.as_deref())
-        });
+        let effective_model_id = Self::normalize_model_id(model_id)
+            .or_else(|| self.resolve_body_model_filter(route, typed_req.get_model(), run_id));
 
         let response = RetryExecutor::execute_response_with_retry(
             &self.retry_config,
             // operation per attempt
             |_: u32| async {
-                let worker = match self.select_worker_for_model(
-                    effective_model_id,
-                    Some(&text),
-                    headers,
-                ) {
-                    Some(w) => w,
-                    None => {
-                        RouterMetrics::record_request_error(route, "no_available_workers");
-                        return (
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            "No available workers (all circuits open or unhealthy)",
-                        )
-                            .into_response();
-                    }
-                };
+                let worker =
+                    match self.select_worker_for_model(effective_model_id, Some(&text), headers) {
+                        Some(w) => w,
+                        None => {
+                            RouterMetrics::record_request_error(route, "no_available_workers");
+                            return (
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                "No available workers (all circuits open or unhealthy)",
+                            )
+                                .into_response();
+                        }
+                    };
 
                 // Optional load tracking for cache-aware policy
                 // Get the policy for this model to check if it's cache-aware
@@ -675,14 +672,21 @@ impl Router {
                         worker.url(),
                         is_stream,
                         load_incremented,
-                        run_id.as_deref(),
+                        run_id,
                     )
                     .await;
 
                 // Client errors (4xx) are not worker failures - only server errors (5xx)
-                // should count against the circuit breaker. This matches pd_router.rs behavior.
+                // should count against the circuit breaker.
                 let status = response.status();
                 worker.record_outcome(status.is_success() || status.is_client_error());
+
+                // Load lifecycle is owned entirely by send_typed_request: it
+                // decrements on every path (success, error, early return, or
+                // when the streaming forwarder finishes). Decrementing here
+                // too caused a double decrement on retryable failures, which
+                // let the load counter drift and concentrated cache-aware
+                // routing onto phantom-loaded workers.
 
                 response
             },
@@ -833,6 +837,8 @@ impl Router {
             .await
     }
 
+    // Send typed request directly without conversion
+    #[allow(clippy::too_many_arguments)]
     async fn send_typed_request<T: serde::Serialize>(
         &self,
         headers: Option<&HeaderMap>,
@@ -841,7 +847,7 @@ impl Router {
         worker_url: &str,
         is_stream: bool,
         load_incremented: bool, // Whether load was incremented for this request
-        run_id: Option<&str>,
+        run_id: Option<&str>,   // JWT-derived run id for per-run usage metrics
     ) -> Response {
         let (mut request_builder, extracted_dp_rank, request_url) =
             if self.intra_node_data_parallel_size > 1 {
@@ -967,9 +973,10 @@ impl Router {
                     // 400s and genuine 500s) — we bypass the normal
                     // non-streaming cleanup at the bottom of this function,
                     // and the caller's retry closure no longer decrements
-                    // (#23 removed that to avoid double-decrement once
-                    // send_typed_request owned the lifecycle). Without this,
-                    // each retry attempt's increment leaks → phantom load.
+                    // (removed to avoid double-decrement now that
+                    // send_typed_request owns the load lifecycle). Without
+                    // this, each retry attempt's increment leaks → phantom
+                    // load.
                     if load_incremented {
                         if let Some(worker) = self.worker_registry.get_by_url(worker_url) {
                             worker.decrement_load();
@@ -982,9 +989,19 @@ impl Router {
                     return response;
                 }
                 Err(e) => {
+                    // Same lifecycle rule as the Ok branch: this early return
+                    // bypasses the cleanup at the bottom of the function and
+                    // nobody else decrements.
+                    if load_incremented {
+                        if let Some(worker) = self.worker_registry.get_by_url(worker_url) {
+                            worker.decrement_load();
+                            RouterMetrics::set_running_requests(worker_url, worker.load());
+                        }
+                    }
                     tracing::error!(
                         "Failed to read 500 response body from worker_url={}: {}",
-                        worker_url, e
+                        worker_url,
+                        e
                     );
                     return (
                         StatusCode::INTERNAL_SERVER_ERROR,
@@ -1069,13 +1086,11 @@ impl Router {
             tokio::spawn(async move {
                 let mut stream = stream;
                 let mut decremented = false;
-                let mut usage_extractor =
-                    stream_run_id.map(usage_metrics::SseUsageExtractor::new);
+                let mut usage_extractor = stream_run_id.map(usage_metrics::SseUsageExtractor::new);
                 loop {
-                    match tokio::time::timeout(
-                        std::time::Duration::from_secs(300),
-                        stream.next(),
-                    ).await {
+                    match tokio::time::timeout(std::time::Duration::from_secs(300), stream.next())
+                        .await
+                    {
                         Ok(Some(chunk)) => {
                             match chunk {
                                 Ok(bytes) => {
@@ -1093,7 +1108,10 @@ impl Router {
                                     {
                                         if let Some(worker) = registry.get_by_url(&worker_url) {
                                             worker.decrement_load();
-                                            RouterMetrics::set_running_requests(&worker_url, worker.load());
+                                            RouterMetrics::set_running_requests(
+                                                &worker_url,
+                                                worker.load(),
+                                            );
                                             decremented = true;
                                         }
                                     }
@@ -1112,13 +1130,16 @@ impl Router {
                             break;
                         }
                         Err(_elapsed) => {
-                            // Upstream stalled for 60s — notify client and bail
+                            // Upstream stalled — notify client and bail so the
+                            // worker's load slot is released instead of leaking
+                            // for the lifetime of a wedged connection.
                             tracing::warn!(
                                 "Stream from {} timed out after 300s of inactivity, closing",
                                 worker_url
                             );
                             let _ = tx.send(Err(
-                                "stream timeout: upstream worker did not send data for 300 seconds".to_string()
+                                "stream timeout: upstream worker did not send data for 300 seconds"
+                                    .to_string(),
                             ));
                             break;
                         }
@@ -1165,8 +1186,7 @@ impl Router {
             // Spawn task to forward stream
             tokio::spawn(async move {
                 let mut stream = stream;
-                let mut usage_extractor =
-                    stream_run_id.map(usage_metrics::SseUsageExtractor::new);
+                let mut usage_extractor = stream_run_id.map(usage_metrics::SseUsageExtractor::new);
                 while let Some(chunk) = stream.next().await {
                     match chunk {
                         Ok(bytes) => {
@@ -1225,7 +1245,10 @@ impl Router {
                         let mut labels = HashMap::new();
                         if let Some(first_model) = models.first() {
                             labels.insert("model_id".to_string(), first_model.clone());
-                            info!("Discovered model '{}' on worker {}", first_model, worker_url);
+                            info!(
+                                "Discovered model '{}' on worker {}",
+                                first_model, worker_url
+                            );
                         }
 
                         if self.intra_node_data_parallel_size > 1 {
@@ -1659,6 +1682,17 @@ impl RouterTrait for Router {
             .await
     }
 
+    async fn route_inference_generate(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &InferenceGenerateRequest,
+        model_id: Option<&str>,
+        run_id: Option<&str>,
+    ) -> Response {
+        self.route_typed_request(headers, body, "/inference/v1/generate", model_id, run_id)
+            .await
+    }
+
     async fn route_chat(
         &self,
         headers: Option<&HeaderMap>,
@@ -1667,17 +1701,6 @@ impl RouterTrait for Router {
         run_id: Option<&str>,
     ) -> Response {
         self.route_typed_request(headers, body, "/v1/chat/completions", model_id, run_id)
-            .await
-    }
-
-    async fn route_chat_tokens(
-        &self,
-        headers: Option<&HeaderMap>,
-        body: &ChatCompletionRequest,
-        model_id: Option<&str>,
-        run_id: Option<&str>,
-    ) -> Response {
-        self.route_typed_request(headers, body, "/v1/chat/completions/tokens", model_id, run_id)
             .await
     }
 
@@ -1994,14 +2017,13 @@ impl RouterTrait for Router {
                         if status.is_success() {
                             usage_metrics::record_run_request(rid);
                         }
-                        let stream_run_id =
-                            status.is_success().then(|| rid.to_string());
+                        let stream_run_id = status.is_success().then(|| rid.to_string());
                         let stream = response.bytes_stream();
                         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
                         tokio::spawn(async move {
                             let mut stream = stream;
-                            let mut usage_extractor = stream_run_id
-                                .map(usage_metrics::SseUsageExtractor::new);
+                            let mut usage_extractor =
+                                stream_run_id.map(usage_metrics::SseUsageExtractor::new);
                             while let Some(chunk) = stream.next().await {
                                 match chunk {
                                     Ok(bytes) => {
@@ -2080,6 +2102,27 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
+    #[test]
+    fn test_is_vllm_input_validation_error() {
+        // Prompt too long error from vLLM
+        let body = br#"{"error":{"message":"The prompt is 65537 tokens, which exceeds the model's maximum context length of 65536 tokens. Please reduce the length of the input prompt.","type":"Internal Server Error","param":null,"code":500}}"#;
+        assert!(is_vllm_input_validation_error(body));
+
+        // vLLM 0.26+ wording (tokens-in path)
+        let body = br#"{"error":{"message":"The decoder prompt (length 3000) is longer than the maximum model length of 2048. Make sure that `max_model_len` is no smaller than the number of text tokens.","type":"BadRequestError","code":400}}"#;
+        assert!(is_vllm_input_validation_error(body));
+
+        // Actual server error should not match
+        let body = br#"{"error":{"message":"CUDA out of memory","type":"Internal Server Error","param":null,"code":500}}"#;
+        assert!(!is_vllm_input_validation_error(body));
+
+        // Empty body
+        assert!(!is_vllm_input_validation_error(b""));
+
+        // Non-UTF8
+        assert!(!is_vllm_input_validation_error(&[0xFF, 0xFE]));
+    }
+
     fn create_test_regular_router() -> Router {
         // Create registries
         let worker_registry = Arc::new(WorkerRegistry::new());
@@ -2107,23 +2150,6 @@ mod tests {
             _worker_loads: Arc::new(rx),
             _load_monitor_handle: None,
         }
-    }
-
-    #[test]
-    fn test_is_vllm_input_validation_error() {
-        // Prompt too long error from vLLM
-        let body = br#"{"error":{"message":"The prompt is 65537 tokens, which exceeds the model's maximum context length of 65536 tokens. Please reduce the length of the input prompt.","type":"Internal Server Error","param":null,"code":500}}"#;
-        assert!(is_vllm_input_validation_error(body));
-
-        // Actual server error should not match
-        let body = br#"{"error":{"message":"CUDA out of memory","type":"Internal Server Error","param":null,"code":500}}"#;
-        assert!(!is_vllm_input_validation_error(body));
-
-        // Empty body
-        assert!(!is_vllm_input_validation_error(b""));
-
-        // Non-UTF8
-        assert!(!is_vllm_input_validation_error(&[0xFF, 0xFE]));
     }
 
     #[test]
@@ -2383,19 +2409,11 @@ mod tests {
         );
 
         assert_eq!(
-            router.resolve_body_model_filter(
-                "/v1/chat/completions",
-                Some("rft-run-1"),
-                None,
-            ),
+            router.resolve_body_model_filter("/v1/chat/completions", Some("rft-run-1"), None,),
             Some("rft-run-1")
         );
         assert_eq!(
-            router.resolve_body_model_filter(
-                "/v1/chat/completions",
-                Some("not-indexed"),
-                None,
-            ),
+            router.resolve_body_model_filter("/v1/chat/completions", Some("not-indexed"), None,),
             None
         );
         assert_eq!(
@@ -2558,8 +2576,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_router_new_indexes_all_discovered_models_immediately() {
-        let (url, _handle) =
-            start_model_listing_worker(vec!["base-model", "rft-run-1"]).await;
+        let (url, _handle) = start_model_listing_worker(vec!["base-model", "rft-run-1"]).await;
         let config = crate::config::types::RouterConfig {
             mode: crate::config::types::RoutingMode::Regular {
                 worker_urls: vec![url.clone()],
@@ -2595,9 +2612,8 @@ mod tests {
 
     #[test]
     fn test_inline_header_conversion_matches_headers_to_request_headers() {
-        // Verify that the inline header conversion pattern used in pd_router and
-        // vllm_pd_router produces the same result as Router::headers_to_request_headers.
-        // This ensures consistency across all three router implementations.
+        // Verify that the inline header conversion pattern used in vllm_pd_router
+        // produces the same result as Router::headers_to_request_headers.
         let mut header_map = HeaderMap::new();
         header_map.insert("X-Session-Id", HeaderValue::from_static("session-abc"));
         header_map.insert("Content-Type", HeaderValue::from_static("application/json"));
@@ -2606,7 +2622,7 @@ mod tests {
         // Method 1: Router::headers_to_request_headers (used in router.rs)
         let method1 = Router::headers_to_request_headers(Some(&header_map)).unwrap();
 
-        // Method 2: Inline conversion (used in pd_router.rs and vllm_pd_router.rs)
+        // Method 2: Inline conversion (used in vllm_pd_router.rs)
         let method2: HashMap<String, String> = header_map
             .iter()
             .filter_map(|(name, value)| {
@@ -2722,13 +2738,13 @@ mod tests {
         // Verify the delayed worker is genuinely unhealthy right now.
         let client = reqwest::Client::new();
         let resp = client
-            .get(format!("{}/health", &delayed_url))
+            .get(format!("{}/health", delayed_url))
             .send()
             .await
             .unwrap();
         assert_eq!(resp.status().as_u16(), 503);
 
-        // ── Step 1: wait_for_healthy_workers (mirrors PDRouter::new startup) ──
+        // ── Step 1: wait_for_healthy_workers (mirrors PdRouterBase::new startup) ──
         // This succeeds because the healthy worker responds immediately,
         // even though the delayed worker is still returning 503.
         let result =
@@ -2739,7 +2755,7 @@ mod tests {
             "Startup should succeed with at least one healthy worker"
         );
 
-        // ── Step 2: register workers in the registry (mirrors PDRouter::new) ──
+        // ── Step 2: register workers in the registry (mirrors PdRouterBase::new) ──
         let registry = Arc::new(WorkerRegistry::new());
 
         let healthy_worker = Arc::new(
@@ -2774,7 +2790,7 @@ mod tests {
             healthy.len()
         );
 
-        // ── Step 3: start background health checker (mirrors PDRouter::new) ──
+        // ── Step 3: start background health checker (mirrors PdRouterBase::new) ──
         let health_checker = registry.start_health_checker(1);
 
         // ── Step 4: wait for delayed worker to recover ──

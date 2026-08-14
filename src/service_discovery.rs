@@ -383,28 +383,9 @@ async fn handle_pod_event(
 
             // Handle PD mode with specific pod types
             let result = if pd_mode && pod_info.pod_type.is_some() {
-                // Import both PD router types
-                use crate::routers::http::pd_router::PDRouter;
                 use crate::routers::http::vllm_pd_router::VllmPDRouter;
 
-                // Try to downcast to PDRouter first, then VllmPDRouter
-                if let Some(pd_router) = router.as_any().downcast_ref::<PDRouter>() {
-                    match &pod_info.pod_type {
-                        Some(PodType::Prefill) => pd_router
-                            .add_prefill_server(worker_url.clone(), pod_info.bootstrap_port)
-                            .await
-                            .map_err(|e| e.to_string()),
-                        Some(PodType::Decode) => pd_router
-                            .add_decode_server(worker_url.clone())
-                            .await
-                            .map_err(|e| e.to_string()),
-                        Some(PodType::Regular) | None => {
-                            // Fall back to regular add_worker for regular pods
-                            router.add_worker(&worker_url).await
-                        }
-                    }
-                } else if let Some(vllm_pd_router) = router.as_any().downcast_ref::<VllmPDRouter>()
-                {
+                if let Some(vllm_pd_router) = router.as_any().downcast_ref::<VllmPDRouter>() {
                     // Support --vllm-pd-disaggregation mode with K8s service discovery
                     match &pod_info.pod_type {
                         Some(PodType::Prefill) => vllm_pd_router
@@ -421,7 +402,7 @@ async fn handle_pod_event(
                         }
                     }
                 } else {
-                    Err("PD mode enabled but router is not a PDRouter or VllmPDRouter".to_string())
+                    Err("PD mode enabled but router is not a VllmPDRouter".to_string())
                 }
             } else {
                 // Regular mode or no pod type specified
@@ -484,26 +465,9 @@ async fn remove_worker_from_router(
     pd_mode: bool,
 ) {
     if pd_mode && pod_info.pod_type.is_some() {
-        use crate::routers::http::pd_router::PDRouter;
         use crate::routers::http::vllm_pd_router::VllmPDRouter;
 
-        if let Some(pd_router) = router.as_any().downcast_ref::<PDRouter>() {
-            match &pod_info.pod_type {
-                Some(PodType::Prefill) => {
-                    if let Err(e) = pd_router.remove_prefill_server(worker_url).await {
-                        error!("Failed to remove prefill server {}: {}", worker_url, e);
-                    }
-                }
-                Some(PodType::Decode) => {
-                    if let Err(e) = pd_router.remove_decode_server(worker_url).await {
-                        error!("Failed to remove decode server {}: {}", worker_url, e);
-                    }
-                }
-                Some(PodType::Regular) | None => {
-                    router.remove_worker(worker_url);
-                }
-            }
-        } else if let Some(vllm_pd_router) = router.as_any().downcast_ref::<VllmPDRouter>() {
+        if let Some(vllm_pd_router) = router.as_any().downcast_ref::<VllmPDRouter>() {
             match &pod_info.pod_type {
                 Some(PodType::Prefill) => {
                     if let Err(e) = vllm_pd_router.remove_prefill_server(worker_url).await {
@@ -520,9 +484,11 @@ async fn remove_worker_from_router(
                 }
             }
         } else {
+            // PD mode but not a VllmPDRouter, use generic removal
             router.remove_worker(worker_url);
         }
     } else {
+        // Regular mode removal
         router.remove_worker(worker_url);
     }
 }
@@ -671,7 +637,6 @@ mod tests {
             policy_registry: Arc::new(crate::policies::PolicyRegistry::new(
                 router_config.policy.clone(),
             )),
-            tokenizer: None,      // HTTP mode doesn't need tokenizer
             router_manager: None, // Test doesn't need router manager
             response_storage: Arc::new(crate::data_connector::MemoryResponseStorage::new()),
             api_key_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
@@ -1013,10 +978,6 @@ mod tests {
             }
         }
 
-        fn active_workers(&self) -> Vec<String> {
-            self.workers.lock().unwrap().clone()
-        }
-
         fn removed_workers(&self) -> Vec<String> {
             self.removed.lock().unwrap().clone()
         }
@@ -1041,45 +1002,113 @@ mod tests {
 
     #[async_trait::async_trait]
     impl crate::routers::RouterTrait for MockRouter {
-        fn as_any(&self) -> &dyn std::any::Any { self }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
 
-        async fn health(&self, _req: axum::extract::Request<axum::body::Body>) -> axum::response::Response {
+        async fn health(
+            &self,
+            _req: axum::extract::Request<axum::body::Body>,
+        ) -> axum::response::Response {
             axum::http::StatusCode::OK.into_response()
         }
-        async fn health_generate(&self, _req: axum::extract::Request<axum::body::Body>) -> axum::response::Response {
+        async fn health_generate(
+            &self,
+            _req: axum::extract::Request<axum::body::Body>,
+        ) -> axum::response::Response {
             axum::http::StatusCode::OK.into_response()
         }
-        async fn get_server_info(&self, _req: axum::extract::Request<axum::body::Body>) -> axum::response::Response {
+        async fn get_server_info(
+            &self,
+            _req: axum::extract::Request<axum::body::Body>,
+        ) -> axum::response::Response {
             axum::http::StatusCode::OK.into_response()
         }
-        async fn get_models(&self, _req: axum::extract::Request<axum::body::Body>) -> axum::response::Response {
+        async fn get_models(
+            &self,
+            _req: axum::extract::Request<axum::body::Body>,
+        ) -> axum::response::Response {
             axum::http::StatusCode::OK.into_response()
         }
-        async fn get_model_info(&self, _req: axum::extract::Request<axum::body::Body>) -> axum::response::Response {
+        async fn get_model_info(
+            &self,
+            _req: axum::extract::Request<axum::body::Body>,
+        ) -> axum::response::Response {
             axum::http::StatusCode::OK.into_response()
         }
-        async fn route_generate(&self, _h: Option<&axum::http::HeaderMap>, _b: &crate::protocols::spec::GenerateRequest, _m: Option<&str>, _r: Option<&str>) -> axum::response::Response {
+        async fn route_generate(
+            &self,
+            _h: Option<&axum::http::HeaderMap>,
+            _b: &crate::protocols::spec::GenerateRequest,
+            _m: Option<&str>,
+            _r: Option<&str>,
+        ) -> axum::response::Response {
             axum::http::StatusCode::OK.into_response()
         }
-        async fn route_chat(&self, _h: Option<&axum::http::HeaderMap>, _b: &crate::protocols::spec::ChatCompletionRequest, _m: Option<&str>, _r: Option<&str>) -> axum::response::Response {
+        async fn route_inference_generate(
+            &self,
+            _h: Option<&axum::http::HeaderMap>,
+            _b: &crate::protocols::spec::InferenceGenerateRequest,
+            _m: Option<&str>,
+            _r: Option<&str>,
+        ) -> axum::response::Response {
             axum::http::StatusCode::OK.into_response()
         }
-        async fn route_completion(&self, _h: Option<&axum::http::HeaderMap>, _b: &crate::protocols::spec::CompletionRequest, _m: Option<&str>, _r: Option<&str>) -> axum::response::Response {
+        async fn route_chat(
+            &self,
+            _h: Option<&axum::http::HeaderMap>,
+            _b: &crate::protocols::spec::ChatCompletionRequest,
+            _m: Option<&str>,
+            _r: Option<&str>,
+        ) -> axum::response::Response {
             axum::http::StatusCode::OK.into_response()
         }
-        async fn route_responses(&self, _h: Option<&axum::http::HeaderMap>, _b: &crate::protocols::spec::ResponsesRequest, _m: Option<&str>, _r: Option<&str>) -> axum::response::Response {
+        async fn route_completion(
+            &self,
+            _h: Option<&axum::http::HeaderMap>,
+            _b: &crate::protocols::spec::CompletionRequest,
+            _m: Option<&str>,
+            _r: Option<&str>,
+        ) -> axum::response::Response {
             axum::http::StatusCode::OK.into_response()
         }
-        async fn get_response(&self, _h: Option<&axum::http::HeaderMap>, _id: &str) -> axum::response::Response {
+        async fn route_responses(
+            &self,
+            _h: Option<&axum::http::HeaderMap>,
+            _b: &crate::protocols::spec::ResponsesRequest,
+            _m: Option<&str>,
+            _r: Option<&str>,
+        ) -> axum::response::Response {
             axum::http::StatusCode::OK.into_response()
         }
-        async fn cancel_response(&self, _h: Option<&axum::http::HeaderMap>, _id: &str) -> axum::response::Response {
+        async fn get_response(
+            &self,
+            _h: Option<&axum::http::HeaderMap>,
+            _id: &str,
+        ) -> axum::response::Response {
             axum::http::StatusCode::OK.into_response()
         }
-        async fn route_embeddings(&self, _h: Option<&axum::http::HeaderMap>, _b: &crate::protocols::spec::EmbeddingRequest, _m: Option<&str>) -> axum::response::Response {
+        async fn cancel_response(
+            &self,
+            _h: Option<&axum::http::HeaderMap>,
+            _id: &str,
+        ) -> axum::response::Response {
             axum::http::StatusCode::OK.into_response()
         }
-        async fn route_rerank(&self, _h: Option<&axum::http::HeaderMap>, _b: &crate::protocols::spec::RerankRequest, _m: Option<&str>) -> axum::response::Response {
+        async fn route_embeddings(
+            &self,
+            _h: Option<&axum::http::HeaderMap>,
+            _b: &crate::protocols::spec::EmbeddingRequest,
+            _m: Option<&str>,
+        ) -> axum::response::Response {
+            axum::http::StatusCode::OK.into_response()
+        }
+        async fn route_rerank(
+            &self,
+            _h: Option<&axum::http::HeaderMap>,
+            _b: &crate::protocols::spec::RerankRequest,
+            _m: Option<&str>,
+        ) -> axum::response::Response {
             axum::http::StatusCode::OK.into_response()
         }
         async fn flush_cache(&self) -> axum::response::Response {
@@ -1088,7 +1117,9 @@ mod tests {
         async fn get_worker_loads(&self) -> axum::response::Response {
             axum::http::StatusCode::OK.into_response()
         }
-        fn router_type(&self) -> &'static str { "mock" }
+        fn router_type(&self) -> &'static str {
+            "mock"
+        }
         fn readiness(&self) -> axum::response::Response {
             axum::http::StatusCode::OK.into_response()
         }
@@ -1170,7 +1201,14 @@ mod tests {
                 pod_type: None,
                 bootstrap_port: None,
             };
-            handle_pod_event(&pod, Arc::clone(&tracked_pods), Arc::clone(&router), port, false).await;
+            handle_pod_event(
+                &pod,
+                Arc::clone(&tracked_pods),
+                Arc::clone(&router),
+                port,
+                false,
+            )
+            .await;
         }
 
         assert_eq!(router.get_worker_urls().len(), 2);
@@ -1184,7 +1222,14 @@ mod tests {
             pod_type: None,
             bootstrap_port: None,
         };
-        handle_pod_event(&unhealthy, Arc::clone(&tracked_pods), Arc::clone(&router), port, false).await;
+        handle_pod_event(
+            &unhealthy,
+            Arc::clone(&tracked_pods),
+            Arc::clone(&router),
+            port,
+            false,
+        )
+        .await;
 
         // Only pod 2 should remain
         assert_eq!(router.get_worker_urls(), vec!["http://10.0.0.2:8080"]);
@@ -1206,7 +1251,14 @@ mod tests {
             pod_type: None,
             bootstrap_port: None,
         };
-        handle_pod_event(&unhealthy, Arc::clone(&tracked_pods), Arc::clone(&router), port, false).await;
+        handle_pod_event(
+            &unhealthy,
+            Arc::clone(&tracked_pods),
+            Arc::clone(&router),
+            port,
+            false,
+        )
+        .await;
 
         assert!(tracked_pods.lock().unwrap().is_empty());
         assert!(router.get_worker_urls().is_empty());
@@ -1239,13 +1291,34 @@ mod tests {
         };
 
         // healthy → unhealthy → healthy again
-        handle_pod_event(&healthy, Arc::clone(&tracked_pods), Arc::clone(&router), port, false).await;
+        handle_pod_event(
+            &healthy,
+            Arc::clone(&tracked_pods),
+            Arc::clone(&router),
+            port,
+            false,
+        )
+        .await;
         assert_eq!(router.get_worker_urls().len(), 1);
 
-        handle_pod_event(&unhealthy, Arc::clone(&tracked_pods), Arc::clone(&router), port, false).await;
+        handle_pod_event(
+            &unhealthy,
+            Arc::clone(&tracked_pods),
+            Arc::clone(&router),
+            port,
+            false,
+        )
+        .await;
         assert!(router.get_worker_urls().is_empty());
 
-        handle_pod_event(&healthy, Arc::clone(&tracked_pods), Arc::clone(&router), port, false).await;
+        handle_pod_event(
+            &healthy,
+            Arc::clone(&tracked_pods),
+            Arc::clone(&router),
+            port,
+            false,
+        )
+        .await;
         assert_eq!(router.get_worker_urls(), vec!["http://10.0.0.1:8080"]);
     }
 

@@ -5,10 +5,7 @@ use axum::{
     extract::Request,
     http::{header::CONTENT_TYPE, StatusCode},
 };
-use common::mock_worker::{
-    clear_captured_requests, get_captured_requests, HealthStatus, MockWorker, MockWorkerConfig,
-    WorkerType,
-};
+use common::mock_worker::{HealthStatus, MockWorker, MockWorkerConfig, WorkerType};
 use reqwest::Client;
 use serde_json::json;
 use std::sync::Arc;
@@ -61,11 +58,10 @@ impl TestContext {
             health_check: vllm_router_rs::config::HealthCheckConfig::default(),
             enable_igw: false,
             connection_mode: ConnectionMode::Http,
-            model_path: None,
-            tokenizer_path: None,
             history_backend: vllm_router_rs::config::HistoryBackend::Memory,
             enable_profiling: false,
             profile_timeout_secs: 30,
+            kv_connector: vllm_router_rs::config::KvConnector::Nixl,
         };
 
         Self::new_with_config(config, worker_configs).await
@@ -429,54 +425,6 @@ mod generation_tests {
 
         ctx.shutdown().await;
     }
-
-    #[tokio::test]
-    async fn test_v1_chat_completions_tokens_forwards_correct_path() {
-        let port = 18109;
-        let ctx = TestContext::new(vec![MockWorkerConfig {
-            port,
-            worker_type: WorkerType::Regular,
-            health_status: HealthStatus::Healthy,
-            response_delay_ms: 0,
-            fail_rate: 0.0,
-        }])
-        .await;
-
-        let app = ctx.create_app().await;
-        clear_captured_requests(port);
-
-        let payload = json!({
-            "model": "test-model",
-            "messages": [
-                {"role": "user", "content": "Hello!"}
-            ],
-            "stream": false
-        });
-
-        let req = Request::builder()
-            .method("POST")
-            .uri("/v1/chat/completions/tokens")
-            .header(CONTENT_TYPE, "application/json")
-            .body(Body::from(serde_json::to_string(&payload).unwrap()))
-            .unwrap();
-
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        // Verify the backend received /v1/chat/completions/tokens, not /v1/chat/completions
-        let captured = get_captured_requests(port);
-        assert!(
-            !captured.is_empty(),
-            "Mock worker should have received a request"
-        );
-        assert_eq!(
-            captured[0].path, "/v1/chat/completions/tokens",
-            "Request must be forwarded to /v1/chat/completions/tokens, got: {}",
-            captured[0].path
-        );
-
-        ctx.shutdown().await;
-    }
 }
 
 #[cfg(test)]
@@ -513,7 +461,6 @@ mod model_info_tests {
         // Check for actual vllm server fields
         assert!(body_json.get("version").is_some());
         assert!(body_json.get("model_path").is_some());
-        assert!(body_json.get("tokenizer_path").is_some());
         assert!(body_json.get("port").is_some());
         assert!(body_json.get("max_num_batched_tokens").is_some());
         assert!(body_json.get("schedule_policy").is_some());
@@ -552,10 +499,6 @@ mod model_info_tests {
         assert_eq!(
             body_json.get("model_path").and_then(|v| v.as_str()),
             Some("mock-model-path")
-        );
-        assert_eq!(
-            body_json.get("tokenizer_path").and_then(|v| v.as_str()),
-            Some("mock-tokenizer-path")
         );
         assert_eq!(
             body_json.get("is_generation").and_then(|v| v.as_bool()),
@@ -1448,11 +1391,10 @@ mod error_tests {
             health_check: vllm_router_rs::config::HealthCheckConfig::default(),
             enable_igw: false,
             connection_mode: ConnectionMode::Http,
-            model_path: None,
-            tokenizer_path: None,
             history_backend: vllm_router_rs::config::HistoryBackend::Memory,
             enable_profiling: false,
             profile_timeout_secs: 30,
+            kv_connector: vllm_router_rs::config::KvConnector::Nixl,
         };
 
         let ctx = TestContext::new_with_config(
@@ -1777,11 +1719,12 @@ mod pd_mode_tests {
             .unwrap_or(9000);
 
         let config = RouterConfig {
-            mode: RoutingMode::PrefillDecode {
+            mode: RoutingMode::VllmPrefillDecode {
                 prefill_urls: vec![(prefill_url, Some(prefill_port))],
                 decode_urls: vec![decode_url],
                 prefill_policy: None,
                 decode_policy: None,
+                discovery_address: None,
             },
             policy: PolicyConfig::Random,
             host: "127.0.0.1".to_string(),
@@ -1811,11 +1754,10 @@ mod pd_mode_tests {
             health_check: vllm_router_rs::config::HealthCheckConfig::default(),
             enable_igw: false,
             connection_mode: ConnectionMode::Http,
-            model_path: None,
-            tokenizer_path: None,
             history_backend: vllm_router_rs::config::HistoryBackend::Memory,
             enable_profiling: false,
             profile_timeout_secs: 30,
+            kv_connector: vllm_router_rs::config::KvConnector::Nixl,
         };
 
         // Create app context
@@ -1978,11 +1920,10 @@ mod request_id_tests {
             health_check: vllm_router_rs::config::HealthCheckConfig::default(),
             enable_igw: false,
             connection_mode: ConnectionMode::Http,
-            model_path: None,
-            tokenizer_path: None,
             history_backend: vllm_router_rs::config::HistoryBackend::Memory,
             enable_profiling: false,
             profile_timeout_secs: 30,
+            kv_connector: vllm_router_rs::config::KvConnector::Nixl,
         };
 
         let ctx = TestContext::new_with_config(

@@ -125,32 +125,6 @@ pub(crate) fn record_run_request(run_id: &str) {
     RouterMetrics::record_run_request(run_id);
 }
 
-/// Record per-run token usage from a fully-buffered response body.
-///
-/// Some routing paths (notably the vLLM PD two-stage handler) read the
-/// entire upstream response into memory before handing it back to the
-/// client, even when the client requested `stream=true`. In that case
-/// the buffered body is SSE-framed (`data: {...}\n` lines) rather than a
-/// single JSON object, so parsing it as JSON silently drops all token
-/// counts. This helper picks the right parser based on `is_streaming`.
-pub(crate) fn extract_and_record_usage_buffered(
-    run_id: &str,
-    body: &[u8],
-    is_streaming: bool,
-) {
-    if is_streaming {
-        // Feed the whole SSE blob through a single-shot extractor. A
-        // well-formed SSE body ends with a terminator line so every
-        // `data:` event we care about is complete; any trailing partial
-        // line is dropped, matching the behaviour of a real streaming
-        // client that never received it.
-        let mut extractor = SseUsageExtractor::new(run_id.to_string());
-        extractor.push_chunk(body);
-    } else {
-        extract_and_record_usage(run_id, body);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,8 +158,7 @@ mod tests {
 
     #[test]
     fn handles_crlf_line_endings() {
-        let line =
-            b"data: {\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2}}\r\n";
+        let line = b"data: {\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2}}\r\n";
         let mut extractor = SseUsageExtractor::new("run-crlf".to_string());
         extractor.push_chunk(line);
         assert!(extractor.buf.is_empty());
@@ -250,7 +223,8 @@ mod tests {
     fn cached_prompt_tokens_field_can_be_missing_within_details() {
         // Some engines emit prompt_tokens_details for reasoning metadata
         // without populating cached_tokens. Treat the missing field as 0.
-        let body = br#"{"usage":{"prompt_tokens":5,"completion_tokens":1,"prompt_tokens_details":{}}}"#;
+        let body =
+            br#"{"usage":{"prompt_tokens":5,"completion_tokens":1,"prompt_tokens_details":{}}}"#;
         let parsed: UsageOnly = serde_json::from_slice(body).expect("parse usage block");
         let usage = parsed.usage.expect("usage present");
         let cached = usage

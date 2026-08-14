@@ -146,7 +146,7 @@ class TestRouterInitialization:
     def test_router_initialization_pd_mode(self):
         """Test router initialization in PD mode."""
         args = RouterArgs(
-            pd_disaggregation=True,
+            vllm_pd_disaggregation=True,
             prefill_urls=[("http://prefill1:8000", 9000)],
             decode_urls=["http://decode1:8001"],
             policy="power_of_two",
@@ -159,7 +159,7 @@ class TestRouterInitialization:
             def fake_from_args(router_args):
                 captured_args.update(
                     dict(
-                        pd_disaggregation=router_args.pd_disaggregation,
+                        vllm_pd_disaggregation=router_args.vllm_pd_disaggregation,
                         prefill_urls=router_args.prefill_urls,
                         decode_urls=router_args.decode_urls,
                         policy=policy_from_str(router_args.policy),
@@ -173,7 +173,7 @@ class TestRouterInitialization:
 
             # Verify Router.from_args was called with PD parameters
             router_mod.from_args.assert_called_once()
-            assert captured_args["pd_disaggregation"] is True
+            assert captured_args["vllm_pd_disaggregation"] is True
             assert captured_args["prefill_urls"] == [("http://prefill1:8000", 9000)]
             assert captured_args["decode_urls"] == ["http://decode1:8001"]
             assert captured_args["policy"] == PolicyType.PowerOfTwo
@@ -460,7 +460,6 @@ class TestRouterInitialization:
 
     def test_router_initialization_with_tokenizer_config(self):
         """Test router initialization with tokenizer configuration."""
-        # Note: model_path and tokenizer_path are not available in current RouterArgs
         pytest.skip("Tokenizer configuration not available in current implementation")
 
 
@@ -471,7 +470,7 @@ class TestStartupValidation:
         """Test PD mode validation during startup."""
         # PD mode without URLs should fail
         args = RouterArgs(
-            pd_disaggregation=True,
+            vllm_pd_disaggregation=True,
             prefill_urls=[],
             decode_urls=[],
             service_discovery=False,
@@ -485,7 +484,7 @@ class TestStartupValidation:
     def test_pd_mode_with_service_discovery_validation(self):
         """Test PD mode with service discovery validation during startup."""
         args = RouterArgs(
-            pd_disaggregation=True,
+            vllm_pd_disaggregation=True,
             prefill_urls=[],
             decode_urls=[],
             service_discovery=True,
@@ -505,7 +504,7 @@ class TestStartupValidation:
     def test_policy_warning_during_startup(self):
         """Test policy warning during startup in PD mode."""
         args = RouterArgs(
-            pd_disaggregation=True,
+            vllm_pd_disaggregation=True,
             prefill_urls=[("http://prefill1:8000", None)],
             decode_urls=["http://decode1:8001"],
             policy="cache_aware",
@@ -536,7 +535,7 @@ class TestStartupValidation:
         """Test policy info logging during startup in PD mode."""
         # Test with only prefill policy specified
         args = RouterArgs(
-            pd_disaggregation=True,
+            vllm_pd_disaggregation=True,
             prefill_urls=[("http://prefill1:8000", None)],
             decode_urls=["http://decode1:8001"],
             policy="cache_aware",
@@ -564,7 +563,7 @@ class TestStartupValidation:
     def test_policy_info_decode_only_during_startup(self):
         """Test policy info logging during startup with only decode policy specified."""
         args = RouterArgs(
-            pd_disaggregation=True,
+            vllm_pd_disaggregation=True,
             prefill_urls=[("http://prefill1:8000", None)],
             decode_urls=["http://decode1:8001"],
             policy="cache_aware",
@@ -665,7 +664,7 @@ class TestStartupFlow:
     def test_complete_startup_flow_pd_mode(self):
         """Test complete startup flow for PD mode configuration."""
         args = RouterArgs(
-            pd_disaggregation=True,
+            vllm_pd_disaggregation=True,
             prefill_urls=[
                 ("http://prefill1:8000", 9000),
                 ("http://prefill2:8000", None),

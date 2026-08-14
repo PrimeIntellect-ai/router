@@ -178,10 +178,7 @@ pub fn init_metrics() {
         "Subset of prompt tokens served from the KV/prefix cache, by run ID. \
          Always less than or equal to vllm_router_run_prompt_tokens_total for the same run."
     );
-    describe_counter!(
-        "vllm_router_run_requests_total",
-        "Total requests by run ID"
-    );
+    describe_counter!("vllm_router_run_requests_total", "Total requests by run ID");
 
     // Tokenizer metrics
     describe_histogram!(

@@ -57,7 +57,7 @@ class MiniLoadBalancer:
             logger.warning("[MiniLB] Overriding policy to random")
             router_args.policy = "random"
 
-        if not router_args.pd_disaggregation:
+        if not router_args.vllm_pd_disaggregation:
             raise ValueError("MiniLB only supports PD disaggregation mode")
 
         if len(router_args.prefill_urls) == 0 or len(router_args.decode_urls) == 0:

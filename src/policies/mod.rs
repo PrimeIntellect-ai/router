@@ -11,17 +11,21 @@ use std::sync::Arc;
 mod cache_aware;
 mod consistent_hash;
 mod factory;
+mod hash_key;
 mod power_of_two;
 mod random;
 mod registry;
+mod rendezvous_hash;
 mod round_robin;
 
 pub use cache_aware::CacheAwarePolicy;
 pub use consistent_hash::ConsistentHashPolicy;
+pub use consistent_hash::VIRTUAL_NODES_PER_WORKER;
 pub use factory::PolicyFactory;
 pub use power_of_two::PowerOfTwoPolicy;
 pub use random::RandomPolicy;
 pub use registry::PolicyRegistry;
+pub use rendezvous_hash::RendezvousHashPolicy;
 pub use round_robin::RoundRobinPolicy;
 
 /// HTTP headers passed to policies for routing decisions

@@ -1,10 +1,10 @@
 //! Tests for transparent proxy routing with headers and availability filtering.
 //!
-//! These tests verify the fixes to route_transparent() across all three router
-//! implementations (Router, PDRouter, VllmPDRouter):
+//! These tests verify the fixes to route_transparent() across router
+//! implementations (Router, VllmPDRouter):
 //!   1. Headers are passed to select_worker_with_headers() for consistent hash routing
 //!   2. Workers are filtered by is_available() before selection
-//!   3. The inline header conversion pattern (used in pd_router/vllm_pd_router) matches
+//!   3. The inline header conversion pattern (used in vllm_pd_router) matches
 //!      the Router::headers_to_request_headers() output
 
 #[cfg(test)]
@@ -277,7 +277,7 @@ mod transparent_proxy_routing_tests {
     // =====================================================================
     // Test 4: Inline header conversion correctness
     // =====================================================================
-    // pd_router.rs and vllm_pd_router.rs use an inline pattern to convert
+    // vllm_pd_router.rs uses an inline pattern to convert
     // HeaderMap → HashMap<String, String>. Verify it produces correct output.
 
     #[test]
@@ -290,7 +290,7 @@ mod transparent_proxy_routing_tests {
         header_map.insert("X-USER-ID", HeaderValue::from_static("user-456"));
         header_map.insert("content-type", HeaderValue::from_static("application/json"));
 
-        // Simulate the inline pattern from pd_router.rs / vllm_pd_router.rs
+        // Simulate the inline pattern from vllm_pd_router.rs
         let request_headers: Option<HashMap<String, String>> = Some(&header_map).map(|h| {
             h.iter()
                 .filter_map(|(name, value)| {
@@ -319,7 +319,7 @@ mod transparent_proxy_routing_tests {
         let policy = ConsistentHashPolicy::new();
         let workers = create_workers(3);
 
-        // Convert via the inline pattern (as pd_router/vllm_pd_router do)
+        // Convert via the inline pattern (as vllm_pd_router does)
         let mut header_map = HeaderMap::new();
         header_map.insert(
             "x-session-id",

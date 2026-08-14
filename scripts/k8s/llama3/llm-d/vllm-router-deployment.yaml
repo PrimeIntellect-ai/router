@@ -27,7 +27,7 @@ spec:
         image: 584868043064.dkr.ecr.us-west-2.amazonaws.com/dev-vllm-repo:router-dp-fallback
         command:
           - vllm-router
-          - --pd-disaggregation
+          - --vllm-pd-disaggregation
           - --prefill
           - http://ms-llama31-llm-d-modelservice-prefill.llm-d-llama31.svc.cluster.local:8000
           - --decode

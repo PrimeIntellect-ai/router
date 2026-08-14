@@ -185,7 +185,7 @@ vllm-router with P-D disaggregation:
 ```yaml
 command:
   - vllm-router
-  - --pd-disaggregation
+  - --vllm-pd-disaggregation
   - --prefill
   - http://ms-llama31-llm-d-modelservice-prefill.vllm-router-pd-llama31.svc.cluster.local:8000
   - --decode

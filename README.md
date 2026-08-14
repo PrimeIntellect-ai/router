@@ -26,9 +26,6 @@ source $HOME/.cargo/env
 rustc --version
 cargo --version
 
-# Install protobuf compiler (on Ubuntu/Debian)
-sudo apt-get update
-sudo apt-get install -y protobuf-compiler libprotobuf-dev
 ```
 
 **Python with pip installed**
@@ -108,6 +105,22 @@ cargo run --release -- \
     --port 10001 \
     --prefill-policy consistent_hash \
     --decode-policy consistent_hash
+
+# When vLLM runs the Mooncake connector, pass --kv-connector mooncake.
+# The router queries each prefill node's Mooncake bootstrap server at startup
+# to learn engine_id per DP rank, and injects transfer_id / remote_bootstrap_addr /
+# remote_engine_id into each request's kv_transfer_params for P/D coordination.
+cargo run --release -- \
+    --policy consistent_hash \
+    --vllm-pd-disaggregation \
+    --kv-connector mooncake \
+    --prefill http://127.0.0.1:8081 \
+    --prefill http://127.0.0.1:8082 \
+    --decode http://127.0.0.1:8083 \
+    --decode http://127.0.0.1:8084 \
+    --host 127.0.0.1 \
+    --port 8090 \
+    --intra-node-data-parallel-size 1
 ```
 
 ## Configuration

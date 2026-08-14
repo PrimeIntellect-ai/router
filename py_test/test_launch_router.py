@@ -21,6 +21,19 @@ def terminate_process(process: multiprocessing.Process, timeout: float = 1.0) ->
         process.join()
 
 
+def run_router(args):
+    try:
+        from vllm_router.launch_router import launch_router
+
+        router = launch_router(args)
+        if router is None:
+            return 1
+        return 0
+    except Exception as e:
+        print(e)
+        return 1
+
+
 class TestLaunchRouter(unittest.TestCase):
     def setUp(self):
         """Set up default arguments for router tests."""
@@ -49,7 +62,7 @@ class TestLaunchRouter(unittest.TestCase):
             request_timeout_secs=60,
             max_concurrent_requests=64,
             cors_allowed_origins=[],
-            pd_disaggregation=False,
+            vllm_pd_disaggregation=False,
             prefill=None,
             decode=None,
             worker_urls=[],
@@ -64,8 +77,6 @@ class TestLaunchRouter(unittest.TestCase):
             cb_window_duration_secs=60,
             disable_retries=False,
             disable_circuit_breaker=False,
-            model_path=None,
-            tokenizer_path=None,
         )
 
     def create_router_args(self, **kwargs):
@@ -76,20 +87,7 @@ class TestLaunchRouter(unittest.TestCase):
 
     def run_router_process(self, args):
         """Run router in a separate process and verify it starts successfully."""
-
-        def run_router():
-            try:
-                from vllm_router.launch_router import launch_router
-
-                router = launch_router(args)
-                if router is None:
-                    return 1
-                return 0
-            except Exception as e:
-                print(e)
-                return 1
-
-        process = multiprocessing.Process(target=run_router)
+        process = multiprocessing.Process(target=run_router, args=(args,))
         try:
             process.start()
             # Wait 3 seconds
@@ -151,7 +149,7 @@ class TestLaunchRouter(unittest.TestCase):
         # Test RouterArgs parsing for PD mode
         # Simulate the parsed args structure from argparse with action="append"
         args = self.create_router_args(
-            pd_disaggregation=True,
+            vllm_pd_disaggregation=True,
             policy="power_of_two",  # PowerOfTwo is only valid in PD mode
             prefill=[
                 ["http://prefill1:8080", "9000"],
@@ -165,7 +163,7 @@ class TestLaunchRouter(unittest.TestCase):
         )
 
         router_args = RouterArgs.from_cli_args(args)
-        self.assertTrue(router_args.pd_disaggregation)
+        self.assertTrue(router_args.vllm_pd_disaggregation)
         self.assertEqual(router_args.policy, "power_of_two")
         self.assertEqual(len(router_args.prefill_urls), 2)
         self.assertEqual(len(router_args.decode_urls), 2)
@@ -179,7 +177,7 @@ class TestLaunchRouter(unittest.TestCase):
         # Test Router creation in PD mode
         router = Router(
             worker_urls=[],  # Empty for PD mode
-            pd_disaggregation=True,
+            vllm_pd_disaggregation=True,
             prefill_urls=[
                 ("http://prefill1:8080", 9000),
                 ("http://prefill2:8080", None),
@@ -197,7 +195,7 @@ class TestLaunchRouter(unittest.TestCase):
 
         # Test 1: PowerOfTwo requires at least 2 workers
         args = self.create_router_args(
-            pd_disaggregation=False,
+            vllm_pd_disaggregation=False,
             policy="power_of_two",
             worker_urls=["http://localhost:8000"],  # Only 1 worker
         )
@@ -212,7 +210,7 @@ class TestLaunchRouter(unittest.TestCase):
 
         # Test 2: PowerOfTwo with sufficient workers should succeed
         args = self.create_router_args(
-            pd_disaggregation=False,
+            vllm_pd_disaggregation=False,
             policy="power_of_two",
             worker_urls=["http://localhost:8000", "http://localhost:8001"],  # 2 workers
         )
@@ -221,7 +219,7 @@ class TestLaunchRouter(unittest.TestCase):
         # Test 3: All policies now work in both modes
         # Regular mode with RoundRobin
         args = self.create_router_args(
-            pd_disaggregation=False,
+            vllm_pd_disaggregation=False,
             policy="round_robin",
             worker_urls=["http://localhost:8000"],
         )
@@ -229,7 +227,7 @@ class TestLaunchRouter(unittest.TestCase):
 
         # PD mode with RoundRobin (now supported!)
         args = self.create_router_args(
-            pd_disaggregation=True,
+            vllm_pd_disaggregation=True,
             policy="round_robin",
             prefill=[["http://prefill1:8080", "9000"]],
             decode=[["http://decode1:8081"]],
@@ -248,7 +246,7 @@ class TestLaunchRouter(unittest.TestCase):
 
         args = parser.parse_args(
             [
-                "--pd-disaggregation",
+                "--vllm-pd-disaggregation",
                 "--service-discovery",
                 "--prefill-selector",
                 "app=vllm",
@@ -267,7 +265,7 @@ class TestLaunchRouter(unittest.TestCase):
 
         router_args = RouterArgs.from_cli_args(args)
 
-        self.assertTrue(router_args.pd_disaggregation)
+        self.assertTrue(router_args.vllm_pd_disaggregation)
         self.assertTrue(router_args.service_discovery)
         self.assertEqual(
             router_args.prefill_selector, {"app": "vllm", "component": "prefill"}
@@ -302,7 +300,7 @@ class TestLaunchRouter(unittest.TestCase):
 
         router_args = RouterArgs.from_cli_args(args)
 
-        self.assertFalse(router_args.pd_disaggregation)
+        self.assertFalse(router_args.vllm_pd_disaggregation)
         self.assertTrue(router_args.service_discovery)
         self.assertEqual(
             router_args.selector, {"app": "vllm-worker", "environment": "staging"}

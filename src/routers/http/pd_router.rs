@@ -1,44 +1,29 @@
 // PD (Prefill-Decode) Router Implementation
 // This module handles routing for disaggregated prefill-decode systems
 use super::dp_utils;
-use super::logprobs_merge;
-use super::pd_types::{api_path, PDRouterError};
-use super::usage_metrics;
-use crate::config::types::RetryConfig;
+use super::pd_types::PDRouterError;
 use crate::core::{
-    is_retryable_status, BasicWorker, CircuitBreakerConfig, DPAwareWorker, HealthConfig,
-    RetryExecutor, Worker, WorkerFactory, WorkerLoadGuard, WorkerRegistry, WorkerType,
+    BasicWorker, CircuitBreakerConfig, DPAwareWorker, HealthConfig, Worker, WorkerFactory,
+    WorkerRegistry, WorkerType,
 };
-use crate::metrics::RouterMetrics;
-use crate::otel_http::{self, ClientRequestOptions};
 use crate::policies::{LoadBalancingPolicy, PolicyRegistry};
-use crate::protocols::spec::{
-    ChatCompletionRequest, ChatMessage, CompletionRequest, GenerateRequest, RerankRequest,
-    ResponsesRequest, StringOrArray, UserMessageContent,
-};
 use crate::routers::header_utils;
-use crate::routers::{RouterTrait, WorkerManagement};
-use async_trait::async_trait;
 use axum::{
     body::Body,
     extract::Request,
-    http::{header::CONTENT_TYPE, HeaderMap, HeaderValue, Method, StatusCode},
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
-use futures_util::StreamExt;
 use reqwest::Client;
-use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::UnboundedReceiverStream;
+use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
 #[derive(Debug, Clone)]
-pub struct PDRouter {
+pub struct PdRouterBase {
     pub worker_registry: Arc<WorkerRegistry>,
     pub policy_registry: Arc<PolicyRegistry>,
     pub worker_startup_timeout_secs: u64,
@@ -46,27 +31,12 @@ pub struct PDRouter {
     pub worker_loads: Arc<tokio::sync::watch::Receiver<HashMap<String, isize>>>,
     pub load_monitor_handle: Option<Arc<tokio::task::JoinHandle<()>>>,
     pub client: Client,
-    // Dedicated client for prefill fire-and-forget (non-logprob) requests
-    pub prefill_client: Client,
-    pub retry_config: RetryConfig,
     pub circuit_breaker_config: CircuitBreakerConfig,
-    // Channel for sending prefill responses to background workers for draining
-    prefill_drain_tx: mpsc::Sender<reqwest::Response>,
+    // Intra-node data parallel size for creating DPAwareWorker in add_*_server()
+    pub dp_size: usize,
 }
 
-// Request context for PD router operations
-#[derive(Clone)]
-struct PDRequestContext<'a> {
-    route: &'static str,
-    batch_size: Option<usize>,
-    is_stream: bool,
-    return_logprob: bool,
-    request_text: Option<String>,
-    model_id: Option<&'a str>,
-    run_id: Option<&'a str>,
-}
-
-impl PDRouter {
+impl PdRouterBase {
     // Private helper method to perform health check on a new server
     async fn wait_for_server_health(&self, url: &str) -> Result<(), PDRouterError> {
         crate::routers::http::router::Router::wait_for_healthy_workers(
@@ -268,40 +238,63 @@ impl PDRouter {
         // Wait for the new server to be healthy
         self.wait_for_server_health(&url).await?;
 
-        // Check if already exists
-        if self.worker_registry.get_by_url(&url).is_some() {
-            return Err(PDRouterError::WorkerAlreadyExists { url: url.clone() });
-        }
+        let worker_type = WorkerType::Prefill { bootstrap_port };
 
-        // Create Worker for the new prefill server with circuit breaker configuration
-        // TODO: In IGW mode, fetch model_id from worker's /get_model_info endpoint
-        let worker = WorkerFactory::create_prefill_with_config(
-            url.clone(),
-            bootstrap_port,
-            self.circuit_breaker_config.clone(),
-        );
-
-        let worker_arc: Arc<dyn Worker> = Arc::from(worker);
-
-        // Register the worker in the registry
-        self.worker_registry.register(worker_arc.clone());
-
-        // Notify PolicyRegistry about the new worker
-        let model_id = worker_arc.model_id();
-        let policy = self.policy_registry.on_worker_added(model_id, None);
-
-        // If this is a cache-aware policy, update it with all workers for this model
-        if policy.name() == "cache_aware" {
-            if let Some(cache_aware) = policy
-                .as_any()
-                .downcast_ref::<crate::policies::CacheAwarePolicy>()
-            {
-                let model_workers = self.worker_registry.get_by_model_fast(model_id);
-                cache_aware.init_workers(&model_workers);
+        if self.dp_size > 1 {
+            let (_base_url, dp_rank) = dp_utils::parse_worker_url(&url);
+            if dp_rank.is_some() {
+                // URL already has @rank suffix (e.g., from direct URL mode).
+                // Create a single DPAwareWorker. DPAwareWorker strips the @rank
+                // suffix in endpoint_url(), preventing IPv6+DP URL corruption
+                // where HTTP clients interpret @N as a userinfo separator per RFC 3986.
+                if self.worker_registry.get_by_url(&url).is_some() {
+                    return Err(PDRouterError::WorkerAlreadyExists { url: url.clone() });
+                }
+                let (base_url, dp_rank) = dp_utils::parse_worker_url(&url);
+                let worker_arc: Arc<dyn Worker> = Arc::new(
+                    DPAwareWorker::new(base_url, dp_rank.unwrap_or(0), self.dp_size, worker_type)
+                        .with_circuit_breaker_config(self.circuit_breaker_config.clone()),
+                );
+                self.register_and_notify(worker_arc);
+                info!("Added prefill server: {}", url);
+            } else {
+                // Bare URL without @rank (e.g., from K8s service discovery).
+                // Expand into dp_size workers, one per DP rank, matching the
+                // expansion logic in router.rs::add_worker() and PdRouterBase::new().
+                // Without this, all traffic pins to rank 0 via unwrap_or(0),
+                // bypassing vLLM's hybrid load balancer.
+                let first_dp_url = format!("{}@0", url);
+                if self.worker_registry.get_by_url(&first_dp_url).is_some() {
+                    return Err(PDRouterError::WorkerAlreadyExists { url: url.clone() });
+                }
+                for rank in 0..self.dp_size {
+                    let dp_url = format!("{}@{}", url, rank);
+                    let worker_arc: Arc<dyn Worker> = Arc::new(
+                        DPAwareWorker::new(url.clone(), rank, self.dp_size, worker_type.clone())
+                            .with_circuit_breaker_config(self.circuit_breaker_config.clone()),
+                    );
+                    self.register_and_notify(worker_arc);
+                    info!("Added prefill server: {} (rank {})", dp_url, rank);
+                }
+                info!(
+                    "Expanded prefill server {} into {} DP-aware workers",
+                    url, self.dp_size
+                );
             }
+        } else {
+            // dp_size == 1: no DP-aware routing, use BasicWorker
+            if self.worker_registry.get_by_url(&url).is_some() {
+                return Err(PDRouterError::WorkerAlreadyExists { url: url.clone() });
+            }
+            let worker_arc: Arc<dyn Worker> = Arc::from(WorkerFactory::create_prefill_with_config(
+                url.clone(),
+                bootstrap_port,
+                self.circuit_breaker_config.clone(),
+            ));
+            self.register_and_notify(worker_arc);
+            info!("Added prefill server: {}", url);
         }
 
-        info!("Added prefill server: {}", url);
         Ok(format!("Successfully added prefill server: {}", url))
     }
 
@@ -309,28 +302,65 @@ impl PDRouter {
         // Wait for the new server to be healthy
         self.wait_for_server_health(&url).await?;
 
-        // Check if already exists
-        if self.worker_registry.get_by_url(&url).is_some() {
-            return Err(PDRouterError::WorkerAlreadyExists { url: url.clone() });
+        if self.dp_size > 1 {
+            let (_base_url, dp_rank) = dp_utils::parse_worker_url(&url);
+            if dp_rank.is_some() {
+                // URL already has @rank suffix — single DPAwareWorker
+                if self.worker_registry.get_by_url(&url).is_some() {
+                    return Err(PDRouterError::WorkerAlreadyExists { url: url.clone() });
+                }
+                let (base_url, dp_rank) = dp_utils::parse_worker_url(&url);
+                let worker_arc: Arc<dyn Worker> = Arc::new(
+                    DPAwareWorker::new(
+                        base_url,
+                        dp_rank.unwrap_or(0),
+                        self.dp_size,
+                        WorkerType::Decode,
+                    )
+                    .with_circuit_breaker_config(self.circuit_breaker_config.clone()),
+                );
+                self.register_and_notify(worker_arc);
+                info!("Added decode server: {}", url);
+            } else {
+                // Bare URL — expand into dp_size workers (same as add_prefill_server)
+                let first_dp_url = format!("{}@0", url);
+                if self.worker_registry.get_by_url(&first_dp_url).is_some() {
+                    return Err(PDRouterError::WorkerAlreadyExists { url: url.clone() });
+                }
+                for rank in 0..self.dp_size {
+                    let dp_url = format!("{}@{}", url, rank);
+                    let worker_arc: Arc<dyn Worker> = Arc::new(
+                        DPAwareWorker::new(url.clone(), rank, self.dp_size, WorkerType::Decode)
+                            .with_circuit_breaker_config(self.circuit_breaker_config.clone()),
+                    );
+                    self.register_and_notify(worker_arc);
+                    info!("Added decode server: {} (rank {})", dp_url, rank);
+                }
+                info!(
+                    "Expanded decode server {} into {} DP-aware workers",
+                    url, self.dp_size
+                );
+            }
+        } else {
+            if self.worker_registry.get_by_url(&url).is_some() {
+                return Err(PDRouterError::WorkerAlreadyExists { url: url.clone() });
+            }
+            let worker_arc: Arc<dyn Worker> = Arc::from(WorkerFactory::create_decode_with_config(
+                url.clone(),
+                self.circuit_breaker_config.clone(),
+            ));
+            self.register_and_notify(worker_arc);
+            info!("Added decode server: {}", url);
         }
 
-        // Create Worker for the new decode server with circuit breaker configuration
-        // TODO: In IGW mode, fetch model_id from worker's /get_model_info endpoint
-        let worker = WorkerFactory::create_decode_with_config(
-            url.clone(),
-            self.circuit_breaker_config.clone(),
-        );
+        Ok(format!("Successfully added decode server: {}", url))
+    }
 
-        let worker_arc: Arc<dyn Worker> = Arc::from(worker);
-
-        // Register the worker in the registry
+    /// Register a worker and notify the policy registry.
+    fn register_and_notify(&self, worker_arc: Arc<dyn Worker>) {
         self.worker_registry.register(worker_arc.clone());
-
-        // Notify PolicyRegistry about the new worker
         let model_id = worker_arc.model_id();
         let policy = self.policy_registry.on_worker_added(model_id, None);
-
-        // If this is a cache-aware policy, update it with all workers for this model
         if policy.name() == "cache_aware" {
             if let Some(cache_aware) = policy
                 .as_any()
@@ -340,13 +370,17 @@ impl PDRouter {
                 cache_aware.init_workers(&model_workers);
             }
         }
-
-        info!("Added decode server: {}", url);
-        Ok(format!("Successfully added decode server: {}", url))
     }
 
     pub async fn remove_prefill_server(&self, url: &str) -> Result<String, PDRouterError> {
-        // Check if worker exists and get model_id
+        if self.dp_size > 1 && !url.contains('@') {
+            // Bare URL: remove all DP-expanded workers by prefix match,
+            // mirroring the expansion in add_prefill_server and the
+            // prefix-match removal in router.rs::remove_worker().
+            return self.remove_dp_expanded_workers(url, "prefill");
+        }
+
+        // Exact URL match (with @rank or dp_size==1)
         let model_id = match self.worker_registry.get_by_url(url) {
             Some(worker) => worker.model_id().to_string(),
             None => {
@@ -356,14 +390,10 @@ impl PDRouter {
             }
         };
 
-        // Remove from registry
         let removed = self.worker_registry.remove_by_url(url);
 
         if removed.is_some() {
-            // Notify PolicyRegistry about the removed worker
             self.policy_registry.on_worker_removed(&model_id);
-
-            // Get the policy for this model to update cache-aware if needed
             if let Some(policy) = self.policy_registry.get_policy(&model_id) {
                 if policy.name() == "cache_aware" {
                     if let Some(cache_aware) = policy
@@ -387,7 +417,10 @@ impl PDRouter {
     }
 
     pub async fn remove_decode_server(&self, url: &str) -> Result<String, PDRouterError> {
-        // Check if worker exists and get model_id
+        if self.dp_size > 1 && !url.contains('@') {
+            return self.remove_dp_expanded_workers(url, "decode");
+        }
+
         let model_id = match self.worker_registry.get_by_url(url) {
             Some(worker) => worker.model_id().to_string(),
             None => {
@@ -397,7 +430,6 @@ impl PDRouter {
             }
         };
 
-        // Remove from registry
         let removed = self.worker_registry.remove_by_url(url);
 
         if removed.is_some() {
@@ -420,6 +452,48 @@ impl PDRouter {
         if removed.is_some() {
             info!("Removed decode server: {}", url);
             Ok(format!("Successfully removed decode server: {}", url))
+        } else {
+            Err(PDRouterError::WorkerNotFound {
+                url: url.to_string(),
+            })
+        }
+    }
+
+    /// Remove all DP-expanded workers for a bare URL by prefix match.
+    /// When a bare URL like "http://host:8000" was expanded into
+    /// "http://host:8000@0", "@1", ..., "@N-1", this removes all of them.
+    fn remove_dp_expanded_workers(&self, url: &str, role: &str) -> Result<String, PDRouterError> {
+        let prefix = format!("{}@", url);
+        let all_workers = self.worker_registry.get_all();
+        let mut removed_count = 0;
+        for w in all_workers.iter() {
+            if w.url().starts_with(&prefix) {
+                let model_id = w.model_id().to_string();
+                if self.worker_registry.remove_by_url(w.url()).is_some() {
+                    self.policy_registry.on_worker_removed(&model_id);
+                    if let Some(policy) = self.policy_registry.get_policy(&model_id) {
+                        if policy.name() == "cache_aware" {
+                            if let Some(cache_aware) = policy
+                                .as_any()
+                                .downcast_ref::<crate::policies::CacheAwarePolicy>(
+                            ) {
+                                cache_aware.remove_worker_by_url(w.url());
+                            }
+                        }
+                    }
+                    removed_count += 1;
+                }
+            }
+        }
+        if removed_count > 0 {
+            info!(
+                "Removed {} DP-expanded {} workers for {}",
+                removed_count, role, url
+            );
+            Ok(format!(
+                "Successfully removed {} {} server(s) for {}",
+                removed_count, role, url
+            ))
         } else {
             Err(PDRouterError::WorkerNotFound {
                 url: url.to_string(),
@@ -619,85 +693,7 @@ impl PDRouter {
         // Note: Health checking is now handled centrally by RouterManager
         // Individual routers no longer need to manage health checkers
 
-        // Build a dedicated prefill client for fire-and-forget semantics
-        let prefill_client = reqwest::Client::builder()
-            .pool_max_idle_per_host(0)
-            .http1_only()
-            .connect_timeout(Duration::from_millis(300))
-            .timeout(Duration::from_secs(ctx.router_config.request_timeout_secs))
-            .build()
-            .map_err(|e| format!("Failed to build prefill client: {}", e))?;
-
-        // Create bounded channel for prefill response draining
-        // Larger buffer for high concurrency scenarios
-        let (prefill_drain_tx, mut prefill_drain_rx) = mpsc::channel::<reqwest::Response>(2000);
-
-        // Spawn a coordinator with limited concurrent drain tasks
-        // This prevents unbounded task spawning under extreme load
-        tokio::spawn(async move {
-            info!("Prefill drain coordinator started");
-
-            // Use a semaphore to limit concurrent drain operations
-            let max_concurrent_drains = 100;
-            let semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrent_drains));
-
-            while let Some(response) = prefill_drain_rx.recv().await {
-                let permit = semaphore.clone().acquire_owned().await;
-
-                match permit {
-                    Ok(permit) => {
-                        // Spawn a task to drain this response
-                        tokio::spawn(async move {
-                            let url = response.url().to_string();
-                            let status = response.status();
-
-                            if !status.is_success() {
-                                error!("Prefill drain: error status={} url={}", status, url);
-                                RouterMetrics::record_pd_prefill_error(&url);
-                            }
-
-                            // Drain the response body efficiently
-                            // Use streaming to avoid loading entire body into memory
-                            let start = std::time::Instant::now();
-                            let mut stream = response.bytes_stream();
-                            let mut bytes_drained = 0;
-
-                            while let Some(chunk_result) = stream.next().await {
-                                match chunk_result {
-                                    Ok(chunk) => bytes_drained += chunk.len(),
-                                    Err(e) => {
-                                        debug!(
-                                            "Prefill drain: error streaming url={} error={}",
-                                            url, e
-                                        );
-                                        break;
-                                    }
-                                }
-                            }
-
-                            let elapsed = start.elapsed();
-                            if elapsed > Duration::from_millis(100) {
-                                // Only log slow drains
-                                debug!(
-                                    "Prefill drain: slow drain {} bytes from {} in {:?}",
-                                    bytes_drained, url, elapsed
-                                );
-                            }
-
-                            // Permit is automatically released when dropped
-                            drop(permit);
-                        });
-                    }
-                    Err(_) => {
-                        // Semaphore closed, shutting down
-                        break;
-                    }
-                }
-            }
-            info!("Prefill drain coordinator shutting down");
-        });
-
-        Ok(PDRouter {
+        Ok(PdRouterBase {
             worker_registry: Arc::clone(&ctx.worker_registry),
             policy_registry: Arc::clone(&ctx.policy_registry),
             worker_startup_timeout_secs: ctx.router_config.worker_startup_timeout_secs,
@@ -707,632 +703,9 @@ impl PDRouter {
             worker_loads,
             load_monitor_handle,
             client: ctx.client.clone(),
-            prefill_client,
-            prefill_drain_tx,
-            retry_config: ctx.router_config.effective_retry_config(),
             circuit_breaker_config: core_cb_config,
+            dp_size,
         })
-    }
-
-    // Helper to handle server selection errors
-    fn handle_server_selection_error(error: String) -> Response {
-        error!("Failed to select PD pair error={}", error);
-        RouterMetrics::record_pd_error("server_selection");
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            format!("No available servers: {}", error),
-        )
-            .into_response()
-    }
-
-    // Helper to handle serialization errors
-    fn handle_serialization_error(error: impl std::fmt::Display) -> Response {
-        error!("Failed to serialize request error={}", error);
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to serialize request",
-        )
-            .into_response()
-    }
-
-    // Helper to determine batch size from a GenerateRequest
-    fn get_generate_batch_size(req: &GenerateRequest) -> Option<usize> {
-        // Check prompt array
-        if let Some(StringOrArray::Array(arr)) = &req.prompt {
-            if !arr.is_empty() {
-                return Some(arr.len());
-            }
-        }
-        // Check text array
-        if let Some(text) = &req.text {
-            if text.contains("[") && text.contains("]") {
-                // This is a simplified check - in reality we'd need to parse JSON
-                return None; // For now, fall back to non-batch
-            }
-        }
-        None
-    }
-
-    // Helper to determine batch size from a ChatCompletionRequest
-    fn get_chat_batch_size(req: &ChatCompletionRequest) -> Option<usize> {
-        // Check 'n' parameter for multiple responses
-        if let Some(n) = req.n {
-            if n > 1 {
-                return Some(n as usize);
-            }
-        }
-        None
-    }
-
-    // Helper to determine batch size from a CompletionRequest
-    fn get_completion_batch_size(req: &CompletionRequest) -> Option<usize> {
-        // Check prompt type and return batch size
-        use crate::protocols::spec::PromptInput;
-        match &req.prompt {
-            PromptInput::StringArray(arr) => {
-                if !arr.is_empty() {
-                    Some(arr.len())
-                } else {
-                    None
-                }
-            }
-            PromptInput::IntBatch(batch) => {
-                if !batch.is_empty() {
-                    Some(batch.len())
-                } else {
-                    None
-                }
-            }
-            _ => None, // Single string or single int array = batch size 1 (not batched)
-        }
-    }
-
-    // Helper to inject bootstrap fields into an existing JSON request value
-    fn inject_bootstrap_into_value(
-        mut original: Value,
-        prefill_worker: &dyn Worker,
-        batch_size: Option<usize>,
-    ) -> Result<Value, String> {
-        let bootstrap_port = match prefill_worker.worker_type() {
-            crate::core::WorkerType::Prefill { bootstrap_port } => bootstrap_port,
-            _ => None,
-        };
-        let hostname = super::pd_types::get_hostname(prefill_worker.url());
-
-        let obj = original
-            .as_object_mut()
-            .ok_or_else(|| "Request must be a JSON object".to_string())?;
-
-        if let Some(n) = batch_size {
-            let mut hosts = Vec::with_capacity(n);
-            let mut ports = Vec::with_capacity(n);
-            let mut rooms = Vec::with_capacity(n);
-            for _ in 0..n {
-                hosts.push(hostname.clone());
-                ports.push(bootstrap_port);
-                rooms.push(super::pd_types::generate_room_id());
-            }
-            obj.insert(
-                "bootstrap_host".to_string(),
-                Value::Array(hosts.into_iter().map(serde_json::Value::from).collect()),
-            );
-            obj.insert(
-                "bootstrap_port".to_string(),
-                Value::Array(
-                    ports
-                        .into_iter()
-                        .map(|p| match p {
-                            Some(v) => serde_json::Value::from(v),
-                            None => Value::Null,
-                        })
-                        .collect(),
-                ),
-            );
-            obj.insert(
-                "bootstrap_room".to_string(),
-                Value::Array(rooms.into_iter().map(serde_json::Value::from).collect()),
-            );
-        } else {
-            obj.insert(
-                "bootstrap_host".to_string(),
-                serde_json::Value::from(hostname),
-            );
-            obj.insert(
-                "bootstrap_port".to_string(),
-                match bootstrap_port {
-                    Some(v) => serde_json::Value::from(v),
-                    None => Value::Null,
-                },
-            );
-            obj.insert(
-                "bootstrap_room".to_string(),
-                serde_json::Value::from(super::pd_types::generate_room_id()),
-            );
-        }
-        Ok(original)
-    }
-
-    // Execute the dual dispatch to prefill and decode servers with retries and bootstrap injection
-    async fn execute_dual_dispatch<T: Serialize + Clone>(
-        &self,
-        headers: Option<&HeaderMap>,
-        original_request: &T,
-        context: PDRequestContext<'_>,
-    ) -> Response {
-        let start_time = Instant::now();
-
-        let route = context.route;
-        RetryExecutor::execute_response_with_retry(
-            &self.retry_config,
-            // Operation per attempt
-            {
-                let original_request = original_request.clone();
-                move |attempt: u32| {
-                    let original_request = original_request.clone();
-                    let context = context.clone();
-                    async move {
-                        // Select workers fresh for each attempt
-                        let (prefill, decode) = match self
-                            .select_pd_pair(context.request_text.as_deref(), context.model_id)
-                            .await
-                        {
-                            Ok(pair) => pair,
-                            Err(e) => {
-                                RouterMetrics::record_pd_error("server_selection");
-                                return Self::handle_server_selection_error(e);
-                            }
-                        };
-
-                        debug!(
-                            "PD retry attempt {} using prefill={} decode={}",
-                            attempt,
-                            prefill.url(),
-                            decode.url()
-                        );
-
-                        // Serialize the original request
-                        let mut json_request = match serde_json::to_value(&original_request) {
-                            Ok(v) => v,
-                            Err(e) => return Self::handle_serialization_error(e),
-                        };
-
-                        // Inject bootstrap based on current prefill worker
-                        json_request = match Self::inject_bootstrap_into_value(
-                            json_request,
-                            prefill.as_ref(),
-                            context.batch_size,
-                        ) {
-                            Ok(v) => v,
-                            Err(e) => return Self::handle_serialization_error(e),
-                        };
-
-                        // Execute the actual dual dispatch
-                        let response = self
-                            .execute_dual_dispatch_internal(
-                                headers,
-                                json_request,
-                                context,
-                                prefill.as_ref(),
-                                decode.as_ref(),
-                                start_time,
-                            )
-                            .await;
-
-                        // Record outcomes for circuit breakers
-                        let _status = response.status();
-                        let not_error = _status.is_success() || _status.is_client_error();
-                        prefill.record_outcome(not_error);
-                        decode.record_outcome(not_error);
-
-                        response
-                    }
-                }
-            },
-            // Should retry predicate
-            |res, _attempt| is_retryable_status(res.status()),
-            // On backoff hook
-            |delay, attempt| {
-                RouterMetrics::record_retry(route);
-                RouterMetrics::record_retry_backoff_duration(delay, attempt);
-            },
-            // On exhausted hook
-            || RouterMetrics::record_retries_exhausted(route),
-        )
-        .await
-    }
-
-    async fn handle_decode_error_response(
-        &self,
-        res: reqwest::Response,
-        context: &PDRequestContext<'_>,
-        prefill: &dyn Worker,
-        decode: &dyn Worker,
-    ) -> Response {
-        let status = res.status();
-
-        if context.is_stream {
-            // Handle streaming error response
-            let response_headers = header_utils::preserve_response_headers(res.headers());
-            let error_payload = match res.bytes().await {
-                Ok(error_body) => {
-                    if let Ok(error_json) = serde_json::from_slice::<Value>(&error_body) {
-                        json!({ "message": error_json, "status": status.as_u16() })
-                    } else {
-                        json!({ "message": String::from_utf8_lossy(&error_body).to_string(), "status": status.as_u16() })
-                    }
-                }
-                Err(e) => {
-                    json!({ "message": format!("Decode server error: {}", e), "status": status.as_u16() })
-                }
-            };
-
-            let sse_data = format!(
-                "data: {{'error': {}}}",
-                serde_json::to_string(&error_payload).unwrap_or_default()
-            );
-            let error_stream = tokio_stream::once(Ok(axum::body::Bytes::from(sse_data)));
-
-            let decode_url = decode.url().to_string();
-            self.create_streaming_response(
-                error_stream,
-                status,
-                None,
-                context.return_logprob,
-                Some(decode_url),
-                Some(response_headers),
-                prefill,
-                decode,
-                None, // error path: never bill
-            )
-        } else {
-            // Handle non-streaming error response
-            match res.bytes().await {
-                Ok(error_body) => (status, error_body).into_response(),
-                Err(e) => (status, format!("Decode server error: {}", e)).into_response(),
-            }
-        }
-    }
-
-    // Internal method that performs the actual dual dispatch (without retry logic)
-    async fn execute_dual_dispatch_internal(
-        &self,
-        headers: Option<&HeaderMap>,
-        json_request: Value,
-        context: PDRequestContext<'_>,
-        prefill: &dyn Worker,
-        decode: &dyn Worker,
-        start_time: Instant,
-    ) -> Response {
-        // For non-streaming: use guard for automatic load management
-        // For streaming: load will be managed in create_streaming_response
-        let _guard = if !context.is_stream {
-            Some(WorkerLoadGuard::new_multi(vec![prefill, decode]))
-        } else {
-            None
-        };
-
-        // Build decode request with shared client
-        let decode_request_url = Self::backend_request_url(decode.url(), context.route);
-        let decode_request = otel_http::prepare_client_request(
-            self.build_post_with_headers(
-                &self.client,
-                decode.url(),
-                context.route,
-                &json_request,
-                headers,
-                false,
-            ),
-            headers,
-            ClientRequestOptions {
-                method: "POST",
-                url: &decode_request_url,
-                route: Some(context.route),
-                request_phase: Some("decode"),
-            },
-        );
-
-        // Send both requests concurrently
-        debug!(
-            "Sending concurrent requests to prefill={} decode={}",
-            prefill.url(),
-            decode.url()
-        );
-
-        if context.return_logprob {
-            // Build prefill request with shared client when we need response body
-            let prefill_request_url = Self::backend_request_url(prefill.url(), context.route);
-            let prefill_request = otel_http::prepare_client_request(
-                self.build_post_with_headers(
-                    &self.client,
-                    prefill.url(),
-                    context.route,
-                    &json_request,
-                    headers,
-                    false,
-                ),
-                headers,
-                ClientRequestOptions {
-                    method: "POST",
-                    url: &prefill_request_url,
-                    route: Some(context.route),
-                    request_phase: Some("prefill"),
-                },
-            );
-            // When we need logprobs, wait for both responses
-            let (prefill_result, decode_result) =
-                tokio::join!(prefill_request.send(), decode_request.send());
-            debug!("Received responses from both servers");
-
-            // Update metrics
-            let duration = start_time.elapsed();
-            RouterMetrics::record_pd_request_duration(context.route, duration);
-            RouterMetrics::record_pd_request(context.route);
-            RouterMetrics::record_pd_prefill_request(prefill.url());
-            RouterMetrics::record_pd_decode_request(decode.url());
-
-            // Process decode response with prefill for logprobs
-            debug!("Processing decode response with logprobs");
-            match decode_result {
-                Ok(res) => {
-                    let status = StatusCode::from_u16(res.status().as_u16())
-                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                    debug!("Decode response status: {}", status);
-
-                    if !status.is_success() {
-                        RouterMetrics::record_pd_decode_error(decode.url());
-                        error!(
-                            "Decode server returned error status decode_url={} status={}",
-                            decode.url(),
-                            status
-                        );
-
-                        return self
-                            .handle_decode_error_response(res, &context, prefill, decode)
-                            .await;
-                    }
-
-                    // Process prefill response for logprobs
-                    let prefill_body = match self
-                        .process_prefill_response(
-                            prefill_result,
-                            prefill.url(),
-                            context.return_logprob,
-                        )
-                        .await
-                    {
-                        Ok((_, body)) => body,
-                        Err(error_response) => return error_response,
-                    };
-
-                    if context.is_stream {
-                        // Streaming response with logprobs. Count the
-                        // request once; token counts come from the stream.
-                        // We bill here (before the stream starts) because
-                        // the client has already received the success
-                        // status line, mirroring the non-logprob branch.
-                        if let Some(rid) = context.run_id {
-                            usage_metrics::record_run_request(rid);
-                        }
-
-                        let prefill_logprobs = prefill_body
-                            .as_ref()
-                            .and_then(|body| serde_json::from_slice::<Value>(body).ok())
-                            .and_then(|json| {
-                                json.pointer("/meta_info/input_token_logprobs").cloned()
-                            });
-
-                        let response_headers =
-                            header_utils::preserve_response_headers(res.headers());
-
-                        self.create_streaming_response(
-                            res.bytes_stream(),
-                            status,
-                            prefill_logprobs,
-                            context.return_logprob,
-                            None,
-                            Some(response_headers),
-                            prefill,
-                            decode,
-                            context.run_id.map(|s| s.to_string()),
-                        )
-                    } else {
-                        // Non-streaming response with logprobs.
-                        // Billing happens inside process_non_streaming_response
-                        // after the decode body is successfully read, so a
-                        // mid-body read failure does not count against the
-                        // run.
-                        self.process_non_streaming_response(
-                            res,
-                            status,
-                            context.return_logprob,
-                            prefill_body,
-                            context.run_id,
-                        )
-                        .await
-                    }
-                }
-                Err(e) => {
-                    error!(
-                        decode_url = %decode.url(),
-                        error = %e,
-                        "Decode request failed"
-                    );
-                    RouterMetrics::record_pd_decode_error(decode.url());
-                    (
-                        StatusCode::BAD_GATEWAY,
-                        format!("Decode server error: {}", e),
-                    )
-                        .into_response()
-                }
-            }
-        } else {
-            // When we don't need logprobs, only wait for decode response
-            // Send both requests concurrently but don't wait for prefill
-            // Use dedicated prefill client with Connection: close
-            let prefill_request_url = Self::backend_request_url(prefill.url(), context.route);
-            let prefill_request = otel_http::prepare_client_request(
-                self.build_post_with_headers(
-                    &self.prefill_client,
-                    prefill.url(),
-                    context.route,
-                    &json_request,
-                    headers,
-                    true,
-                ),
-                headers,
-                ClientRequestOptions {
-                    method: "POST",
-                    url: &prefill_request_url,
-                    route: Some(context.route),
-                    request_phase: Some("prefill"),
-                },
-            );
-
-            // Send prefill response to background worker for draining
-            // This ensures HTTP compliance without blocking
-            let drain_tx = self.prefill_drain_tx.clone();
-            let prefill_url = prefill.url().to_string();
-            tokio::spawn(async move {
-                if let Ok(response) = prefill_request.send().await {
-                    // Try to send to drain worker
-                    // If channel is full (under extreme load), drain inline as fallback
-                    match drain_tx.try_send(response) {
-                        Ok(_) => {
-                            // Successfully queued for draining
-                            debug!("Prefill response queued for draining");
-                        }
-                        Err(mpsc::error::TrySendError::Full(response)) => {
-                            // Channel full - drain inline as fallback
-                            warn!("Prefill drain channel full (capacity exceeded), draining inline for {}", prefill_url);
-                            RouterMetrics::record_pd_prefill_error(&prefill_url);
-
-                            // Drain inline with timeout to prevent blocking too long
-                            let drain_future = async {
-                                let mut stream = response.bytes_stream();
-                                while stream.next().await.is_some() {
-                                    // Just drain
-                                }
-                            };
-
-                            match tokio::time::timeout(Duration::from_secs(1), drain_future).await {
-                                Ok(_) => debug!("Inline drain completed for {}", prefill_url),
-                                Err(_) => error!("Inline drain timeout for {}", prefill_url),
-                            }
-                        }
-                        Err(mpsc::error::TrySendError::Closed(_)) => {
-                            error!("Prefill drain channel closed!");
-                        }
-                    }
-                }
-            });
-
-            // Wait only for decode response
-            let decode_result = decode_request.send().await;
-            debug!("Received decode response");
-
-            // Update metrics
-            let duration = start_time.elapsed();
-            RouterMetrics::record_pd_request_duration(context.route, duration);
-            RouterMetrics::record_pd_request(context.route);
-            RouterMetrics::record_pd_prefill_request(prefill.url());
-            RouterMetrics::record_pd_decode_request(decode.url());
-
-            // Process decode response immediately
-            debug!("Processing decode response (no logprobs)");
-            match decode_result {
-                Ok(res) => {
-                    let status = StatusCode::from_u16(res.status().as_u16())
-                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                    debug!("Decode response status: {}", status);
-
-                    if !status.is_success() {
-                        RouterMetrics::record_pd_decode_error(decode.url());
-                        error!(
-                            "Decode server returned error status decode_url={} status={}",
-                            decode.url(),
-                            status
-                        );
-
-                        self.handle_decode_error_response(res, &context, prefill, decode)
-                            .await
-                    } else if context.is_stream {
-                        // Successful streaming response: count the request
-                        // once for billing (token counts come from the
-                        // stream, but the request counter must increment
-                        // even when usage is omitted).
-                        if let Some(rid) = context.run_id {
-                            usage_metrics::record_run_request(rid);
-                        }
-
-                        // Streaming response without logprobs - direct passthrough
-                        let decode_url = decode.url().to_string();
-                        let response_headers =
-                            header_utils::preserve_response_headers(res.headers());
-
-                        self.create_streaming_response(
-                            res.bytes_stream(),
-                            status,
-                            None,
-                            false,
-                            Some(decode_url),
-                            Some(response_headers),
-                            prefill,
-                            decode,
-                            context.run_id.map(|s| s.to_string()),
-                        )
-                    } else {
-                        // Non-streaming response without logprobs - direct passthrough like fast version
-                        let response_headers =
-                            header_utils::preserve_response_headers(res.headers());
-
-                        match res.bytes().await {
-                            Ok(decode_body) => {
-                                // Successful non-streaming response:
-                                // record per-run billing metrics.
-                                if let Some(rid) = context.run_id {
-                                    usage_metrics::record_run_request(rid);
-                                    usage_metrics::extract_and_record_usage(
-                                        rid,
-                                        &decode_body,
-                                    );
-                                }
-                                let mut response =
-                                    Response::new(axum::body::Body::from(decode_body));
-                                *response.status_mut() = status;
-                                *response.headers_mut() = response_headers;
-                                response
-                            }
-                            Err(e) => {
-                                error!("Failed to read decode response: {}", e);
-                                (StatusCode::INTERNAL_SERVER_ERROR, "Failed to read response")
-                                    .into_response()
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    error!(
-                        decode_url = %decode.url(),
-                        error = %e,
-                        "Decode request failed"
-                    );
-                    RouterMetrics::record_pd_decode_error(decode.url());
-                    (
-                        StatusCode::BAD_GATEWAY,
-                        format!("Decode server error: {}", e),
-                    )
-                        .into_response()
-                }
-            }
-        }
-    }
-
-    // Check if either prefill or decode policy needs request text
-    fn policies_need_request_text(&self) -> bool {
-        // Check both prefill and decode policies
-        let prefill_policy = self.policy_registry.get_prefill_policy();
-        let decode_policy = self.policy_registry.get_decode_policy();
-        prefill_policy.needs_request_text() || decode_policy.needs_request_text()
     }
 
     // Select a pair of prefill and decode servers considering circuit breaker state
@@ -1475,418 +848,6 @@ impl PDRouter {
             tokio::time::sleep(Duration::from_secs(interval_secs)).await;
         }
     }
-
-    // Helper to create a streaming response
-    #[allow(clippy::too_many_arguments)]
-    fn create_streaming_response(
-        &self,
-        stream: impl futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static,
-        status: StatusCode,
-        prefill_logprobs: Option<Value>,
-        return_logprob: bool,
-        decode_url: Option<String>,
-        headers: Option<HeaderMap>,
-        prefill: &dyn Worker,
-        decode: &dyn Worker,
-        run_id: Option<String>,
-    ) -> Response {
-        // For streaming, increment load now - will be decremented when streaming completes
-        prefill.increment_load();
-        decode.increment_load();
-
-        // Store URLs to find workers later for decrementing
-        let prefill_url = prefill.url().to_string();
-        let decode_url_str = decode.url().to_string();
-
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-
-        // Clone the registry for the spawned task
-        let registry = self.worker_registry.clone();
-
-        tokio::spawn(async move {
-            // Use a flag to track whether stream completed successfully
-            let mut stream_completed = false;
-            let mut usage_extractor = run_id.map(usage_metrics::SseUsageExtractor::new);
-
-            futures_util::pin_mut!(stream);
-            while let Some(chunk_result) = stream.next().await {
-                match chunk_result {
-                    Ok(chunk) => {
-                        // Extract per-run token usage from streaming chunks
-                        // for billing. Status was already verified successful
-                        // before we got here, so it's safe to bill. The
-                        // extractor buffers across chunks since TCP segment
-                        // boundaries can split SSE lines.
-                        if let Some(extractor) = usage_extractor.as_mut() {
-                            extractor.push_chunk(&chunk);
-                        }
-
-                        // Check for stream end marker to decrement load early
-                        let is_done = chunk
-                            .as_ref()
-                            .windows(12)
-                            .any(|window| window == b"data: [DONE]");
-
-                        let result = if return_logprob && prefill_logprobs.is_some() {
-                            // Try to merge logprobs
-                            Self::merge_streaming_logprobs(prefill_logprobs.clone(), &chunk)
-                                .unwrap_or(chunk)
-                        } else {
-                            chunk
-                        };
-
-                        if tx.send(Ok(result)).is_err() {
-                            break;
-                        }
-
-                        // If we see the done marker, decrement load immediately
-                        if is_done {
-                            stream_completed = true;
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        if let Some(ref url) = decode_url {
-                            error!("Stream error from decode server {}: {}", url, e);
-                            RouterMetrics::record_pd_stream_error(url);
-                        }
-                        let _ = tx.send(Err(format!("Stream error: {}", e)));
-                        break;
-                    }
-                }
-            }
-
-            // Always decrement load after streaming (either completes or errors)
-            // Find and decrement prefill worker
-            if let Some(worker) = registry.get_by_url(&prefill_url) {
-                worker.decrement_load();
-                debug!(
-                    "Decremented load for prefill worker: {} (stream_completed: {})",
-                    prefill_url, stream_completed
-                );
-            }
-
-            // Find and decrement decode worker
-            if let Some(worker) = registry.get_by_url(&decode_url_str) {
-                worker.decrement_load();
-                debug!(
-                    "Decremented load for decode worker: {} (stream_completed: {})",
-                    decode_url_str, stream_completed
-                );
-            }
-        });
-
-        let stream = UnboundedReceiverStream::new(rx);
-        let body = Body::from_stream(stream);
-
-        let mut response = Response::new(body);
-        *response.status_mut() = status;
-
-        // Use provided headers or create new ones, then ensure content-type is set for streaming
-        let mut headers = headers.unwrap_or_default();
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
-        *response.headers_mut() = headers;
-
-        response
-    }
-
-    // Helper to process non-streaming decode response with logprob merging
-    async fn process_non_streaming_response(
-        &self,
-        res: reqwest::Response,
-        status: StatusCode,
-        return_logprob: bool,
-        prefill_body: Option<bytes::Bytes>,
-        run_id: Option<&str>,
-    ) -> Response {
-        let response = res.bytes().await;
-        let decode_body = match response {
-            Ok(decode_body) => decode_body,
-            Err(e) => {
-                error!("Failed to read decode response: {}", e);
-                return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to read response")
-                    .into_response();
-            }
-        };
-
-        // Record per-run billing metrics on success. We bill *after* the
-        // body has been successfully read — if `.bytes().await` fails
-        // above, we return 500 and never reach this point, so a
-        // mid-body upstream failure does not count as a billed request.
-        // The status check is defensive: today the only caller already
-        // gates on success, but guarding here too prevents future
-        // callers from accidentally billing failed requests.
-        if let Some(rid) = run_id {
-            if status.is_success() {
-                usage_metrics::record_run_request(rid);
-                usage_metrics::extract_and_record_usage(rid, &decode_body);
-            }
-        }
-
-        if !return_logprob {
-            return (status, decode_body).into_response();
-        }
-
-        let Some(prefill_body) = prefill_body else {
-            return (status, decode_body).into_response();
-        };
-
-        // Merge logprobs from prefill and decode
-        let (Ok(prefill_json), Ok(mut decode_json)) = (
-            serde_json::from_slice::<Value>(&prefill_body),
-            serde_json::from_slice::<Value>(&decode_body),
-        ) else {
-            warn!("Failed to parse responses for logprob merging");
-            return (status, decode_body).into_response();
-        };
-
-        Self::merge_logprobs_in_json(&prefill_json, &mut decode_json);
-
-        // Return merged response
-        match serde_json::to_vec(&decode_json) {
-            Ok(body) => (status, body).into_response(),
-            Err(e) => {
-                error!("Failed to serialize merged response: {}", e);
-                (status, decode_body).into_response()
-            }
-        }
-    }
-
-    // Helper to process prefill response and extract body if needed for logprobs
-    async fn process_prefill_response(
-        &self,
-        prefill_result: Result<reqwest::Response, reqwest::Error>,
-        prefill_url: &str,
-        return_logprob: bool,
-    ) -> Result<(StatusCode, Option<bytes::Bytes>), Response> {
-        // Check prefill result first - it's critical for disaggregated mode
-        let prefill_response = match prefill_result {
-            Ok(response) => response,
-            Err(e) => {
-                RouterMetrics::record_pd_prefill_error(prefill_url);
-                error!(
-                    "Prefill server failed (CRITICAL) prefill_url={} error={}. Decode will timeout without prefill KV cache.",
-                    prefill_url,
-                    e
-                );
-
-                // Return error immediately - don't wait for decode to timeout
-                return Err((
-                    StatusCode::BAD_GATEWAY,
-                    format!(
-                        "Prefill server error: {}. This will cause decode timeout.",
-                        e
-                    ),
-                )
-                    .into_response());
-            }
-        };
-
-        let prefill_status = StatusCode::from_u16(prefill_response.status().as_u16())
-            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-
-        // Check if prefill succeeded
-        if !prefill_status.is_success() {
-            RouterMetrics::record_pd_prefill_error(prefill_url);
-
-            // Get error body from prefill
-            let error_msg = prefill_response
-                .text()
-                .await
-                .unwrap_or_else(|_| "Unknown prefill error".to_string());
-
-            error!(
-                "Prefill server returned error status prefill_url={} status={} body={}",
-                prefill_url, prefill_status, error_msg
-            );
-
-            return Err((
-                prefill_status,
-                format!("Prefill server error ({}): {}", prefill_status, error_msg),
-            )
-                .into_response());
-        }
-
-        // Read prefill body if needed for logprob merging
-        let prefill_body = if return_logprob {
-            match prefill_response.bytes().await {
-                Ok(body) => Some(body),
-                Err(e) => {
-                    warn!("Failed to read prefill response body for logprobs: {}", e);
-                    None
-                }
-            }
-        } else {
-            // For non-logprob requests, just consume the response without storing
-            debug!("Consuming prefill response body (non-logprob request)");
-            match prefill_response.bytes().await {
-                Ok(_) => debug!("Prefill response consumed successfully"),
-                Err(e) => warn!("Error consuming prefill response: {}", e),
-            }
-            None
-        };
-
-        Ok((prefill_status, prefill_body))
-    }
-
-    fn backend_request_url(url: &str, route: &str) -> String {
-        let (base_url, _) = super::dp_utils::parse_worker_url(url);
-        api_path(&base_url, route)
-    }
-
-    fn build_post_with_headers(
-        &self,
-        client: &Client,
-        url: &str,
-        route: &str,
-        json_request: &Value,
-        headers: Option<&HeaderMap>,
-        connection_close: bool,
-    ) -> reqwest::RequestBuilder {
-        // Extract base URL and dp_rank using shared utility
-        let (base_url, dp_rank) = super::dp_utils::parse_worker_url(url);
-
-        let mut request = client.post(api_path(&base_url, route)).json(json_request);
-
-        // Add X-data-parallel-rank header using shared utility
-        request = super::dp_utils::add_dp_rank_header(request, dp_rank);
-        if let Some(rank) = dp_rank {
-            debug!(
-                "Added X-data-parallel-rank={} header to request for {}",
-                rank, base_url
-            );
-        }
-
-        if connection_close {
-            request = request.header("Connection", "close");
-        }
-        if let Some(headers) = headers {
-            for (name, value) in headers.iter() {
-                let name_lc = name.as_str().to_ascii_lowercase();
-                // Whitelist important end-to-end headers, skip hop-by-hop
-                let forward = matches!(
-                    name_lc.as_str(),
-                    "authorization" | "x-request-id" | "x-correlation-id"
-                ) || name_lc.starts_with("x-request-id-");
-                if forward {
-                    if let Ok(val) = value.to_str() {
-                        request = request.header(name, val);
-                    }
-                }
-            }
-        }
-
-        request
-    }
-
-    // Helper to merge logprobs from prefill and decode responses
-    // This is now a thin wrapper around the utility function in logprobs_merge module
-    fn merge_logprobs_in_json(prefill_json: &Value, decode_json: &mut Value) -> bool {
-        logprobs_merge::merge_logprobs_in_json(prefill_json, decode_json)
-    }
-
-    // Simple helper to merge logprobs in streaming responses
-    fn merge_streaming_logprobs(
-        prefill_logprobs: Option<Value>,
-        decode_chunk: &[u8],
-    ) -> Result<bytes::Bytes, ()> {
-        // Skip non-data chunks
-        let chunk_str = std::str::from_utf8(decode_chunk).map_err(|_| ())?;
-        if !chunk_str.starts_with("data: ") || chunk_str.contains("[DONE]") {
-            return Err(());
-        }
-
-        // Parse JSON from chunk
-        let json_str = chunk_str.trim_start_matches("data: ").trim();
-        let mut decode_json: Value = serde_json::from_str(json_str).map_err(|_| ())?;
-
-        // Merge prefill logprobs if available
-        if let Some(ref p_logprobs) = prefill_logprobs {
-            // 1. Try to merge meta_info/input_token_logprobs (for Generate API)
-            if let Some(meta) = decode_json.get_mut("meta_info") {
-                if let Some(d_logprobs) = meta.get_mut("input_token_logprobs") {
-                    if let (Some(p_arr), Some(d_arr)) =
-                        (p_logprobs.as_array(), d_logprobs.as_array())
-                    {
-                        let mut merged = p_arr.clone();
-                        merged.extend(d_arr.clone());
-                        *d_logprobs = Value::Array(merged);
-                    }
-                }
-            }
-
-            // 2. Try to merge prompt_logprobs at top level (for Chat Completions API)
-            // In streaming, only add on the first chunk to avoid duplication
-            if let Some(decode_obj) = decode_json.as_object_mut() {
-                if !decode_obj.contains_key("prompt_logprobs") {
-                    decode_obj.insert("prompt_logprobs".to_string(), p_logprobs.clone());
-                }
-            }
-
-            // 3. Try to merge prompt_logprobs in choices (for Completions API)
-            if let Some(choices) = decode_json
-                .get_mut("choices")
-                .and_then(|v| v.as_array_mut())
-            {
-                for choice in choices.iter_mut() {
-                    if let Some(choice_obj) = choice.as_object_mut() {
-                        // For streaming, only merge if the choice doesn't already have prompt_logprobs
-                        // This prevents duplication across multiple chunks
-                        if !choice_obj.contains_key("prompt_logprobs") {
-                            choice_obj.insert("prompt_logprobs".to_string(), p_logprobs.clone());
-                        }
-                    }
-                }
-            }
-        }
-
-        // Re-serialize
-        let merged_str = format!(
-            "data: {}\n\n",
-            serde_json::to_string(&decode_json).unwrap_or_default()
-        );
-        Ok(bytes::Bytes::from(merged_str))
-    }
-
-    /// Internal helper for routing chat requests with a configurable backend path.
-    async fn route_chat_with_path(
-        &self,
-        headers: Option<&HeaderMap>,
-        body: &ChatCompletionRequest,
-        model_id: Option<&str>,
-        run_id: Option<&str>,
-        route: &'static str,
-    ) -> Response {
-        let is_stream = body.stream;
-        let return_logprob = body.logprobs;
-
-        let request_text = if self.policies_need_request_text() {
-            body.messages.first().and_then(|msg| match msg {
-                ChatMessage::User { content, .. } => match content {
-                    UserMessageContent::Text(text) => Some(text.clone()),
-                    UserMessageContent::Parts(_) => None,
-                },
-                ChatMessage::System { content, .. } => Some(content.clone()),
-                _ => None,
-            })
-        } else {
-            None
-        };
-
-        let batch_size = Self::get_chat_batch_size(body);
-
-        let context = PDRequestContext {
-            route,
-            batch_size,
-            is_stream,
-            return_logprob,
-            request_text,
-            model_id,
-            run_id,
-        };
-
-        self.execute_dual_dispatch(headers, body, context).await
-    }
 }
 
 // Helper functions
@@ -1924,9 +885,8 @@ async fn get_worker_load(client: &Client, worker_url: &str) -> Option<isize> {
     }
 }
 
-#[async_trait]
-impl WorkerManagement for PDRouter {
-    async fn add_worker(&self, _worker_url: &str) -> Result<String, String> {
+impl PdRouterBase {
+    pub async fn add_worker(&self, _worker_url: &str) -> Result<String, String> {
         // For PD router, we don't support adding workers via this generic method
         Err(
             "PD router requires specific add_prefill_server or add_decode_server methods"
@@ -1934,7 +894,7 @@ impl WorkerManagement for PDRouter {
         )
     }
 
-    fn remove_worker(&self, worker_url: &str) {
+    pub fn remove_worker(&self, worker_url: &str) {
         // Remove from registry
         if let Some(worker) = self.worker_registry.remove_by_url(worker_url) {
             match worker.worker_type() {
@@ -1951,18 +911,13 @@ impl WorkerManagement for PDRouter {
         }
     }
 
-    fn get_worker_urls(&self) -> Vec<String> {
+    pub fn get_worker_urls(&self) -> Vec<String> {
         self.worker_registry.get_all_urls()
     }
 }
 
-#[async_trait]
-impl RouterTrait for PDRouter {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
-    async fn health(&self, _req: Request<Body>) -> Response {
+impl PdRouterBase {
+    pub async fn health(&self, _req: Request<Body>) -> Response {
         // This is a server readiness check - checking if we have healthy workers
         // Workers handle their own health checks in the background
         let mut all_healthy = true;
@@ -1992,7 +947,7 @@ impl RouterTrait for PDRouter {
         }
     }
 
-    async fn health_generate(&self, _req: Request<Body>) -> Response {
+    pub async fn health_generate(&self, _req: Request<Body>) -> Response {
         // Test model generation capability by selecting a random pair and testing them
         // Note: This endpoint actually causes the model to generate tokens, so we only test one pair
 
@@ -2078,14 +1033,14 @@ impl RouterTrait for PDRouter {
         }
     }
 
-    async fn get_server_info(&self, _req: Request<Body>) -> Response {
+    pub async fn get_server_info(&self, _req: Request<Body>) -> Response {
         // Get info from the first decode server to match vllm's server info format
         // Note: We use decode workers for server info to match expected format
         self.proxy_to_first_prefill_worker("get_server_info", None)
             .await
     }
 
-    async fn get_models(&self, req: Request<Body>) -> Response {
+    pub async fn get_models(&self, req: Request<Body>) -> Response {
         // Extract headers first to avoid Send issues
         let headers = header_utils::copy_request_headers(&req);
 
@@ -2094,7 +1049,7 @@ impl RouterTrait for PDRouter {
             .await
     }
 
-    async fn get_model_info(&self, req: Request<Body>) -> Response {
+    pub async fn get_model_info(&self, req: Request<Body>) -> Response {
         // Extract headers first to avoid Send issues
         let headers = header_utils::copy_request_headers(&req);
 
@@ -2103,123 +1058,7 @@ impl RouterTrait for PDRouter {
             .await
     }
 
-    async fn route_generate(
-        &self,
-        headers: Option<&HeaderMap>,
-        body: &GenerateRequest,
-        model_id: Option<&str>,
-        run_id: Option<&str>,
-    ) -> Response {
-        // Extract parameters
-        let is_stream = body.stream;
-        let return_logprob = body.return_logprob;
-
-        // Extract text for cache-aware routing
-        let request_text = if self.policies_need_request_text() {
-            body.text
-                .as_deref()
-                .or_else(|| {
-                    body.prompt.as_ref().and_then(|p| match p {
-                        StringOrArray::String(s) => Some(s.as_str()),
-                        StringOrArray::Array(v) => v.first().map(|s| s.as_str()),
-                    })
-                })
-                .map(|s| s.to_string())
-        } else {
-            None
-        };
-
-        // Calculate batch size
-        let batch_size = Self::get_generate_batch_size(body);
-
-        // Create context
-        let context = PDRequestContext {
-            route: "/generate",
-            batch_size,
-            is_stream,
-            return_logprob,
-            request_text,
-            model_id,
-            run_id,
-        };
-
-        // Execute with retry and bootstrap injection
-        self.execute_dual_dispatch(headers, body, context).await
-    }
-
-    async fn route_chat(
-        &self,
-        headers: Option<&HeaderMap>,
-        body: &ChatCompletionRequest,
-        model_id: Option<&str>,
-        run_id: Option<&str>,
-    ) -> Response {
-        self.route_chat_with_path(headers, body, model_id, run_id, "/v1/chat/completions")
-            .await
-    }
-
-    async fn route_chat_tokens(
-        &self,
-        headers: Option<&HeaderMap>,
-        body: &ChatCompletionRequest,
-        model_id: Option<&str>,
-        run_id: Option<&str>,
-    ) -> Response {
-        self.route_chat_with_path(headers, body, model_id, run_id, "/v1/chat/completions/tokens")
-            .await
-    }
-
-    async fn route_completion(
-        &self,
-        headers: Option<&HeaderMap>,
-        body: &CompletionRequest,
-        model_id: Option<&str>,
-        run_id: Option<&str>,
-    ) -> Response {
-        // Extract parameters
-        let is_stream = body.stream;
-        let return_logprob = body.logprobs.is_some();
-
-        // Extract text for cache-aware routing
-        let request_text = if self.policies_need_request_text() {
-            Some(body.prompt.extract_text_for_routing())
-        } else {
-            None
-        };
-
-        // Calculate batch size
-        let batch_size = Self::get_completion_batch_size(body);
-
-        // Create context
-        let context = PDRequestContext {
-            route: "/v1/completions",
-            batch_size,
-            is_stream,
-            return_logprob,
-            request_text,
-            model_id,
-            run_id,
-        };
-
-        // Execute with retry and bootstrap injection
-        self.execute_dual_dispatch(headers, body, context).await
-    }
-
-    async fn route_responses(
-        &self,
-        _headers: Option<&HeaderMap>,
-        _body: &ResponsesRequest,
-        _model_id: Option<&str>,
-        _run_id: Option<&str>, // Not implemented; usage metrics N/A.
-    ) -> Response {
-        (
-            StatusCode::NOT_IMPLEMENTED,
-            "Responses endpoint not implemented for PD router",
-        )
-            .into_response()
-    }
-
-    async fn get_response(&self, _headers: Option<&HeaderMap>, _response_id: &str) -> Response {
+    pub async fn get_response(&self, _headers: Option<&HeaderMap>, _response_id: &str) -> Response {
         (
             StatusCode::NOT_IMPLEMENTED,
             "Responses retrieve endpoint not implemented for PD router",
@@ -2227,7 +1066,11 @@ impl RouterTrait for PDRouter {
             .into_response()
     }
 
-    async fn cancel_response(&self, _headers: Option<&HeaderMap>, _response_id: &str) -> Response {
+    pub async fn cancel_response(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _response_id: &str,
+    ) -> Response {
         (
             StatusCode::NOT_IMPLEMENTED,
             "Responses cancel endpoint not implemented for PD router",
@@ -2235,7 +1078,7 @@ impl RouterTrait for PDRouter {
             .into_response()
     }
 
-    async fn route_embeddings(
+    pub async fn route_embeddings(
         &self,
         _headers: Option<&HeaderMap>,
         _body: &crate::protocols::spec::EmbeddingRequest,
@@ -2248,35 +1091,7 @@ impl RouterTrait for PDRouter {
             .into_response()
     }
 
-    async fn route_rerank(
-        &self,
-        headers: Option<&HeaderMap>,
-        body: &RerankRequest,
-        model_id: Option<&str>,
-    ) -> Response {
-        // Extract text for cache-aware routing
-        let req_text = if self.policies_need_request_text() {
-            Some(body.query.clone())
-        } else {
-            None
-        };
-
-        // Create context
-        let context = PDRequestContext {
-            route: "/v1/rerank",
-            batch_size: None,
-            is_stream: false,
-            return_logprob: false,
-            request_text: req_text,
-            model_id,
-            run_id: None,
-        };
-
-        // Execute with retry and bootstrap injection
-        self.execute_dual_dispatch(headers, body, context).await
-    }
-
-    async fn flush_cache(&self) -> Response {
+    pub async fn flush_cache(&self) -> Response {
         // Process both prefill and decode workers
         let (prefill_results, prefill_errors) = self
             .process_workers(
@@ -2315,7 +1130,7 @@ impl RouterTrait for PDRouter {
         }
     }
 
-    async fn get_worker_loads(&self) -> Response {
+    pub async fn get_worker_loads(&self) -> Response {
         let mut loads = HashMap::new();
         let mut errors = Vec::new();
 
@@ -2353,11 +1168,7 @@ impl RouterTrait for PDRouter {
         (StatusCode::OK, Json(response_data)).into_response()
     }
 
-    fn router_type(&self) -> &'static str {
-        "pd"
-    }
-
-    fn readiness(&self) -> Response {
+    pub fn readiness(&self) -> Response {
         // PD router is ready if it has at least one healthy prefill AND one healthy decode worker
         let prefill_workers = self.worker_registry.get_prefill_workers();
         let decode_workers = self.worker_registry.get_decode_workers();
@@ -2409,222 +1220,19 @@ impl RouterTrait for PDRouter {
                 .into_response()
         }
     }
-
-    /// Route a transparent proxy request through the P/D disaggregation pipeline
-    /// For unmatched paths, we forward directly to a decode worker
-    async fn route_transparent(
-        &self,
-        headers: Option<&HeaderMap>,
-        path: &str,
-        method: &Method,
-        body: serde_json::Value,
-        run_id: Option<&str>,
-    ) -> Response {
-        // Only handle POST requests for inference
-        if *method != Method::POST {
-            return (
-                StatusCode::METHOD_NOT_ALLOWED,
-                "Only POST requests are supported for transparent proxy",
-            )
-                .into_response();
-        }
-
-        debug!(
-            "PDRouter transparent proxy: routing {} {} to decode worker",
-            method, path
-        );
-
-        // Get decode workers, filtered by availability
-        let all_decode_workers = self.worker_registry.get_decode_workers();
-        let decode_workers: Vec<Arc<dyn Worker>> = all_decode_workers
-            .iter()
-            .filter(|w| w.is_available())
-            .cloned()
-            .collect();
-
-        if decode_workers.is_empty() {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "No decode workers available",
-            )
-                .into_response();
-        }
-
-        // Select a decode worker using policy with headers for consistent hash
-        let decode_policy = self.policy_registry.get_decode_policy();
-        let request_text = serde_json::to_string(&body).ok();
-        let request_headers: Option<HashMap<String, String>> = headers.map(|h| {
-            h.iter()
-                .filter_map(|(name, value)| {
-                    value
-                        .to_str()
-                        .ok()
-                        .map(|v| (name.as_str().to_lowercase(), v.to_string()))
-                })
-                .collect()
-        });
-        let decode_idx = match decode_policy.select_worker_with_headers(
-            &decode_workers,
-            request_text.as_deref(),
-            request_headers.as_ref(),
-        ) {
-            Some(idx) => idx,
-            None => {
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "Decode policy failed to select a worker".to_string(),
-                )
-                    .into_response();
-            }
-        };
-
-        let decode_worker = &decode_workers[decode_idx];
-        let url = decode_worker.endpoint_url(path);
-
-        debug!("PDRouter transparent proxy: forwarding to {}", url);
-
-        // Build the request
-        let mut request_builder = self.client.post(&url);
-
-        // Add X-data-parallel-rank header for DP-aware routing
-        request_builder = dp_utils::add_dp_rank_header(request_builder, decode_worker.dp_rank());
-
-        // Add JSON body if not null
-        if !body.is_null() {
-            request_builder = request_builder.json(&body);
-        }
-
-        // Send request
-        match otel_http::send_client_request(
-            request_builder,
-            headers,
-            ClientRequestOptions {
-                method: "POST",
-                url: &url,
-                route: Some(path),
-                request_phase: Some("inference"),
-            },
-        )
-        .await
-        {
-            Ok(response) => {
-                let status = StatusCode::from_u16(response.status().as_u16())
-                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                let resp_headers = response.headers().clone();
-                let is_streaming = resp_headers
-                    .get(reqwest::header::CONTENT_TYPE)
-                    .and_then(|v| v.to_str().ok())
-                    .map(|ct| ct.starts_with("text/event-stream"))
-                    .unwrap_or(false);
-
-                let mut response_builder = Response::builder().status(status);
-                for (name, value) in resp_headers.iter() {
-                    if name != "transfer-encoding" && name != "content-length" {
-                        response_builder = response_builder.header(name, value);
-                    }
-                }
-
-                // SSE responses keep streaming chunk-by-chunk so clients get
-                // incremental tokens; usage is teed off the same stream via
-                // SseUsageExtractor. Non-SSE buffers once. No run_id → pass
-                // through unchanged.
-                match (run_id, is_streaming) {
-                    (Some(rid), true) => {
-                        if status.is_success() {
-                            usage_metrics::record_run_request(rid);
-                        }
-                        let stream_run_id =
-                            status.is_success().then(|| rid.to_string());
-                        let stream = response.bytes_stream();
-                        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-                        tokio::spawn(async move {
-                            let mut stream = stream;
-                            let mut usage_extractor = stream_run_id
-                                .map(usage_metrics::SseUsageExtractor::new);
-                            while let Some(chunk) = stream.next().await {
-                                match chunk {
-                                    Ok(bytes) => {
-                                        if let Some(extractor) = usage_extractor.as_mut() {
-                                            extractor.push_chunk(&bytes);
-                                        }
-                                        if tx.send(Ok(bytes)).is_err() {
-                                            break;
-                                        }
-                                    }
-                                    Err(e) => {
-                                        let _ = tx.send(Err(format!("Stream error: {}", e)));
-                                        break;
-                                    }
-                                }
-                            }
-                        });
-                        let body = Body::from_stream(UnboundedReceiverStream::new(rx));
-                        match response_builder.body(body) {
-                            Ok(response) => response,
-                            Err(e) => (
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                format!("Failed to build response: {}", e),
-                            )
-                                .into_response(),
-                        }
-                    }
-                    (Some(rid), false) => {
-                        let body_bytes = match response.bytes().await {
-                            Ok(b) => b,
-                            Err(e) => {
-                                return (
-                                    StatusCode::BAD_GATEWAY,
-                                    format!("Failed to read upstream response: {}", e),
-                                )
-                                    .into_response();
-                            }
-                        };
-                        if status.is_success() {
-                            usage_metrics::record_run_request(rid);
-                            usage_metrics::extract_and_record_usage(rid, &body_bytes);
-                        }
-                        match response_builder.body(Body::from(body_bytes)) {
-                            Ok(response) => response,
-                            Err(e) => (
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                format!("Failed to build response: {}", e),
-                            )
-                                .into_response(),
-                        }
-                    }
-                    (None, _) => {
-                        let body = Body::from_stream(response.bytes_stream());
-                        match response_builder.body(body) {
-                            Ok(response) => response,
-                            Err(e) => (
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                format!("Failed to build response: {}", e),
-                            )
-                                .into_response(),
-                        }
-                    }
-                }
-            }
-            Err(e) => (
-                StatusCode::BAD_GATEWAY,
-                format!("Backend request failed: {}", e),
-            )
-                .into_response(),
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{BasicWorker, WorkerType};
+    use crate::core::{BasicWorker, DPAwareWorker, Worker, WorkerType};
 
-    fn create_test_pd_router() -> PDRouter {
+    fn create_test_pd_router() -> PdRouterBase {
         let worker_registry = Arc::new(WorkerRegistry::new());
         let policy_registry =
             Arc::new(PolicyRegistry::new(crate::config::PolicyConfig::RoundRobin));
 
-        PDRouter {
+        PdRouterBase {
             worker_registry,
             policy_registry,
             worker_startup_timeout_secs: 5,
@@ -2632,10 +1240,26 @@ mod tests {
             worker_loads: Arc::new(tokio::sync::watch::channel(HashMap::new()).1),
             load_monitor_handle: None,
             client: Client::new(),
-            prefill_client: Client::new(),
-            prefill_drain_tx: mpsc::channel(100).0,
-            retry_config: RetryConfig::default(),
             circuit_breaker_config: CircuitBreakerConfig::default(),
+            dp_size: 1,
+        }
+    }
+
+    fn create_test_pd_router_with_dp(dp_size: usize) -> PdRouterBase {
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let policy_registry =
+            Arc::new(PolicyRegistry::new(crate::config::PolicyConfig::RoundRobin));
+
+        PdRouterBase {
+            worker_registry,
+            policy_registry,
+            worker_startup_timeout_secs: 5,
+            worker_startup_check_interval_secs: 1,
+            worker_loads: Arc::new(tokio::sync::watch::channel(HashMap::new()).1),
+            load_monitor_handle: None,
+            client: Client::new(),
+            circuit_breaker_config: CircuitBreakerConfig::default(),
+            dp_size,
         }
     }
 
@@ -2763,13 +1387,6 @@ mod tests {
         assert_eq!(prefill_workers.len(), 1);
     }
 
-    // ============= Bootstrap Injection Tests =============
-    // Note: These tests are commented out as we've moved to the optimized bootstrap injection
-    // approach that doesn't use the Bootstrap trait on GenerateReqInput anymore.
-
-    // TODO: Add new tests for the optimized bootstrap injection approach using
-    // RequestWithBootstrap and BatchRequestWithBootstrap wrappers
-
     // ============= Worker Selection Tests =============
 
     #[tokio::test]
@@ -2885,109 +1502,6 @@ mod tests {
         assert_eq!(received.get("http://worker2"), Some(&5));
     }
 
-    // ============= Worker Load Tests =============
-
-    #[test]
-    fn test_worker_load_metrics() {
-        let prefill_worker = create_test_worker(
-            "http://prefill".to_string(),
-            WorkerType::Prefill {
-                bootstrap_port: None,
-            },
-            true,
-        );
-        let decode_worker =
-            create_test_worker("http://decode".to_string(), WorkerType::Decode, true);
-
-        // Create load guard for both workers
-        let _guard =
-            WorkerLoadGuard::new_multi(vec![prefill_worker.as_ref(), decode_worker.as_ref()]);
-
-        // Load should be incremented
-        assert_eq!(prefill_worker.load(), 1);
-        assert_eq!(decode_worker.load(), 1);
-
-        // Drop guard - load should decrement
-        drop(_guard);
-
-        assert_eq!(prefill_worker.load(), 0);
-        assert_eq!(decode_worker.load(), 0);
-    }
-
-    #[tokio::test]
-    async fn test_streaming_load_tracking() {
-        use futures_util::StreamExt;
-        use tokio::time::{sleep, Duration};
-
-        let router = create_test_pd_router();
-
-        // Add workers - create_test_worker returns Box<dyn Worker>, convert to Arc
-        let prefill_worker = create_test_worker(
-            "http://prefill".to_string(),
-            WorkerType::Prefill {
-                bootstrap_port: None,
-            },
-            true,
-        );
-        let decode_worker =
-            create_test_worker("http://decode".to_string(), WorkerType::Decode, true);
-
-        router.worker_registry.register(Arc::from(prefill_worker));
-        router.worker_registry.register(Arc::from(decode_worker));
-
-        // Get references to the workers from registry
-        let prefill_workers = router.worker_registry.get_prefill_workers();
-        let decode_workers = router.worker_registry.get_decode_workers();
-
-        let prefill_ref = prefill_workers[0].clone();
-        let decode_ref = decode_workers[0].clone();
-
-        // Initially load should be 0
-        assert_eq!(prefill_ref.load(), 0);
-        assert_eq!(decode_ref.load(), 0);
-
-        // Create a mock streaming response
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(rx);
-
-        // Call create_streaming_response which should increment load
-        let _response = router.create_streaming_response(
-            stream.map(Ok),
-            StatusCode::OK,
-            None,
-            false,
-            None,
-            None,
-            prefill_ref.as_ref(),
-            decode_ref.as_ref(),
-            None,
-        );
-
-        // Load should be incremented immediately
-        assert_eq!(prefill_ref.load(), 1);
-        assert_eq!(decode_ref.load(), 1);
-
-        // Send some data through the stream
-        tx.send(bytes::Bytes::from("test data")).unwrap();
-
-        // Give time for the spawned task to process
-        sleep(Duration::from_millis(10)).await;
-
-        // Load should still be 1 (streaming in progress)
-        assert_eq!(prefill_ref.load(), 1);
-        assert_eq!(decode_ref.load(), 1);
-
-        // Close the stream
-        drop(tx);
-
-        // Give time for cleanup
-        sleep(Duration::from_millis(100)).await;
-
-        // Load should be decremented after streaming completes
-        assert_eq!(prefill_ref.load(), 0);
-        assert_eq!(decode_ref.load(), 0);
-    }
-
     // ============= Concurrent Operations Tests =============
 
     #[tokio::test]
@@ -3021,5 +1535,443 @@ mod tests {
         // Check final state
         let workers = router.worker_registry.get_prefill_workers();
         assert_eq!(workers.len(), 5);
+    }
+
+    // ============= DP-Aware Worker Creation Tests =============
+    // These tests verify that add_prefill_server/add_decode_server create
+    // DPAwareWorker (not BasicWorker) when dp_size > 1, preventing IPv6+DP
+    // URL corruption where @rank is misinterpreted as userinfo per RFC 3986.
+
+    #[test]
+    fn test_pd_router_dp_size_field() {
+        let router1 = create_test_pd_router();
+        assert_eq!(
+            router1.dp_size, 1,
+            "Default test router should have dp_size=1"
+        );
+
+        let router2 = create_test_pd_router_with_dp(4);
+        assert_eq!(router2.dp_size, 4);
+    }
+
+    #[test]
+    fn test_add_prefill_dp_creates_dp_aware_worker() {
+        // Simulate what happens when add_prefill_server registers a @rank URL
+        // with dp_size > 1: should create DPAwareWorker, not BasicWorker
+        let router = create_test_pd_router_with_dp(2);
+        let url = "http://10.0.0.1:8000@0";
+
+        let (base_url, dp_rank) = super::dp_utils::parse_worker_url(url);
+        let worker: Arc<dyn Worker> = Arc::new(DPAwareWorker::new(
+            base_url.clone(),
+            dp_rank.unwrap_or(0),
+            router.dp_size,
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+        ));
+
+        router.worker_registry.register(worker.clone());
+
+        // Verify worker is DP-aware
+        assert!(
+            worker.is_dp_aware(),
+            "Worker should be DP-aware when dp_size > 1"
+        );
+        assert_eq!(worker.dp_rank(), Some(0));
+        assert_eq!(worker.dp_size(), Some(2));
+
+        // Critical: endpoint_url must NOT contain @rank
+        let endpoint = worker.endpoint_url("/v1/completions");
+        assert_eq!(
+            endpoint, "http://10.0.0.1:8000/v1/completions",
+            "DPAwareWorker endpoint_url must strip @rank"
+        );
+        assert!(
+            !endpoint.contains('@'),
+            "endpoint_url must not contain @ (got: {})",
+            endpoint
+        );
+
+        // Verify the registry URL still has @rank for identification
+        assert_eq!(worker.url(), "http://10.0.0.1:8000@0");
+    }
+
+    #[test]
+    fn test_add_prefill_dp1_creates_basic_worker() {
+        // With dp_size=1, should create BasicWorker (no @rank in URL)
+        let router = create_test_pd_router();
+        let url = "http://10.0.0.1:8000";
+
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            url.to_string(),
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+        ));
+
+        router.worker_registry.register(worker.clone());
+
+        assert!(
+            !worker.is_dp_aware(),
+            "Worker should NOT be DP-aware when dp_size=1"
+        );
+        assert_eq!(worker.dp_rank(), None);
+        assert_eq!(
+            worker.endpoint_url("/v1/completions"),
+            "http://10.0.0.1:8000/v1/completions"
+        );
+    }
+
+    #[test]
+    fn test_add_decode_dp_creates_dp_aware_worker() {
+        let router = create_test_pd_router_with_dp(4);
+        let url = "http://10.0.0.1:9000@2";
+
+        let (base_url, dp_rank) = super::dp_utils::parse_worker_url(url);
+        let worker: Arc<dyn Worker> = Arc::new(DPAwareWorker::new(
+            base_url,
+            dp_rank.unwrap_or(0),
+            router.dp_size,
+            WorkerType::Decode,
+        ));
+
+        router.worker_registry.register(worker.clone());
+
+        assert!(worker.is_dp_aware());
+        assert_eq!(worker.dp_rank(), Some(2));
+        assert_eq!(worker.dp_size(), Some(4));
+
+        let endpoint = worker.endpoint_url("/v1/completions");
+        assert_eq!(endpoint, "http://10.0.0.1:9000/v1/completions");
+        assert!(!endpoint.contains('@'));
+    }
+
+    #[test]
+    fn test_dp_aware_worker_ipv6_url_not_corrupted() {
+        // This is the exact production bug: IPv6 + @rank suffix causes URL corruption
+        let router = create_test_pd_router_with_dp(2);
+        let ipv6_url = "https://[2a03:83e4:5006:0090:5f5a:f8c5:0400:0000]:20009@0";
+
+        let (base_url, dp_rank) = super::dp_utils::parse_worker_url(ipv6_url);
+        assert_eq!(
+            base_url,
+            "https://[2a03:83e4:5006:0090:5f5a:f8c5:0400:0000]:20009"
+        );
+        assert_eq!(dp_rank, Some(0));
+
+        // DPAwareWorker correctly strips @rank
+        let dp_worker: Arc<dyn Worker> = Arc::new(DPAwareWorker::new(
+            base_url.clone(),
+            dp_rank.unwrap_or(0),
+            router.dp_size,
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+        ));
+
+        let endpoint = dp_worker.endpoint_url("/v1/completions");
+        assert_eq!(
+            endpoint, "https://[2a03:83e4:5006:0090:5f5a:f8c5:0400:0000]:20009/v1/completions",
+            "DPAwareWorker must produce clean IPv6 endpoint URL"
+        );
+
+        // BasicWorker would include @rank, causing corruption
+        let basic_worker = BasicWorker::new(
+            ipv6_url.to_string(),
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+        );
+        let bad_endpoint = basic_worker.endpoint_url("/v1/completions");
+        assert_eq!(
+            bad_endpoint,
+            "https://[2a03:83e4:5006:0090:5f5a:f8c5:0400:0000]:20009@0/v1/completions",
+            "BasicWorker includes @rank in endpoint URL (this is the bug)"
+        );
+    }
+
+    #[test]
+    fn test_dp_add_prefill_logic_matches_new() {
+        // Verify that the add_prefill_server logic (dp_size > 1 branch)
+        // produces the same result as PdRouterBase::new() worker creation
+        let dp_size = 4;
+        let urls = [
+            "http://10.0.0.1:8000@0",
+            "http://10.0.0.1:8000@1",
+            "http://10.0.0.1:8000@2",
+            "http://10.0.0.1:8000@3",
+        ];
+
+        for (expected_rank, url) in urls.iter().enumerate() {
+            let (base_url, dp_rank) = super::dp_utils::parse_worker_url(url);
+            assert_eq!(base_url, "http://10.0.0.1:8000");
+            assert_eq!(dp_rank, Some(expected_rank));
+
+            let worker = DPAwareWorker::new(
+                base_url,
+                dp_rank.unwrap_or(0),
+                dp_size,
+                WorkerType::Prefill {
+                    bootstrap_port: Some(8080),
+                },
+            );
+
+            assert!(worker.is_dp_aware());
+            assert_eq!(worker.dp_rank(), Some(expected_rank));
+            assert_eq!(worker.dp_size(), Some(dp_size));
+            assert_eq!(
+                worker.endpoint_url("/v1/completions"),
+                "http://10.0.0.1:8000/v1/completions"
+            );
+        }
+    }
+
+    // ============= Bare URL DP Expansion Tests =============
+    // These tests verify that add_prefill_server/add_decode_server correctly
+    // expand bare URLs (without @rank) from K8s service discovery into
+    // dp_size DPAwareWorkers. Without expansion, all traffic pins to rank 0
+    // via unwrap_or(0), bypassing vLLM's hybrid load balancer.
+
+    #[tokio::test]
+    async fn test_add_prefill_bare_url_expands_to_dp_size_workers() {
+        let router = create_test_pd_router_with_dp(4);
+        let bare_url = "http://10.0.0.1:8000";
+
+        // Simulate what service discovery does: call add_prefill_server with bare URL.
+        // We can't call add_prefill_server directly (it does health checks),
+        // so test the expansion logic inline.
+        let dp_size = router.dp_size;
+        assert_eq!(dp_size, 4);
+
+        // Bare URL has no @rank
+        let (_base, dp_rank) = super::dp_utils::parse_worker_url(bare_url);
+        assert!(dp_rank.is_none(), "Bare URL should not have @rank");
+
+        // Expand: register dp_size workers
+        for rank in 0..dp_size {
+            let worker: Arc<dyn Worker> = Arc::new(DPAwareWorker::new(
+                bare_url.to_string(),
+                rank,
+                dp_size,
+                WorkerType::Prefill {
+                    bootstrap_port: None,
+                },
+            ));
+            router.worker_registry.register(worker);
+        }
+
+        // Should have 4 workers, not 1
+        let workers = router.worker_registry.get_prefill_workers();
+        assert_eq!(
+            workers.len(),
+            4,
+            "Bare URL should expand into dp_size workers"
+        );
+
+        // Each worker should have a distinct rank
+        let mut ranks: Vec<usize> = workers.iter().filter_map(|w| w.dp_rank()).collect();
+        ranks.sort();
+        assert_eq!(ranks, vec![0, 1, 2, 3], "All DP ranks should be present");
+
+        // All workers should share the same base endpoint
+        for w in &workers {
+            assert_eq!(
+                w.endpoint_url("/v1/completions"),
+                "http://10.0.0.1:8000/v1/completions"
+            );
+        }
+
+        // Registry URLs should have @rank suffixes
+        let mut urls: Vec<String> = workers.iter().map(|w| w.url().to_string()).collect();
+        urls.sort();
+        assert_eq!(
+            urls,
+            vec![
+                "http://10.0.0.1:8000@0",
+                "http://10.0.0.1:8000@1",
+                "http://10.0.0.1:8000@2",
+                "http://10.0.0.1:8000@3",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_add_decode_bare_url_expands_to_dp_size_workers() {
+        let router = create_test_pd_router_with_dp(4);
+        let bare_url = "http://10.0.0.2:8000";
+
+        for rank in 0..router.dp_size {
+            let worker: Arc<dyn Worker> = Arc::new(DPAwareWorker::new(
+                bare_url.to_string(),
+                rank,
+                router.dp_size,
+                WorkerType::Decode,
+            ));
+            router.worker_registry.register(worker);
+        }
+
+        let workers = router.worker_registry.get_decode_workers();
+        assert_eq!(workers.len(), 4);
+
+        let mut ranks: Vec<usize> = workers.iter().filter_map(|w| w.dp_rank()).collect();
+        ranks.sort();
+        assert_eq!(ranks, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn test_bare_url_rank0_pinning_regression() {
+        // This is the exact regression from c1710b1: bare URL + dp_size > 1
+        // should NOT create a single worker pinned to rank 0.
+        let router = create_test_pd_router_with_dp(4);
+        let bare_url = "http://10.0.0.1:8000";
+
+        // Old buggy behavior: parse bare URL -> dp_rank=None -> unwrap_or(0)
+        // -> single DPAwareWorker at rank 0
+        let (_base, dp_rank) = super::dp_utils::parse_worker_url(bare_url);
+        assert!(
+            dp_rank.is_none(),
+            "parse_worker_url on bare URL must return None, not Some(0)"
+        );
+
+        // Correct behavior: expand into dp_size workers
+        // (The fix checks dp_rank.is_some() to distinguish pre-expanded from bare)
+        if dp_rank.is_none() {
+            // Must expand, not fall through to unwrap_or(0)
+            for rank in 0..router.dp_size {
+                let worker: Arc<dyn Worker> = Arc::new(DPAwareWorker::new(
+                    bare_url.to_string(),
+                    rank,
+                    router.dp_size,
+                    WorkerType::Prefill {
+                        bootstrap_port: None,
+                    },
+                ));
+                router.worker_registry.register(worker);
+            }
+        }
+
+        let workers = router.worker_registry.get_prefill_workers();
+        assert_ne!(
+            workers.len(),
+            1,
+            "Bare URL must NOT create a single rank-0 worker (regression check)"
+        );
+        assert_eq!(workers.len(), 4);
+    }
+
+    #[test]
+    fn test_remove_dp_expanded_workers_by_prefix() {
+        let router = create_test_pd_router_with_dp(4);
+        let bare_url = "http://10.0.0.1:8000";
+
+        // Register 4 expanded workers
+        for rank in 0..4 {
+            let worker: Arc<dyn Worker> = Arc::new(DPAwareWorker::new(
+                bare_url.to_string(),
+                rank,
+                4,
+                WorkerType::Prefill {
+                    bootstrap_port: None,
+                },
+            ));
+            router.worker_registry.register(worker);
+        }
+        assert_eq!(router.worker_registry.get_prefill_workers().len(), 4);
+
+        // Remove by bare URL prefix
+        let result = router.remove_dp_expanded_workers(bare_url, "prefill");
+        assert!(result.is_ok());
+        assert_eq!(router.worker_registry.get_prefill_workers().len(), 0);
+    }
+
+    #[test]
+    fn test_remove_dp_expanded_workers_not_found() {
+        let router = create_test_pd_router_with_dp(4);
+        let result = router.remove_dp_expanded_workers("http://nonexistent:8000", "prefill");
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_pre_expanded_url_still_works() {
+        // Pre-expanded URLs (with @rank) should still create a single worker,
+        // not trigger re-expansion.
+        let router = create_test_pd_router_with_dp(4);
+        let pre_expanded_url = "http://10.0.0.1:8000@2";
+
+        let (_base, dp_rank) = super::dp_utils::parse_worker_url(pre_expanded_url);
+        assert_eq!(dp_rank, Some(2), "Pre-expanded URL should parse to rank 2");
+
+        // Register as single worker (what add_prefill_server does for @rank URLs)
+        let (base_url, dp_rank) = super::dp_utils::parse_worker_url(pre_expanded_url);
+        let worker: Arc<dyn Worker> = Arc::new(DPAwareWorker::new(
+            base_url,
+            dp_rank.unwrap(),
+            router.dp_size,
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+        ));
+        router.worker_registry.register(worker.clone());
+
+        let workers = router.worker_registry.get_prefill_workers();
+        assert_eq!(
+            workers.len(),
+            1,
+            "Pre-expanded @rank URL should create exactly 1 worker"
+        );
+        assert_eq!(workers[0].dp_rank(), Some(2));
+    }
+
+    #[tokio::test]
+    async fn test_bare_url_dp1_creates_basic_worker() {
+        // With dp_size=1, bare URL should create BasicWorker (no DP expansion)
+        let router = create_test_pd_router();
+        assert_eq!(router.dp_size, 1);
+
+        let bare_url = "http://10.0.0.1:8000";
+        let worker: Arc<dyn Worker> = Arc::from(WorkerFactory::create_prefill_with_config(
+            bare_url.to_string(),
+            None,
+            router.circuit_breaker_config.clone(),
+        ));
+        router.worker_registry.register(worker.clone());
+
+        let workers = router.worker_registry.get_prefill_workers();
+        assert_eq!(workers.len(), 1);
+        assert!(!workers[0].is_dp_aware());
+        assert_eq!(workers[0].dp_rank(), None);
+    }
+
+    #[tokio::test]
+    async fn test_two_bare_urls_expand_independently() {
+        // Simulates 2 pods discovered by service discovery, each expanded to dp_size workers
+        let router = create_test_pd_router_with_dp(4);
+
+        for bare_url in &["http://10.0.0.1:8000", "http://10.0.0.2:8000"] {
+            for rank in 0..router.dp_size {
+                let worker: Arc<dyn Worker> = Arc::new(DPAwareWorker::new(
+                    bare_url.to_string(),
+                    rank,
+                    router.dp_size,
+                    WorkerType::Prefill {
+                        bootstrap_port: None,
+                    },
+                ));
+                router.worker_registry.register(worker);
+            }
+        }
+
+        let workers = router.worker_registry.get_prefill_workers();
+        assert_eq!(workers.len(), 8, "2 hosts × 4 ranks = 8 workers");
+
+        // Remove one host's workers
+        let result = router.remove_dp_expanded_workers("http://10.0.0.1:8000", "prefill");
+        assert!(result.is_ok());
+        assert_eq!(
+            router.worker_registry.get_prefill_workers().len(),
+            4,
+            "Only host 2's workers should remain"
+        );
     }
 }

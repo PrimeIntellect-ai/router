@@ -196,7 +196,7 @@ def pd_cluster(e2e_model: str):
             str(rport),
             "--policy",
             "round_robin",
-            "--pd-disaggregation",
+            "--vllm-pd-disaggregation",
         ]
         for url, bport in prefill:
             cmd += ["--prefill", url, str(bport)]

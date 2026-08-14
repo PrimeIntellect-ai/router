@@ -18,9 +18,9 @@
 
 mod common;
 
+use axum::body::Body;
 use common::mock_worker::{HealthStatus, MockWorker, MockWorkerConfig, WorkerType};
 use common::test_app::create_test_app;
-use axum::body::Body;
 use http_body_util::BodyExt;
 use reqwest::Client;
 use serde_json::json;
@@ -356,6 +356,140 @@ async fn test_streaming_request_load_returns_to_zero() {
     for w in &mut workers {
         w.stop().await;
     }
+}
+
+#[tokio::test]
+async fn test_inference_generate_tracks_in_flight_load() {
+    let (mut workers, router, config) = setup_cache_aware_router(vec![MockWorkerConfig {
+        port: 0,
+        worker_type: WorkerType::Regular,
+        health_status: HealthStatus::Healthy,
+        response_delay_ms: 500,
+        fail_rate: 0.0,
+    }])
+    .await;
+
+    let app = create_test_app(router.clone(), Client::new(), &config);
+    let mut requests = Vec::new();
+    for _ in 0..4 {
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/inference/v1/generate")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "model": "mock-model",
+                    "token_ids": [1, 2, 3],
+                    "sampling_params": {"max_tokens": 1},
+                    "stream": false
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        requests.push(tokio::spawn(app.clone().oneshot(request)));
+    }
+
+    tokio::time::timeout(tokio::time::Duration::from_secs(2), async {
+        while get_total_internal_load(&router) != 4 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("all requests should enter cache-aware load tracking");
+    assert_eq!(
+        get_total_internal_load(&router),
+        4,
+        "/inference/v1/generate requests must participate in cache-aware load tracking"
+    );
+
+    for request in requests {
+        let response = request.await.unwrap().unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let _ = response.into_body().collect().await;
+    }
+    assert_eq!(get_total_internal_load(&router), 0);
+
+    for worker in &mut workers {
+        worker.stop().await;
+    }
+}
+
+/// A 500 whose body read fails mid-transfer (worker closes the connection
+/// before sending the advertised Content-Length) must still release the
+/// cache-aware load slot. send_typed_request owns the whole load lifecycle,
+/// so a missing decrement on this early-return path leaks one count per
+/// retry attempt.
+#[tokio::test]
+async fn test_truncated_500_body_read_releases_load() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // Raw TCP worker: well-formed responses for GET (health/model probes),
+    // and for POST a 500 that advertises 1000 body bytes, sends 5, then
+    // closes — making the router's body read fail.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (mut sock, _) = match listener.accept().await {
+                Ok(x) => x,
+                Err(_) => break,
+            };
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 8192];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let head = String::from_utf8_lossy(&buf[..n]);
+                let resp: &[u8] = if head.starts_with("GET") {
+                    b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok"
+                } else {
+                    b"HTTP/1.1 500 Internal Server Error\r\ncontent-length: 1000\r\nconnection: close\r\n\r\noops!"
+                };
+                let _ = sock.write_all(resp).await;
+                let _ = sock.shutdown().await;
+            });
+        }
+    });
+
+    let config = RouterConfig {
+        mode: RoutingMode::Regular {
+            worker_urls: vec![format!("http://{}", addr)],
+        },
+        policy: PolicyConfig::CacheAware {
+            cache_threshold: 0.5,
+            balance_abs_threshold: 2,
+            balance_rel_threshold: 1.5,
+            eviction_interval_secs: 0,
+            max_tree_size: 100,
+        },
+        port: 0,
+        worker_startup_timeout_secs: 5,
+        worker_startup_check_interval_secs: 1,
+        ..Default::default()
+    };
+    let app_context = common::create_test_context(config.clone());
+    let router = RouterFactory::create_router(&app_context).await.unwrap();
+    let router: Arc<dyn RouterTrait> = Arc::from(router);
+    let app = create_test_app(router.clone(), Client::new(), &config);
+
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri("/v1/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({"model": "test", "prompt": "hi", "max_tokens": 4}).to_string(),
+        ))
+        .unwrap();
+    let response = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        response.status(),
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR
+    );
+    let _ = response.into_body().collect().await;
+
+    assert_eq!(
+        get_total_internal_load(&router),
+        0,
+        "failed 500-body read must release the load slot on every retry attempt"
+    );
 }
 
 #[tokio::test]

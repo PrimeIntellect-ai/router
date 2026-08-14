@@ -17,7 +17,7 @@ def test_pd_power_of_two_decode_attribution(router_manager, mock_workers):
 
     rh = router_manager.start_router(
         policy="power_of_two",
-        pd_disaggregation=True,
+        vllm_pd_disaggregation=True,
         prefill_urls=prefill_urls,
         decode_urls=decode_urls,
         extra={"worker_startup_check_interval": 1},
@@ -61,7 +61,7 @@ def test_pd_power_of_two_skews_to_faster_decode(router_manager, mock_workers):
 
     rh = router_manager.start_router(
         policy="power_of_two",
-        pd_disaggregation=True,
+        vllm_pd_disaggregation=True,
         prefill_urls=prefill_urls,
         decode_urls=decode_urls,
         extra={"worker_startup_check_interval": 1},

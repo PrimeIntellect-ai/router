@@ -253,8 +253,8 @@ if ! command -v vllm-router &> /dev/null; then
 
   # Install build dependencies
   if ! command -v pkg-config &> /dev/null; then
-    echo "Installing build dependencies (pkg-config, libssl-dev, protobuf-compiler)..."
-    apt-get update && apt-get install -y pkg-config libssl-dev protobuf-compiler
+    echo "Installing build dependencies (pkg-config, libssl-dev)..."
+    apt-get update && apt-get install -y pkg-config libssl-dev
   fi
 
   # Install Rust if not available

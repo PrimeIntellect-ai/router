@@ -84,7 +84,8 @@ pub enum ChatMessage {
         tool_calls: Option<Vec<ToolCall>>,
         #[serde(skip_serializing_if = "Option::is_none")]
         function_call: Option<FunctionCallResponse>,
-        /// Reasoning content for reasoning models
+        /// Reasoning content for reasoning models. The custom Deserialize impl
+        /// below also accepts the deprecated `reasoning_content` alias.
         #[serde(skip_serializing_if = "Option::is_none")]
         reasoning: Option<String>,
     },
@@ -144,13 +145,15 @@ impl<'de> Deserialize<'de> for ChatMessage {
                         serde_json::from_value(fc.clone()).ok()
                     }
                 }),
-                reasoning: value.get("reasoning").and_then(|r| {
-                    if r.is_null() {
-                        None
-                    } else {
-                        r.as_str().map(String::from)
-                    }
-                }),
+                // `reasoning` is vLLM's canonical field. Prefer a usable canonical
+                // string when both keys are present; otherwise fall back to the
+                // deprecated `reasoning_content` alias, including when `reasoning`
+                // is null or not a string. Serialization remains canonical.
+                reasoning: value
+                    .get("reasoning")
+                    .and_then(Value::as_str)
+                    .or_else(|| value.get("reasoning_content").and_then(Value::as_str))
+                    .map(String::from),
             }),
             "system" => Ok(ChatMessage::System {
                 role: role.to_string(),
@@ -525,9 +528,9 @@ pub struct ChatCompletionRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub structured_outputs: Option<StructuredOutputsParams>,
 
-    /// Catch-all for extra fields (e.g. vLLM's return_token_ids)
+    /// Additional fields passed through transparently to the backend
     #[serde(flatten)]
-    pub extra: HashMap<String, serde_json::Value>,
+    pub other: serde_json::Map<String, serde_json::Value>,
 }
 
 impl GenerationRequest for ChatCompletionRequest {
@@ -1971,6 +1974,42 @@ impl GenerationRequest for GenerateRequest {
 }
 
 // ==================================================================
+// =   VLLM SPEC - DISAGG /inference/v1/generate API              =
+// ==================================================================
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct InferenceGenerateRequest {
+    pub token_ids: Vec<i32>,
+
+    #[serde(default)]
+    pub stream: bool,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+
+    #[serde(flatten)]
+    pub other: serde_json::Map<String, serde_json::Value>,
+}
+
+impl GenerationRequest for InferenceGenerateRequest {
+    fn is_stream(&self) -> bool {
+        self.stream
+    }
+
+    fn get_model(&self) -> Option<&str> {
+        self.model.as_deref()
+    }
+
+    fn extract_text_for_routing(&self) -> String {
+        self.token_ids
+            .iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<String>>()
+            .join(" ")
+    }
+}
+
+// ==================================================================
 // =            VLLM SPEC - RERANK API                            =
 // ==================================================================
 
@@ -2371,6 +2410,80 @@ pub enum LoRAPath {
 mod tests {
     use super::*;
     use serde_json;
+
+    // ==================================================================
+    // =  InferenceGenerateRequest (/inference/v1/generate) TESTS       =
+    // ==================================================================
+
+    #[test]
+    fn test_inference_generate_routing_key_from_token_ids() {
+        let body = serde_json::json!({
+            "token_ids": [151644, 8948, 198, 2610],
+            "sampling_params": {"max_tokens": 4096, "seed": 42, "logprobs": 1}
+        });
+        let req: InferenceGenerateRequest = serde_json::from_value(body).unwrap();
+        assert_eq!(req.extract_text_for_routing(), "151644 8948 198 2610");
+    }
+
+    #[test]
+    fn test_inference_generate_lossless_passthrough() {
+        let body = serde_json::json!({
+            "token_ids": [1, 2, 3],
+            "model": "qwen3-30b",
+            "sampling_params": {
+                "max_tokens": 4096,
+                "seed": 42,
+                "logprobs": 1,
+                "temperature": 1.0
+            }
+        });
+        let req: InferenceGenerateRequest = serde_json::from_value(body).unwrap();
+        let forwarded: serde_json::Value = serde_json::to_value(&req).unwrap();
+
+        assert_eq!(forwarded["token_ids"], serde_json::json!([1, 2, 3]));
+        assert_eq!(forwarded["sampling_params"]["max_tokens"], 4096);
+        assert_eq!(forwarded["sampling_params"]["seed"], 42);
+        assert_eq!(forwarded["sampling_params"]["logprobs"], 1);
+        assert_eq!(forwarded["sampling_params"]["temperature"], 1.0);
+        assert_eq!(forwarded["model"], "qwen3-30b");
+    }
+
+    #[test]
+    fn test_inference_generate_same_tokens_same_key_regardless_of_sampling() {
+        let make = |seed: i64| -> InferenceGenerateRequest {
+            serde_json::from_value(serde_json::json!({
+                "token_ids": [151644, 8948, 198],
+                "sampling_params": {"seed": seed}
+            }))
+            .unwrap()
+        };
+        assert_eq!(
+            make(1).extract_text_for_routing(),
+            make(2).extract_text_for_routing()
+        );
+    }
+
+    #[test]
+    fn test_inference_generate_is_stream() {
+        let non_stream: InferenceGenerateRequest =
+            serde_json::from_value(serde_json::json!({"token_ids": [1]})).unwrap();
+        assert!(!non_stream.is_stream());
+
+        let stream: InferenceGenerateRequest =
+            serde_json::from_value(serde_json::json!({"token_ids": [1], "stream": true})).unwrap();
+        assert!(stream.is_stream());
+    }
+
+    #[test]
+    fn test_inference_generate_get_model() {
+        let with_model: InferenceGenerateRequest =
+            serde_json::from_value(serde_json::json!({"token_ids": [1], "model": "m"})).unwrap();
+        assert_eq!(with_model.get_model(), Some("m"));
+
+        let without: InferenceGenerateRequest =
+            serde_json::from_value(serde_json::json!({"token_ids": [1]})).unwrap();
+        assert_eq!(without.get_model(), None);
+    }
 
     // ==================================================================
     // =            RERANK REQUEST TESTS                                =
@@ -3685,6 +3798,87 @@ mod tests {
                 assert_eq!(reasoning.as_ref().unwrap(), "Thinking...");
             }
             _ => panic!("Expected Assistant message"),
+        }
+    }
+
+    #[test]
+    fn test_chat_message_assistant_reasoning_content_alias_roundtrip() {
+        // Regression: assistant turns using the deprecated `reasoning_content`
+        // alias must survive forwarding and normalize to canonical `reasoning`.
+        let json = r#"{
+            "role": "assistant",
+            "content": "The answer is 42.",
+            "reasoning_content": "First I considered X, then Y..."
+        }"#;
+
+        let message: ChatMessage = serde_json::from_str(json).unwrap();
+        match &message {
+            ChatMessage::Assistant { reasoning, .. } => {
+                assert_eq!(
+                    reasoning.as_deref(),
+                    Some("First I considered X, then Y...")
+                );
+            }
+            _ => panic!("Expected Assistant message"),
+        }
+
+        // Re-serialization emits only vLLM's canonical field.
+        let serialized = serde_json::to_value(&message).unwrap();
+        assert_eq!(
+            serialized.get("reasoning").and_then(|v| v.as_str()),
+            Some("First I considered X, then Y..."),
+        );
+        assert!(serialized.get("reasoning_content").is_none());
+
+        let reparsed: ChatMessage = serde_json::from_value(serialized).unwrap();
+        match reparsed {
+            ChatMessage::Assistant { reasoning, .. } => {
+                assert_eq!(
+                    reasoning.as_deref(),
+                    Some("First I considered X, then Y...")
+                );
+            }
+            _ => panic!("Expected Assistant message"),
+        }
+    }
+
+    #[test]
+    fn test_chat_message_assistant_reasoning_alias_precedence() {
+        let cases = [
+            (
+                r#"{
+                    "role": "assistant",
+                    "reasoning": "canonical",
+                    "reasoning_content": "deprecated alias"
+                }"#,
+                "canonical",
+            ),
+            (
+                r#"{
+                    "role": "assistant",
+                    "reasoning": null,
+                    "reasoning_content": "deprecated alias"
+                }"#,
+                "deprecated alias",
+            ),
+            (
+                r#"{
+                    "role": "assistant",
+                    "reasoning": 42,
+                    "reasoning_content": "deprecated alias"
+                }"#,
+                "deprecated alias",
+            ),
+        ];
+
+        for (json, expected) in cases {
+            let message: ChatMessage = serde_json::from_str(json).unwrap();
+            match message {
+                ChatMessage::Assistant { reasoning, .. } => {
+                    assert_eq!(reasoning.as_deref(), Some(expected));
+                }
+                _ => panic!("Expected Assistant message"),
+            }
         }
     }
 }

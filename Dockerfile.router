@@ -1,11 +1,10 @@
 # Stage 1: Build the vllm-router binary
 FROM rust:1.86-bookworm AS builder
 
-RUN apt-get update && apt-get install -y protobuf-compiler && rm -rf /var/lib/apt/lists/*
 RUN rustup toolchain install nightly && rustup default nightly
 
 WORKDIR /build
-COPY Cargo.toml Cargo.lock build.rs ./
+COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 
 RUN cargo build --release --bin vllm-router

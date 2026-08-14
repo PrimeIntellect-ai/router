@@ -27,7 +27,7 @@ This document contains benchmark results for Llama 3.1 8B Instruct deployed with
 ### Router Configuration
 ```bash
 vllm-router \
-    --pd-disaggregation \
+    --vllm-pd-disaggregation \
     --prefill http://10.2.1.187:8000 \
     --decode http://10.2.1.133:8200 \
     --intra-node-data-parallel-size 8 \

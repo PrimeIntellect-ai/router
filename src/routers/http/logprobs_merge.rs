@@ -72,7 +72,10 @@ pub fn merge_logprobs_in_json(prefill_json: &Value, decode_json: &mut Value) -> 
                 );
                 debug!(
                     "[LOGPROBS MERGE] Merged prompt_token_ids from prefill: {} tokens",
-                    prefill_prompt_token_ids.as_array().map(|a| a.len()).unwrap_or(0)
+                    prefill_prompt_token_ids
+                        .as_array()
+                        .map(|a| a.len())
+                        .unwrap_or(0)
                 );
                 merged = true;
             }

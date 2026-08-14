@@ -1,6 +1,6 @@
 use crate::{
     auth::{JwtVerifier, RftClaims},
-    config::{ConnectionMode, HistoryBackend, RouterConfig, TraceConfig},
+    config::{HistoryBackend, RouterConfig, TraceConfig},
     core::{WorkerRegistry, WorkerType},
     data_connector::{MemoryResponseStorage, NoOpResponseStorage, SharedResponseStorage},
     logging::{self, LoggingConfig},
@@ -10,7 +10,7 @@ use crate::{
     protocols::{
         spec::{
             ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest,
-            RerankRequest, V1RerankReqInput, DEFAULT_MODEL_NAME,
+            InferenceGenerateRequest, RerankRequest, V1RerankReqInput, DEFAULT_MODEL_NAME,
         },
         worker_spec::{WorkerApiResponse, WorkerConfigRequest, WorkerErrorResponse},
     },
@@ -19,7 +19,6 @@ use crate::{
         RouterFactory, RouterTrait,
     },
     service_discovery::{start_service_discovery, ServiceDiscoveryConfig},
-    tokenizer::{factory as tokenizer_factory, traits::Tokenizer},
 };
 use axum::{
     extract::{DefaultBodyLimit, Path, Query, Request, State},
@@ -45,7 +44,6 @@ pub struct AppContext {
     pub client: Client,
     pub router_config: RouterConfig,
     pub rate_limiter: Arc<TokenBucket>,
-    pub tokenizer: Option<Arc<dyn Tokenizer>>,
     pub worker_registry: Arc<WorkerRegistry>,
     pub policy_registry: Arc<PolicyRegistry>,
     pub router_manager: Option<Arc<RouterManager>>,
@@ -65,28 +63,6 @@ impl AppContext {
     ) -> Result<Self, String> {
         let rate_limit_tokens = rate_limit_tokens_per_second.unwrap_or(max_concurrent_requests);
         let rate_limiter = Arc::new(TokenBucket::new(max_concurrent_requests, rate_limit_tokens));
-
-        // Initialize gRPC-specific components only when in gRPC mode
-        let tokenizer = if router_config.connection_mode == ConnectionMode::Grpc {
-            // Get tokenizer path (required for gRPC mode)
-            let tokenizer_path = router_config
-                .tokenizer_path
-                .clone()
-                .or_else(|| router_config.model_path.clone())
-                .ok_or_else(|| {
-                    "gRPC mode requires either --tokenizer-path or --model-path to be specified"
-                        .to_string()
-                })?;
-
-            // Initialize tokenizer
-            Some(
-                tokenizer_factory::create_tokenizer(&tokenizer_path)
-                    .map_err(|e| format!("Failed to create tokenizer: {e}"))?,
-            )
-        } else {
-            // HTTP mode doesn't need tokenizer
-            None
-        };
 
         let worker_registry = Arc::new(WorkerRegistry::new());
         let policy_registry = Arc::new(PolicyRegistry::new(router_config.policy.clone()));
@@ -117,7 +93,6 @@ impl AppContext {
             client,
             router_config,
             rate_limiter,
-            tokenizer,
             worker_registry,
             policy_registry,
             router_manager,
@@ -306,7 +281,10 @@ async fn filter_models_response(response: Response, claims: &RftClaims) -> Respo
         Ok(b) => b,
         Err(e) => {
             warn!("failed to read /v1/models body for filtering: {e}");
-            return (StatusCode::BAD_GATEWAY, "failed to read upstream models response")
+            return (
+                StatusCode::BAD_GATEWAY,
+                "failed to read upstream models response",
+            )
                 .into_response();
         }
     };
@@ -315,7 +293,10 @@ async fn filter_models_response(response: Response, claims: &RftClaims) -> Respo
         Ok(v) => v,
         Err(e) => {
             warn!("failed to parse /v1/models body for filtering: {e}");
-            return (StatusCode::BAD_GATEWAY, "failed to parse upstream models response")
+            return (
+                StatusCode::BAD_GATEWAY,
+                "failed to parse upstream models response",
+            )
                 .into_response();
         }
     };
@@ -412,6 +393,7 @@ fn run_id_from_claims(claims: &Option<RftClaims>) -> Option<String> {
 ///
 /// API-key auth (`claims == None`) is unrestricted and the body is
 /// passed through unchanged.
+#[allow(clippy::result_large_err)]
 fn pin_and_check_model(
     claims: &Option<RftClaims>,
     model: &mut Option<String>,
@@ -472,6 +454,7 @@ fn pin_and_check_model(
 /// `V1RerankReqInput` has no model field at all and always lands here
 /// with `model == "default"` after the `From` conversion — a JWT caller
 /// could otherwise never satisfy the scope check.
+#[allow(clippy::result_large_err)]
 fn pin_and_check_model_string(
     claims: &Option<RftClaims>,
     model: &mut String,
@@ -521,6 +504,7 @@ fn pin_and_check_model_string(
 /// JSON-body variant for the transparent proxy / `/v1/responses`. Same
 /// semantics as [`pin_and_check_model`]: pins missing/empty `model` to
 /// the JWT base, then validates against the allowlist.
+#[allow(clippy::result_large_err)]
 fn pin_and_check_model_json(
     claims: &Option<RftClaims>,
     body: &mut serde_json::Value,
@@ -580,6 +564,7 @@ fn pin_and_check_model_json(
 /// `lora_path` extension lets a caller point at any LoRA on disk, which
 /// would bypass the JWT's `lora` claim. We hard-reject so failures are
 /// loud rather than silent.
+#[allow(clippy::result_large_err)]
 fn enforce_no_lora_path_override<T>(
     claims: &Option<RftClaims>,
     lora_path: &Option<T>,
@@ -598,6 +583,7 @@ fn enforce_no_lora_path_override<T>(
 /// absent — only a non-null override is rejected — to stay consistent
 /// with the typed handlers, where `Option<LoRAPath>` deserializes
 /// `null` to `None`.
+#[allow(clippy::result_large_err)]
 fn enforce_no_lora_path_override_json(
     claims: &Option<RftClaims>,
     body: &serde_json::Value,
@@ -641,6 +627,40 @@ async fn generate(
         .await
 }
 
+async fn inference_generate(
+    State(state): State<Arc<AppState>>,
+    headers: http::HeaderMap,
+    Json(mut body): Json<InferenceGenerateRequest>,
+) -> Response {
+    let claims = match authorize_request(&state, &headers).await {
+        Ok(c) => c,
+        Err(response) => return response,
+    };
+    if let Err(response) = pin_and_check_model(&claims, &mut body.model) {
+        return response;
+    }
+    // InferenceGenerateRequest has no typed `lora_path` field — a
+    // JWT caller could still smuggle one through the flattened extras,
+    // so check the passthrough map explicitly.
+    if claims.is_some() {
+        if let Some(v) = body.other.get("lora_path") {
+            if !v.is_null() {
+                return (
+                    StatusCode::FORBIDDEN,
+                    "lora_path override is not allowed with a run-scoped JWT",
+                )
+                    .into_response();
+            }
+        }
+    }
+    let run_id = run_id_from_claims(&claims);
+
+    state
+        .router
+        .route_inference_generate(Some(&headers), &body, None, run_id.as_deref())
+        .await
+}
+
 async fn v1_chat_completions(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
@@ -661,29 +681,6 @@ async fn v1_chat_completions(
     state
         .router
         .route_chat(Some(&headers), &body, None, run_id.as_deref())
-        .await
-}
-
-async fn v1_chat_completions_tokens(
-    State(state): State<Arc<AppState>>,
-    headers: http::HeaderMap,
-    Json(mut body): Json<ChatCompletionRequest>,
-) -> Response {
-    let claims = match authorize_request(&state, &headers).await {
-        Ok(c) => c,
-        Err(response) => return response,
-    };
-    if let Err(response) = pin_and_check_model(&claims, &mut body.model) {
-        return response;
-    }
-    if let Err(response) = enforce_no_lora_path_override(&claims, &body.lora_path) {
-        return response;
-    }
-    let run_id = run_id_from_claims(&claims);
-
-    state
-        .router
-        .route_chat_tokens(Some(&headers), &body, None, run_id.as_deref())
         .await
 }
 
@@ -900,9 +897,7 @@ async fn authorize_request(
             Err(_) => {
                 // Not a valid JWT — fall through to API key validation if configured
                 if validation_urls.is_empty() {
-                    return Err(
-                        (StatusCode::UNAUTHORIZED, AUTH_FAILURE_MESSAGE).into_response()
-                    );
+                    return Err((StatusCode::UNAUTHORIZED, AUTH_FAILURE_MESSAGE).into_response());
                 }
             }
         }
@@ -1215,11 +1210,8 @@ pub fn build_app_with_request_tracing(
     // Create routes
     let protected_routes = Router::new()
         .route("/generate", post(generate))
+        .route("/inference/v1/generate", post(inference_generate))
         .route("/v1/chat/completions", post(v1_chat_completions))
-        .route(
-            "/v1/chat/completions/tokens",
-            post(v1_chat_completions_tokens),
-        )
         .route("/v1/completions", post(v1_completions))
         .route("/rerank", post(rerank))
         .route("/v1/rerank", post(v1_rerank))
@@ -1343,11 +1335,12 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     println!("DEBUG: Prometheus metrics initialized");
 
     info!(
-        "Starting router on {}:{} | mode: {:?} | policy: {:?} | max_payload: {}MB",
+        "Starting router on {}:{} | mode: {:?} | policy: {:?} | kv_connector: {:?} | max_payload: {}MB",
         config.host,
         config.port,
         config.router_config.mode,
         config.router_config.policy,
+        config.router_config.kv_connector,
         config.max_payload_size / (1024 * 1024)
     );
 
@@ -1408,10 +1401,11 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
                 }
             }
 
-            // 2. HTTP PD Router
-            match RouterFactory::create_pd_router(
+            // 2. HTTP vLLM PD Router
+            match RouterFactory::create_vllm_pd_router(
                 &[],
                 &[],
+                None,
                 None,
                 None,
                 &config.router_config.policy,
@@ -1420,16 +1414,14 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
             .await
             {
                 Ok(http_pd) => {
-                    info!("Created HTTP PD router");
+                    info!("Created HTTP vLLM PD router");
                     router_manager
                         .register_router(RouterId::new("http-pd".to_string()), Arc::from(http_pd));
                 }
                 Err(e) => {
-                    warn!("Failed to create HTTP PD router: {e}");
+                    warn!("Failed to create HTTP vLLM PD router: {e}");
                 }
             }
-
-            // TODO: Add gRPC routers once we have dynamic tokenizer loading
 
             info!(
                 "RouterManager initialized with {} routers",

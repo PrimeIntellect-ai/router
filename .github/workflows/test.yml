@@ -12,9 +12,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install protobuf compiler
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-
       - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@nightly
 
@@ -25,3 +22,14 @@ jobs:
 
       - name: Run tests
         run: cargo test
+
+      # Lints run on a pinned stable toolchain (same pin as upstream's
+      # Buildkite) so new nightly lints can't break CI.
+      - name: Install Rust 1.95.0 for lints
+        run: rustup toolchain install 1.95.0 --profile minimal --component clippy,rustfmt --no-self-update
+
+      - name: Clippy
+        run: cargo +1.95.0 clippy --all-targets -- -D warnings
+
+      - name: Format check
+        run: cargo +1.95.0 fmt --check

@@ -1,5 +1,4 @@
 use super::{CircuitBreaker, CircuitBreakerConfig, WorkerError, WorkerResult};
-use crate::grpc::VllmSchedulerClient;
 use crate::metrics::RouterMetrics;
 use async_trait::async_trait;
 use futures;
@@ -7,7 +6,6 @@ use serde_json;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
-use tokio::sync::Mutex;
 
 // Shared HTTP client for worker operations (health checks, server info, etc.)
 static WORKER_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
@@ -28,11 +26,7 @@ pub async fn fetch_models_from_worker(worker_url: &str) -> Vec<String> {
     let response = match WORKER_CLIENT.get(&url).timeout(timeout).send().await {
         Ok(r) if r.status().is_success() => r,
         Ok(r) => {
-            tracing::debug!(
-                "GET {} returned non-success status: {}",
-                url,
-                r.status()
-            );
+            tracing::debug!("GET {} returned non-success status: {}", url, r.status());
             return Vec::new();
         }
         Err(e) => {
@@ -44,7 +38,11 @@ pub async fn fetch_models_from_worker(worker_url: &str) -> Vec<String> {
     let body: serde_json::Value = match response.json().await {
         Ok(v) => v,
         Err(e) => {
-            tracing::debug!("Failed to parse /v1/models response from {}: {}", worker_url, e);
+            tracing::debug!(
+                "Failed to parse /v1/models response from {}: {}",
+                worker_url,
+                e
+            );
             return Vec::new();
         }
     };
@@ -69,7 +67,7 @@ pub trait Worker: Send + Sync + fmt::Debug {
     /// Get the worker's type (Regular, Prefill, or Decode)
     fn worker_type(&self) -> WorkerType;
 
-    /// Get the worker's connection mode (HTTP or gRPC)
+    /// Get the worker's connection mode
     fn connection_mode(&self) -> ConnectionMode;
 
     /// Check if the worker is currently healthy
@@ -207,7 +205,7 @@ pub trait Worker: Send + Sync + fmt::Debug {
     // - async fn discover_metadata(&mut self) -> Result<(), Error>
     //   Query /get_server_info and populate metadata labels with model_id, priority, cost, etc.
     // - async fn validate_configuration(&self) -> Result<(), Error>
-    //   Ensure worker has required configuration for its mode (e.g., tokenizer for gRPC)
+    //   Ensure worker has required configuration for its mode
     // - Make worker creation async to allow metadata discovery during initialization
     //
     // This way service discovery just calls router.add_worker() and the worker
@@ -239,22 +237,6 @@ pub trait Worker: Send + Sync + fmt::Debug {
             .and_then(|s| s.parse().ok())
             .unwrap_or(1.0)
     }
-
-    /// Get the tokenizer path for this worker (gRPC mode only)
-    fn tokenizer_path(&self) -> Option<&str> {
-        self.metadata()
-            .labels
-            .get("tokenizer_path")
-            .map(|s| s.as_str())
-    }
-
-    /// Get the chat template for this worker (gRPC mode only)
-    fn chat_template(&self) -> Option<&str> {
-        self.metadata()
-            .labels
-            .get("chat_template")
-            .map(|s| s.as_str())
-    }
 }
 
 /// Connection mode for worker communication
@@ -262,21 +244,12 @@ pub trait Worker: Send + Sync + fmt::Debug {
 pub enum ConnectionMode {
     /// HTTP/REST connection
     Http,
-    /// gRPC connection
-    Grpc {
-        /// Optional port for gRPC endpoint (if different from URL)
-        port: Option<u16>,
-    },
 }
 
 impl fmt::Display for ConnectionMode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ConnectionMode::Http => write!(f, "HTTP"),
-            ConnectionMode::Grpc { port } => match port {
-                Some(p) => write!(f, "gRPC(port:{})", p),
-                None => write!(f, "gRPC"),
-            },
         }
     }
 }
@@ -360,8 +333,6 @@ pub struct BasicWorker {
     consecutive_failures: Arc<AtomicUsize>,
     consecutive_successes: Arc<AtomicUsize>,
     circuit_breaker: CircuitBreaker,
-    /// Optional gRPC client for gRPC workers
-    grpc_client: Option<Arc<Mutex<VllmSchedulerClient>>>,
 }
 
 impl fmt::Debug for BasicWorker {
@@ -370,7 +341,6 @@ impl fmt::Debug for BasicWorker {
             .field("metadata", &self.metadata)
             .field("healthy", &self.healthy.load(Ordering::Relaxed))
             .field("circuit_breaker", &self.circuit_breaker)
-            .field("has_grpc_client", &self.grpc_client.is_some())
             .finish()
     }
 }
@@ -401,7 +371,6 @@ impl BasicWorker {
             consecutive_failures: Arc::new(AtomicUsize::new(0)),
             consecutive_successes: Arc::new(AtomicUsize::new(0)),
             circuit_breaker: CircuitBreaker::new(),
-            grpc_client: None,
         }
     }
 
@@ -417,12 +386,6 @@ impl BasicWorker {
 
     pub fn with_circuit_breaker_config(mut self, config: CircuitBreakerConfig) -> Self {
         self.circuit_breaker = CircuitBreaker::with_config(config);
-        self
-    }
-
-    /// Set the gRPC client for gRPC workers
-    pub fn with_grpc_client(mut self, client: VllmSchedulerClient) -> Self {
-        self.grpc_client = Some(Arc::new(Mutex::new(client)));
         self
     }
 
@@ -485,33 +448,6 @@ impl Worker for BasicWorker {
                 match WORKER_CLIENT.get(&health_url).timeout(timeout).send().await {
                     Ok(response) => response.status().is_success(),
                     Err(_) => false,
-                }
-            }
-            ConnectionMode::Grpc { .. } => {
-                // Perform gRPC health check
-                if let Some(grpc_client) = &self.grpc_client {
-                    let mut client = grpc_client.lock().await;
-                    match client.health_check().await {
-                        Ok(response) => {
-                            tracing::debug!(
-                                "gRPC health check succeeded for {}: healthy={}",
-                                self.metadata.url,
-                                response.healthy
-                            );
-                            response.healthy
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "gRPC health check RPC failed for {}: {:?}",
-                                self.metadata.url,
-                                e
-                            );
-                            false
-                        }
-                    }
-                } else {
-                    tracing::error!("No gRPC client available for worker {}", self.metadata.url);
-                    false
                 }
             }
         };
@@ -801,28 +737,6 @@ impl WorkerFactory {
             decode_urls.into_iter().map(Self::create_decode).collect();
 
         (regular_workers, prefill_workers, decode_workers)
-    }
-
-    /// Create a gRPC worker
-    pub fn create_grpc(url: String, worker_type: WorkerType, port: Option<u16>) -> Box<dyn Worker> {
-        Box::new(BasicWorker::with_connection_mode(
-            url,
-            worker_type,
-            ConnectionMode::Grpc { port },
-        ))
-    }
-
-    /// Create a gRPC worker with custom circuit breaker configuration
-    pub fn create_grpc_with_config(
-        url: String,
-        worker_type: WorkerType,
-        port: Option<u16>,
-        circuit_breaker_config: CircuitBreakerConfig,
-    ) -> Box<dyn Worker> {
-        Box::new(
-            BasicWorker::with_connection_mode(url, worker_type, ConnectionMode::Grpc { port })
-                .with_circuit_breaker_config(circuit_breaker_config),
-        )
     }
 
     /// Create a regular worker with custom labels (for multi-router support)
@@ -1581,8 +1495,7 @@ mod tests {
         let worker_clone = Arc::clone(&worker);
 
         // Use AssertUnwindSafe wrapper for the test
-        // This is safe because we're only testing the load counter behavior,
-        // not the grpc_client which is None for HTTP workers
+        // This is safe because we're only testing the load counter behavior.
         use std::panic::AssertUnwindSafe;
 
         // This will panic, but the guard should still clean up

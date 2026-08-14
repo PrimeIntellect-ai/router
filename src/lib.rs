@@ -6,8 +6,6 @@ use std::collections::HashMap;
 pub mod auth;
 pub mod core;
 pub mod data_connector;
-#[cfg(feature = "grpc-client")]
-pub mod grpc;
 pub mod metrics;
 pub mod middleware;
 pub mod otel_http;
@@ -63,8 +61,8 @@ struct Router {
     prometheus_host: Option<String>,
     request_timeout_secs: u64,
     request_id_headers: Option<Vec<String>>,
-    pd_disaggregation: bool,
     vllm_pd_disaggregation: bool,
+    vllm_discovery_address: Option<String>,
     prefill_urls: Option<Vec<(String, Option<u16>)>>,
     decode_urls: Option<Vec<String>>,
     prefill_policy: Option<PolicyType>,
@@ -95,30 +93,14 @@ struct Router {
     queue_size: usize,
     queue_timeout_secs: u64,
     rate_limit_tokens_per_second: Option<usize>,
-    // Connection mode (determined from worker URLs)
-    connection_mode: config::ConnectionMode,
-    // Model path for tokenizer
-    model_path: Option<String>,
-    // Explicit tokenizer path
-    tokenizer_path: Option<String>,
     // OpenTelemetry tracing
     enable_trace: bool,
     otlp_traces_endpoint: Option<String>,
+    // KV connector for PD disaggregation ("nixl" or "mooncake")
+    kv_connector: String,
 }
 
 impl Router {
-    /// Determine connection mode from worker URLs
-    fn determine_connection_mode(worker_urls: &[String]) -> config::ConnectionMode {
-        // Only consider it gRPC if explicitly specified with grpc:// or grpcs:// scheme
-        for url in worker_urls {
-            if url.starts_with("grpc://") || url.starts_with("grpcs://") {
-                return config::ConnectionMode::Grpc;
-            }
-        }
-        // Default to HTTP for all other cases (including http://, https://, or no scheme)
-        config::ConnectionMode::Http
-    }
-
     /// Convert PyO3 Router to RouterConfig
     pub fn to_router_config(&self) -> config::ConfigResult<config::RouterConfig> {
         use config::{
@@ -158,14 +140,7 @@ impl Router {
                 decode_urls: self.decode_urls.clone().unwrap_or_default(),
                 prefill_policy: self.prefill_policy.as_ref().map(convert_policy),
                 decode_policy: self.decode_policy.as_ref().map(convert_policy),
-                discovery_address: None,
-            }
-        } else if self.pd_disaggregation {
-            RoutingMode::PrefillDecode {
-                prefill_urls: self.prefill_urls.clone().unwrap_or_default(),
-                decode_urls: self.decode_urls.clone().unwrap_or_default(),
-                prefill_policy: self.prefill_policy.as_ref().map(convert_policy),
-                decode_policy: self.decode_policy.as_ref().map(convert_policy),
+                discovery_address: self.vllm_discovery_address.clone(),
             }
         } else {
             RoutingMode::Regular {
@@ -206,7 +181,7 @@ impl Router {
             policy,
             host: self.host.clone(),
             port: self.port,
-            connection_mode: self.connection_mode.clone(),
+            connection_mode: config::ConnectionMode::Http,
             max_payload_size: self.max_payload_size,
             request_timeout_secs: self.request_timeout_secs,
             worker_startup_timeout_secs: self.worker_startup_timeout_secs,
@@ -248,11 +223,22 @@ impl Router {
                 endpoint: self.health_check_endpoint.clone(),
             },
             enable_igw: self.enable_igw,
-            model_path: self.model_path.clone(),
-            tokenizer_path: self.tokenizer_path.clone(),
             history_backend: config::HistoryBackend::Memory,
             enable_profiling: false, // Profiling disabled in Python binding by default
             profile_timeout_secs: 10, // Default profiling timeout
+            kv_connector: match self.kv_connector.to_ascii_lowercase().as_str() {
+                "nixl" => config::KvConnector::Nixl,
+                "mooncake" => config::KvConnector::Mooncake,
+                "moriio" => config::KvConnector::MoriIO,
+                other => {
+                    return Err(config::ConfigError::ValidationFailed {
+                        reason: format!(
+                            "Invalid kv_connector '{}': expected 'nixl', 'mooncake', or 'moriio'",
+                            other
+                        ),
+                    });
+                }
+            },
         })
     }
 }
@@ -289,8 +275,8 @@ impl Router {
         prometheus_host = None,
         request_timeout_secs = 1800,  // Add configurable request timeout
         request_id_headers = None,  // Custom request ID headers
-        pd_disaggregation = false,  // New flag for PD mode
         vllm_pd_disaggregation = false,  // New flag for PD mode
+        vllm_discovery_address = None,
         prefill_urls = None,
         decode_urls = None,
         prefill_policy = None,
@@ -321,12 +307,11 @@ impl Router {
         queue_size = 100,
         queue_timeout_secs = 60,
         rate_limit_tokens_per_second = None,
-        // Tokenizer defaults
-        model_path = None,
-        tokenizer_path = None,
         // Tracing defaults
         enable_trace = false,
         otlp_traces_endpoint = None,
+        // KV connector default (PD disaggregation)
+        kv_connector = String::from("nixl"),
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -358,8 +343,8 @@ impl Router {
         prometheus_host: Option<String>,
         request_timeout_secs: u64,
         request_id_headers: Option<Vec<String>>,
-        pd_disaggregation: bool,
         vllm_pd_disaggregation: bool,
+        vllm_discovery_address: Option<String>,
         prefill_urls: Option<Vec<(String, Option<u16>)>>,
         decode_urls: Option<Vec<String>>,
         prefill_policy: Option<PolicyType>,
@@ -386,28 +371,10 @@ impl Router {
         queue_size: usize,
         queue_timeout_secs: u64,
         rate_limit_tokens_per_second: Option<usize>,
-        model_path: Option<String>,
-        tokenizer_path: Option<String>,
         enable_trace: bool,
         otlp_traces_endpoint: Option<String>,
+        kv_connector: String,
     ) -> PyResult<Self> {
-        // Determine connection mode from worker URLs
-        let mut all_urls = worker_urls.clone();
-
-        // Add prefill URLs if in PD mode
-        if let Some(ref prefill_urls) = prefill_urls {
-            for (url, _) in prefill_urls {
-                all_urls.push(url.clone());
-            }
-        }
-
-        // Add decode URLs if in PD mode
-        if let Some(ref decode_urls) = decode_urls {
-            all_urls.extend(decode_urls.clone());
-        }
-
-        let connection_mode = Self::determine_connection_mode(&all_urls);
-
         Ok(Router {
             host,
             port,
@@ -437,8 +404,8 @@ impl Router {
             prometheus_host,
             request_timeout_secs,
             request_id_headers,
-            pd_disaggregation,
             vllm_pd_disaggregation,
+            vllm_discovery_address,
             prefill_urls,
             decode_urls,
             prefill_policy,
@@ -465,11 +432,9 @@ impl Router {
             queue_size,
             queue_timeout_secs,
             rate_limit_tokens_per_second,
-            connection_mode,
-            model_path,
-            tokenizer_path,
             enable_trace,
             otlp_traces_endpoint,
+            kv_connector,
         })
     }
 
@@ -495,8 +460,8 @@ impl Router {
                 check_interval: std::time::Duration::from_secs(60),
                 port: self.service_discovery_port,
                 namespace: self.service_discovery_namespace.clone(),
-                // Enable PD mode for both --pd-disaggregation and --vllm-pd-disaggregation
-                pd_mode: self.pd_disaggregation || self.vllm_pd_disaggregation,
+                // HTTP service discovery only supports the vLLM PD router.
+                pd_mode: self.vllm_pd_disaggregation,
                 prefill_selector: self.prefill_selector.clone(),
                 decode_selector: self.decode_selector.clone(),
                 bootstrap_port_annotation: self.bootstrap_port_annotation.clone(),

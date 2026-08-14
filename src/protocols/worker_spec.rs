@@ -31,15 +31,6 @@ pub struct WorkerConfigRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bootstrap_port: Option<u16>,
 
-    // gRPC-specific configuration (optional, ignored in HTTP mode)
-    /// Tokenizer path for gRPC mode
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tokenizer_path: Option<String>,
-
-    /// Chat template for gRPC mode
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub chat_template: Option<String>,
-
     /// Additional labels (optional)
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub labels: HashMap<String, String>,
@@ -72,15 +63,8 @@ pub struct WorkerInfo {
     /// Current load on the worker
     pub load: usize,
 
-    /// Connection mode (http or grpc)
+    /// Connection mode
     pub connection_mode: String,
-
-    // gRPC-specific fields (None for HTTP workers)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tokenizer_path: Option<String>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub chat_template: Option<String>,
 
     /// Additional metadata
     #[serde(skip_serializing_if = "HashMap::is_empty")]
@@ -168,11 +152,4 @@ pub struct ServerInfo {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worker_type: Option<String>,
-
-    // gRPC-specific
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tokenizer_path: Option<String>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub chat_template: Option<String>,
 }

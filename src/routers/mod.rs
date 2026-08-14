@@ -10,12 +10,11 @@ use axum::{
 use std::fmt::Debug;
 
 use crate::protocols::spec::{
-    ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, RerankRequest,
-    ResponsesRequest,
+    ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest,
+    InferenceGenerateRequest, RerankRequest, ResponsesRequest,
 };
 
 pub mod factory;
-pub mod grpc;
 pub mod header_utils;
 pub mod http;
 pub mod router_manager;
@@ -73,6 +72,15 @@ pub trait RouterTrait: Send + Sync + Debug + WorkerManagement {
         run_id: Option<&str>,
     ) -> Response;
 
+    /// Route a generate request to vLLM's disaggregated `/inference/v1/generate`.
+    async fn route_inference_generate(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &InferenceGenerateRequest,
+        model_id: Option<&str>,
+        run_id: Option<&str>,
+    ) -> Response;
+
     /// Route a chat completion request
     async fn route_chat(
         &self,
@@ -81,18 +89,6 @@ pub trait RouterTrait: Send + Sync + Debug + WorkerManagement {
         model_id: Option<&str>,
         run_id: Option<&str>,
     ) -> Response;
-
-    /// Route a chat completion tokens (TITO) request.
-    /// Defaults to route_chat; override to forward to /v1/chat/completions/tokens.
-    async fn route_chat_tokens(
-        &self,
-        headers: Option<&HeaderMap>,
-        body: &ChatCompletionRequest,
-        model_id: Option<&str>,
-        run_id: Option<&str>,
-    ) -> Response {
-        self.route_chat(headers, body, model_id, run_id).await
-    }
 
     /// Route a completion request
     async fn route_completion(

@@ -39,7 +39,7 @@ The vLLM router with `consistent_hash` policy achieves **218.35ms mean TTFT**, c
 
 ```bash
 vllm-router \
-    --pd-disaggregation \
+    --vllm-pd-disaggregation \
     --prefill http://10.2.1.187:8000 \
     --decode http://10.2.1.133:8200 \
     --host 0.0.0.0 \
@@ -328,7 +328,7 @@ vllm bench serve \
 **Configuration:**
 ```bash
 vllm-router \
-    --pd-disaggregation \
+    --vllm-pd-disaggregation \
     --prefill http://10.2.1.187:8000 \
     --decode http://10.2.1.133:8200 \
     --host 0.0.0.0 \

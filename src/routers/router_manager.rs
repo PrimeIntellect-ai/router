@@ -7,8 +7,8 @@
 use crate::config::RouterConfig;
 use crate::core::{CircuitBreakerConfig, Worker, WorkerFactory, WorkerRegistry, WorkerType};
 use crate::protocols::spec::{
-    ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, RerankRequest,
-    ResponsesRequest,
+    ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest,
+    InferenceGenerateRequest, RerankRequest, ResponsesRequest,
 };
 use crate::protocols::worker_spec::{
     ServerInfo, WorkerApiResponse, WorkerConfigRequest, WorkerErrorResponse, WorkerInfo,
@@ -49,7 +49,7 @@ pub struct RouterManager {
     policy_registry: Arc<crate::policies::PolicyRegistry>,
 
     /// All routers managed by this manager
-    /// RouterId examples: "http-regular", "http-pd", "grpc-regular", "grpc-pd"
+    /// RouterId examples: "http-regular", "http-pd"
     routers: Arc<DashMap<RouterId, Arc<dyn RouterTrait>>>,
 
     /// Default router for requests without specific routing
@@ -188,15 +188,6 @@ impl RouterManager {
 
         if let Some(cost) = config.cost {
             labels.insert("cost".to_string(), cost.to_string());
-        }
-
-        // Add gRPC-specific configuration if provided
-        if let Some(tokenizer_path) = config.tokenizer_path {
-            labels.insert("tokenizer_path".to_string(), tokenizer_path);
-        }
-
-        if let Some(chat_template) = config.chat_template {
-            labels.insert("chat_template".to_string(), chat_template);
         }
 
         let worker = match config.worker_type.as_deref() {
@@ -367,8 +358,6 @@ impl RouterManager {
             is_healthy: worker.is_healthy(),
             load: worker.load(),
             connection_mode: format!("{:?}", worker.connection_mode()),
-            tokenizer_path: worker.tokenizer_path().map(|s| s.to_string()),
-            chat_template: worker.chat_template().map(|s| s.to_string()),
             metadata: metadata.labels.clone(),
         }
     }
@@ -470,8 +459,6 @@ impl WorkerManagement for RouterManager {
             cost: None,
             labels: std::collections::HashMap::new(),
             bootstrap_port: None,
-            tokenizer_path: None,
-            chat_template: None,
         };
 
         match self.add_worker(config).await {
@@ -567,7 +554,7 @@ impl RouterTrait for RouterManager {
         headers: Option<&HeaderMap>,
         body: &GenerateRequest,
         _model_id: Option<&str>,
-        _run_id: Option<&str>,
+        run_id: Option<&str>,
     ) -> Response {
         // Select router based on headers
         // GenerateRequest doesn't have a model field
@@ -575,9 +562,31 @@ impl RouterTrait for RouterManager {
 
         if let Some(router) = router {
             // In multi-model mode, pass None since GenerateRequest doesn't have model field
-            router.route_generate(headers, body, None, _run_id).await
+            router.route_generate(headers, body, None, run_id).await
         } else {
             // Return 404 when no router is available for the request
+            (
+                StatusCode::NOT_FOUND,
+                "No router available for this request",
+            )
+                .into_response()
+        }
+    }
+
+    async fn route_inference_generate(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &InferenceGenerateRequest,
+        _model_id: Option<&str>,
+        run_id: Option<&str>,
+    ) -> Response {
+        let router = self.select_router_for_request(headers, None);
+
+        if let Some(router) = router {
+            router
+                .route_inference_generate(headers, body, None, run_id)
+                .await
+        } else {
             (
                 StatusCode::NOT_FOUND,
                 "No router available for this request",
@@ -592,7 +601,7 @@ impl RouterTrait for RouterManager {
         headers: Option<&HeaderMap>,
         body: &ChatCompletionRequest,
         _model_id: Option<&str>,
-        _run_id: Option<&str>,
+        run_id: Option<&str>,
     ) -> Response {
         // Select router based on headers and model.
         // When model is None, select_router_for_request considers all registered
@@ -602,30 +611,7 @@ impl RouterTrait for RouterManager {
         let router = self.select_router_for_request(headers, model_id);
 
         if let Some(router) = router {
-            router.route_chat(headers, body, model_id, _run_id).await
-        } else {
-            let msg = match model_id {
-                Some(m) => format!("Model '{}' not found or no router available", m),
-                None => "No routers registered to handle this request".to_string(),
-            };
-            (StatusCode::NOT_FOUND, msg).into_response()
-        }
-    }
-
-    async fn route_chat_tokens(
-        &self,
-        headers: Option<&HeaderMap>,
-        body: &ChatCompletionRequest,
-        _model_id: Option<&str>,
-        _run_id: Option<&str>,
-    ) -> Response {
-        let model_id = body.model.as_deref();
-        let router = self.select_router_for_request(headers, model_id);
-
-        if let Some(router) = router {
-            router
-                .route_chat_tokens(headers, body, model_id, _run_id)
-                .await
+            router.route_chat(headers, body, model_id, run_id).await
         } else {
             let msg = match model_id {
                 Some(m) => format!("Model '{}' not found or no router available", m),
@@ -641,7 +627,7 @@ impl RouterTrait for RouterManager {
         headers: Option<&HeaderMap>,
         body: &CompletionRequest,
         _model_id: Option<&str>,
-        _run_id: Option<&str>,
+        run_id: Option<&str>,
     ) -> Response {
         // Select router based on headers and model.
         // When model is None, select_router_for_request considers all registered
@@ -651,7 +637,9 @@ impl RouterTrait for RouterManager {
         let router = self.select_router_for_request(headers, model_id);
 
         if let Some(router) = router {
-            router.route_completion(headers, body, model_id, _run_id).await
+            router
+                .route_completion(headers, body, model_id, run_id)
+                .await
         } else {
             let msg = match model_id {
                 Some(m) => format!("Model '{}' not found or no router available", m),

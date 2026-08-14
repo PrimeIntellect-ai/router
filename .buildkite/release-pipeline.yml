@@ -36,7 +36,7 @@ steps:
       echo "✅ Version check passed: $TAG_VERSION"
     if: build.tag =~ /^v.*/
     agents:
-      queue: "cpu_queue_postmerge"
+      queue: "cpu_queue_release"
 
   - wait
 
@@ -63,7 +63,7 @@ steps:
       - "dist/*.tar.gz"
     depends_on: "version-check"
     agents:
-      queue: "cpu_queue_postmerge"
+      queue: "cpu_queue_release"
 
   - label: ":package: Build Release Artifacts (aarch64)"
     key: "build_wheels_aarch64"
@@ -83,7 +83,7 @@ steps:
       - "dist/*.whl"
     depends_on: "version-check"
     agents:
-      queue: "arm-cpu"
+      queue: "arm64_cpu_queue_release"
 
   - wait
 
@@ -98,7 +98,7 @@ steps:
       docker run --rm -v "$$PWD:/workdir" -w /workdir debian:bullseye ./target/release/vllm-router --version
       docker run --rm -v "$$PWD:/workdir" -w /workdir debian:bullseye ./target/release/vllm-router --help
     agents:
-      queue: "cpu_queue_postmerge"
+      queue: "cpu_queue_release"
 
   - label: ":python: Test Python Wheel (x86_64)"
     key: "test-python-wheel-x86_64"
@@ -107,7 +107,7 @@ steps:
       pip install dist/*x86_64*.whl
       python -c "import vllm_router; print(vllm_router.__version__)"
     agents:
-      queue: "cpu_queue_postmerge"
+      queue: "cpu_queue_release"
 
   - label: ":python: Test Python Wheel (aarch64)"
     key: "test-python-wheel-aarch64"
@@ -116,7 +116,7 @@ steps:
       pip install dist/*aarch64*.whl
       python -c "import vllm_router; print(vllm_router.__version__)"
     agents:
-      queue: "arm-cpu"
+      queue: "arm64_cpu_queue_release"
 
   - wait
 
@@ -153,7 +153,7 @@ steps:
     if: build.tag =~ /^v.*/
     soft_fail: false
     agents:
-      queue: "cpu_queue_postmerge"
+      queue: "cpu_queue_release"
 
   # ============================================================================
   # Nightly Docker Images (only when NIGHTLY=1)
@@ -168,7 +168,7 @@ steps:
         depends_on: ~
         id: build-nightly-docker-x86
         agents:
-          queue: cpu_queue_postmerge
+          queue: cpu_queue_release
         commands:
           - "DOCKER_BUILDKIT=1 docker build --tag vllm/vllm-router:nightly-x86_64 --progress plain -f Dockerfile.router ."
           - "docker push vllm/vllm-router:nightly-x86_64"
@@ -183,7 +183,7 @@ steps:
         depends_on: ~
         id: build-nightly-docker-arm64
         agents:
-          queue: arm64_cpu_queue_postmerge
+          queue: arm64_cpu_queue_release
         commands:
           - "DOCKER_BUILDKIT=1 docker build --tag vllm/vllm-router:nightly-aarch64 --progress plain -f Dockerfile.router ."
           - "docker push vllm/vllm-router:nightly-aarch64"
@@ -204,7 +204,7 @@ steps:
           - build-nightly-docker-arm64
         id: publish-nightly-dockerhub
         agents:
-          queue: cpu_queue_postmerge
+          queue: cpu_queue_release
         commands:
           # Create and push multi-arch manifests
           - "docker manifest create vllm/vllm-router:nightly vllm/vllm-router:nightly-x86_64 vllm/vllm-router:nightly-aarch64 --amend"

@@ -99,7 +99,7 @@ spec:
             echo "Decode endpoints: $DECODE_ARGS"
 
             exec vllm-router \
-              --pd-disaggregation \
+              --vllm-pd-disaggregation \
               $PREFILL_ARGS \
               $DECODE_ARGS \
               --host 0.0.0.0 \

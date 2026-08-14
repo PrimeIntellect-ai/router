@@ -360,7 +360,8 @@ impl WorkerRegistry {
         }
 
         // Record current models for next refresh cycle
-        self.known_models.insert(url.to_string(), new_models.to_vec());
+        self.known_models
+            .insert(url.to_string(), new_models.to_vec());
     }
 
     /// Get all model IDs with workers
@@ -377,7 +378,7 @@ impl WorkerRegistry {
     /// This method allows flexible filtering of workers based on:
     /// - model_id: Filter by specific model
     /// - worker_type: Filter by worker type (Regular, Prefill, Decode)
-    /// - connection_mode: Filter by connection mode (Http, Grpc)
+    /// - connection_mode: Filter by connection mode
     /// - healthy_only: Only return healthy workers
     pub fn get_workers_filtered(
         &self,
@@ -531,7 +532,7 @@ impl WorkerRegistry {
                 // TODO: notify PolicyRegistry on model changes so per-model
                 // policies stay in sync (requires a callback or moving this
                 // logic to a layer that has access to both registries).
-                if check_count % MODEL_REFRESH_INTERVAL == 0 {
+                if check_count.is_multiple_of(MODEL_REFRESH_INTERVAL) {
                     // Deduplicate by base URL so DP workers (@0, @1, …)
                     // sharing the same endpoint only trigger one fetch.
                     let mut fetched: std::collections::HashMap<String, Vec<String>> =
@@ -546,8 +547,7 @@ impl WorkerRegistry {
                             std::collections::hash_map::Entry::Occupied(e) => e.get().clone(),
                             std::collections::hash_map::Entry::Vacant(e) => {
                                 let models =
-                                    crate::core::worker::fetch_models_from_worker(&base_url)
-                                        .await;
+                                    crate::core::worker::fetch_models_from_worker(&base_url).await;
                                 e.insert(models.clone());
                                 models
                             }
@@ -559,7 +559,7 @@ impl WorkerRegistry {
                 }
 
                 // Only reset loads when traffic is idle to prevent drift
-                if check_count % LOAD_RESET_INTERVAL == 0 {
+                if check_count.is_multiple_of(LOAD_RESET_INTERVAL) {
                     let max_load = workers.iter().map(|w| w.load()).max().unwrap_or(0);
                     if max_load <= 2 {
                         tracing::debug!(
@@ -794,19 +794,13 @@ mod tests {
         // Worker loads a LoRA adapter
         registry.sync_worker_models(
             "http://worker1:8000",
-            &[
-                "base-model".to_string(),
-                "rft-lora-adapter".to_string(),
-            ],
+            &["base-model".to_string(), "rft-lora-adapter".to_string()],
         );
         assert_eq!(registry.get_by_model_fast("base-model").len(), 1);
         assert_eq!(registry.get_by_model_fast("rft-lora-adapter").len(), 1);
 
         // LoRA gets evicted — worker now only serves base model
-        registry.sync_worker_models(
-            "http://worker1:8000",
-            &["base-model".to_string()],
-        );
+        registry.sync_worker_models("http://worker1:8000", &["base-model".to_string()]);
         assert_eq!(
             registry.get_by_model_fast("base-model").len(),
             1,
@@ -836,10 +830,7 @@ mod tests {
         // Worker has base model + LoRA
         registry.sync_worker_models(
             "http://worker1:8000",
-            &[
-                "base-model".to_string(),
-                "rft-lora-adapter".to_string(),
-            ],
+            &["base-model".to_string(), "rft-lora-adapter".to_string()],
         );
         assert_eq!(registry.get_by_model_fast("rft-lora-adapter").len(), 1);
 

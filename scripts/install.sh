@@ -80,16 +80,7 @@ check_requirements() {
 
 install_system_deps() {
     print_step "Installing system dependencies..."
-
-    # Check if protoc is installed
-    if ! command -v protoc &> /dev/null; then
-        print_info "Installing protobuf compiler..."
-        sudo apt-get update -qq
-        sudo apt-get install -y protobuf-compiler
-        print_success "protobuf-compiler installed"
-    else
-        print_info "protobuf-compiler already installed ($(protoc --version))"
-    fi
+    print_success "No additional system dependencies required"
 }
 
 install_rust() {
