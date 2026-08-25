@@ -161,6 +161,15 @@ pub trait RouterTrait: Send + Sync + Debug + WorkerManagement {
     /// Get worker loads (for monitoring)
     async fn get_worker_loads(&self) -> Response;
 
+    /// Release a sticky session assignment after its trajectory ends.
+    async fn release_session(&self, _session_id: &str) -> Response {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "Session release is not supported by this router",
+        )
+            .into_response()
+    }
+
     /// Get router type name
     fn router_type(&self) -> &'static str;
 

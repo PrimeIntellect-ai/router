@@ -11,6 +11,7 @@ use std::sync::Arc;
 mod cache_aware;
 mod consistent_hash;
 mod factory;
+mod least_loaded;
 mod power_of_two;
 mod random;
 mod registry;
@@ -19,6 +20,7 @@ mod round_robin;
 pub use cache_aware::CacheAwarePolicy;
 pub use consistent_hash::ConsistentHashPolicy;
 pub use factory::PolicyFactory;
+pub use least_loaded::LeastLoadedPolicy;
 pub use power_of_two::PowerOfTwoPolicy;
 pub use random::RandomPolicy;
 pub use registry::PolicyRegistry;
@@ -91,6 +93,14 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     /// policies to update their internal state.
     fn on_request_complete(&self, _worker_url: &str, _success: bool) {
         // Default: no-op for stateless policies
+    }
+
+    /// Release a session-affine assignment.
+    ///
+    /// Stateful session policies override this. The operation is idempotent:
+    /// false means the session was not assigned by this policy.
+    fn release_session(&self, _session_id: &str) -> bool {
+        false
     }
 
     /// Get policy name for metrics and debugging

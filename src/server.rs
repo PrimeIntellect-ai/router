@@ -1014,6 +1014,22 @@ async fn get_loads(State(state): State<Arc<AppState>>, headers: http::HeaderMap)
     state.router.get_worker_loads().await
 }
 
+async fn release_session(State(state): State<Arc<AppState>>, headers: http::HeaderMap) -> Response {
+    if let Err(response) = authorize_request(&state, &headers).await {
+        return response;
+    }
+
+    let Some(session_id) = headers
+        .get("x-session-id")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty())
+    else {
+        return (StatusCode::BAD_REQUEST, "Missing X-Session-ID header").into_response();
+    };
+
+    state.router.release_session(session_id).await
+}
+
 // ---------- Worker management endpoints (RESTful) ----------
 
 /// POST /workers - Add a new worker with full configuration
@@ -1254,7 +1270,8 @@ pub fn build_app_with_request_tracing(
         .route("/remove_worker", post(remove_worker))
         .route("/list_workers", get(list_workers))
         .route("/flush_cache", post(flush_cache))
-        .route("/get_loads", get(get_loads));
+        .route("/get_loads", get(get_loads))
+        .route("/v1/router/session", delete(release_session));
 
     // Worker management routes
     let worker_routes = Router::new()

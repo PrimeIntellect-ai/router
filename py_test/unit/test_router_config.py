@@ -328,6 +328,7 @@ class TestRouterConfigValidation:
         assert policy_from_str("cache_aware") == PolicyType.CacheAware
         assert policy_from_str("power_of_two") == PolicyType.PowerOfTwo
         assert policy_from_str("consistent_hash") == PolicyType.ConsistentHash
+        assert policy_from_str("least_loaded") == PolicyType.LeastLoaded
 
     def test_invalid_policy_enum_conversion(self):
         """Test invalid policy string to enum conversion."""

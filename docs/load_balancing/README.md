@@ -11,6 +11,24 @@ The vLLM Router supports multiple load balancing policies for distributing reque
 | `consistent_hash` | Multi-turn conversations, KV cache reuse | Yes | No |
 | `power_of_two` | Load-sensitive workloads | No | Yes |
 | `cache_aware` | Prefix caching optimization | Yes (cache-based) | Yes |
+| `least_loaded` | Long-lived agent trajectories | Yes | Yes (active sessions) |
+
+---
+
+## Least Loaded Sessions
+
+`least_loaded` assigns a new `X-Session-ID` to the healthy worker with the fewest
+active sessions, then keeps every request for that session on the same worker.
+Requests without that header are rejected. The client must release the assignment
+when the session ends:
+
+```bash
+curl -X DELETE http://router:8000/v1/router/session \
+  -H "X-Session-ID: trajectory-123"
+```
+
+Release is idempotent. This policy is supported only by the regular HTTP router;
+it is not available for prefill/decode or IGW routing modes.
 
 ---
 

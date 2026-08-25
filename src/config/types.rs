@@ -257,6 +257,10 @@ pub enum PolicyConfig {
         /// Number of virtual nodes per worker for better distribution
         virtual_nodes: u32,
     },
+
+    /// Sticky sessions assigned to the worker with the fewest live sessions.
+    #[serde(rename = "least_loaded")]
+    LeastLoaded,
 }
 
 impl PolicyConfig {
@@ -267,6 +271,7 @@ impl PolicyConfig {
             PolicyConfig::CacheAware { .. } => "cache_aware",
             PolicyConfig::PowerOfTwo { .. } => "power_of_two",
             PolicyConfig::ConsistentHash { .. } => "consistent_hash",
+            PolicyConfig::LeastLoaded => "least_loaded",
         }
     }
 }

@@ -1776,6 +1776,11 @@ impl RouterTrait for Router {
         .into_response()
     }
 
+    async fn release_session(&self, session_id: &str) -> Response {
+        self.policy_registry.release_session(session_id);
+        StatusCode::NO_CONTENT.into_response()
+    }
+
     fn router_type(&self) -> &'static str {
         "regular"
     }
@@ -2140,6 +2145,14 @@ mod tests {
         }
     }
 
+    fn create_test_least_loaded_router() -> Router {
+        let mut router = create_test_regular_router();
+        router.policy_registry = Arc::new(PolicyRegistry::new(
+            crate::config::types::PolicyConfig::LeastLoaded,
+        ));
+        router
+    }
+
     #[test]
     fn test_headers_to_request_headers_basic() {
         // Test that headers_to_request_headers correctly converts HeaderMap to HashMap
@@ -2156,6 +2169,26 @@ mod tests {
         assert_eq!(headers.get("x-session-id").unwrap(), "session-123");
         assert_eq!(headers.get("content-type").unwrap(), "application/json");
         assert_eq!(headers.get("x-custom-header").unwrap(), "custom-value");
+    }
+
+    #[tokio::test]
+    async fn test_release_session_updates_least_loaded_assignment() {
+        let router = create_test_least_loaded_router();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-session-id", HeaderValue::from_static("trajectory-1"));
+
+        let selected = router
+            .select_worker_for_model(None, None, Some(&headers))
+            .expect("worker selected");
+        assert_eq!(selected.load(), 1);
+
+        let response = RouterTrait::release_session(&router, "trajectory-1").await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(selected.load(), 0);
+
+        let response = RouterTrait::release_session(&router, "trajectory-1").await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(selected.load(), 0);
     }
 
     #[test]

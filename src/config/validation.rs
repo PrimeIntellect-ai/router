@@ -177,7 +177,7 @@ impl ConfigValidator {
     /// Validate policy configuration
     fn validate_policy(policy: &PolicyConfig) -> ConfigResult<()> {
         match policy {
-            PolicyConfig::Random | PolicyConfig::RoundRobin => {
+            PolicyConfig::Random | PolicyConfig::RoundRobin | PolicyConfig::LeastLoaded => {
                 // No specific validation needed
             }
             PolicyConfig::CacheAware {
@@ -443,6 +443,11 @@ impl ConfigValidator {
     fn validate_compatibility(config: &RouterConfig) -> ConfigResult<()> {
         // IGW mode is independent - skip other compatibility checks when enabled
         if config.enable_igw {
+            if matches!(config.policy, PolicyConfig::LeastLoaded) {
+                return Err(ConfigError::IncompatibleConfig {
+                    reason: "least_loaded policy requires regular routing without IGW".to_string(),
+                });
+            }
             return Ok(());
         }
 
@@ -456,8 +461,19 @@ impl ConfigValidator {
             });
         }
 
-        // All policies are now supported for both router types thanks to the unified trait design
-        // No mode/policy restrictions needed anymore
+        if !matches!(config.mode, RoutingMode::Regular { .. })
+            && (matches!(
+                config.mode.get_prefill_policy(&config.policy),
+                PolicyConfig::LeastLoaded
+            ) || matches!(
+                config.mode.get_decode_policy(&config.policy),
+                PolicyConfig::LeastLoaded
+            ))
+        {
+            return Err(ConfigError::IncompatibleConfig {
+                reason: "least_loaded policy requires regular routing without IGW".to_string(),
+            });
+        }
 
         // Check if service discovery is enabled for worker count validation
         let has_service_discovery = config.discovery.as_ref().is_some_and(|d| d.enabled);
@@ -690,6 +706,43 @@ mod tests {
 
         let result = ConfigValidator::validate(&config);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_least_loaded_requires_regular_mode() {
+        let regular = RouterConfig::new(
+            RoutingMode::Regular {
+                worker_urls: vec!["http://worker:8000".to_string()],
+            },
+            PolicyConfig::LeastLoaded,
+        );
+        assert!(ConfigValidator::validate(&regular).is_ok());
+
+        let pd = RouterConfig::new(
+            RoutingMode::PrefillDecode {
+                prefill_urls: vec![("http://prefill:8000".to_string(), None)],
+                decode_urls: vec!["http://decode:8000".to_string()],
+                prefill_policy: None,
+                decode_policy: None,
+            },
+            PolicyConfig::LeastLoaded,
+        );
+        assert!(ConfigValidator::validate(&pd).is_err());
+
+        let nested_pd = RouterConfig::new(
+            RoutingMode::PrefillDecode {
+                prefill_urls: vec![("http://prefill:8000".to_string(), None)],
+                decode_urls: vec!["http://decode:8000".to_string()],
+                prefill_policy: Some(PolicyConfig::LeastLoaded),
+                decode_policy: None,
+            },
+            PolicyConfig::RoundRobin,
+        );
+        assert!(ConfigValidator::validate(&nested_pd).is_err());
+
+        let mut igw = regular;
+        igw.enable_igw = true;
+        assert!(ConfigValidator::validate(&igw).is_err());
     }
 
     #[test]
