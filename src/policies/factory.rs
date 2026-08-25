@@ -1,8 +1,8 @@
 //! Factory for creating load balancing policies
 
 use super::{
-    CacheAwareConfig, CacheAwarePolicy, ConsistentHashPolicy, LoadBalancingPolicy,
-    PowerOfTwoPolicy, RandomPolicy, RoundRobinPolicy,
+    CacheAwareConfig, CacheAwarePolicy, ConsistentHashPolicy, LeastLoadedPolicy,
+    LoadBalancingPolicy, PowerOfTwoPolicy, RandomPolicy, RoundRobinPolicy,
 };
 use crate::config::PolicyConfig;
 use std::sync::Arc;
@@ -38,6 +38,7 @@ impl PolicyFactory {
                 // The consistent hash policy uses a hardcoded value for now
                 Arc::new(ConsistentHashPolicy::new())
             }
+            PolicyConfig::LeastLoaded => Arc::new(LeastLoadedPolicy::new()),
         }
     }
 
@@ -49,6 +50,7 @@ impl PolicyFactory {
             "power_of_two" | "poweroftwo" => Some(Arc::new(PowerOfTwoPolicy::new())),
             "cache_aware" | "cacheaware" => Some(Arc::new(CacheAwarePolicy::new())),
             "consistent_hash" | "consistenthash" => Some(Arc::new(ConsistentHashPolicy::new())),
+            "least_loaded" | "leastloaded" => Some(Arc::new(LeastLoadedPolicy::new())),
             _ => None,
         }
     }
@@ -88,6 +90,9 @@ mod tests {
         let policy =
             PolicyFactory::create_from_config(&PolicyConfig::ConsistentHash { virtual_nodes: 160 });
         assert_eq!(policy.name(), "consistent_hash");
+
+        let policy = PolicyFactory::create_from_config(&PolicyConfig::LeastLoaded);
+        assert_eq!(policy.name(), "least_loaded");
     }
 
     #[test]
@@ -102,6 +107,8 @@ mod tests {
         assert!(PolicyFactory::create_by_name("CacheAware").is_some());
         assert!(PolicyFactory::create_by_name("consistent_hash").is_some());
         assert!(PolicyFactory::create_by_name("ConsistentHash").is_some());
+        assert!(PolicyFactory::create_by_name("least_loaded").is_some());
+        assert!(PolicyFactory::create_by_name("LeastLoaded").is_some());
         assert!(PolicyFactory::create_by_name("unknown").is_none());
     }
 }

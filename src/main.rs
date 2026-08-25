@@ -123,7 +123,7 @@ struct CliArgs {
     worker_urls: Vec<String>,
 
     /// Load balancing policy to use
-    #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "consistent_hash"])]
+    #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "consistent_hash", "least_loaded"])]
     policy: String,
 
     /// Enable PD (Prefill-Decode) disaggregated mode
@@ -415,6 +415,7 @@ impl CliArgs {
             "consistent_hash" => PolicyConfig::ConsistentHash {
                 virtual_nodes: 160, // Default value
             },
+            "least_loaded" => PolicyConfig::LeastLoaded,
             _ => PolicyConfig::RoundRobin, // Fallback
         }
     }

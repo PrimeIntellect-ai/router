@@ -140,6 +140,7 @@ class RouterArgs:
                 "cache_aware",
                 "power_of_two",
                 "consistent_hash",
+                "least_loaded",
             ],
             help="Load balancing policy to use. In PD mode, this is used for both prefill and decode unless overridden",
         )
