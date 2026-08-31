@@ -1,8 +1,8 @@
 use crate::config::types::RetryConfig;
 use crate::core::{
     fetch_models_from_worker, is_retryable_status, strip_dp_rank, BasicWorker,
-    CircuitBreakerConfig, DPAwareWorker, HealthConfig, RetryExecutor, Worker, WorkerRegistry,
-    WorkerType,
+    CircuitBreakerConfig, DPAwareWorker, HealthConfig, RetryExecutor, Worker, WorkerLoadGuard,
+    WorkerRegistry, WorkerType,
 };
 use crate::metrics::RouterMetrics;
 use crate::otel_http::{self, ClientRequestOptions};
@@ -656,12 +656,10 @@ impl Router {
                     None => self.policy_registry.get_default_policy(),
                 };
 
-                let load_incremented = if policy.name() == "cache_aware" {
-                    worker.increment_load();
-                    RouterMetrics::set_running_requests(worker.url(), worker.load());
-                    true
+                let load_guard = if policy.name() == "cache_aware" {
+                    Some(WorkerLoadGuard::new(worker.clone()))
                 } else {
-                    false
+                    None
                 };
 
                 let response = self
@@ -671,7 +669,7 @@ impl Router {
                         route,
                         worker.url(),
                         is_stream,
-                        load_incremented,
+                        load_guard,
                         run_id,
                     )
                     .await;
@@ -846,8 +844,8 @@ impl Router {
         route: &str,
         worker_url: &str,
         is_stream: bool,
-        load_incremented: bool, // Whether load was incremented for this request
-        run_id: Option<&str>,   // JWT-derived run id for per-run usage metrics
+        load_guard: Option<WorkerLoadGuard>,
+        run_id: Option<&str>, // JWT-derived run id for per-run usage metrics
     ) -> Response {
         let (mut request_builder, extracted_dp_rank, request_url) =
             if self.intra_node_data_parallel_size > 1 {
@@ -932,14 +930,6 @@ impl Router {
                     worker_url, route, e
                 );
 
-                // Decrement load on error if it was incremented
-                if load_incremented {
-                    if let Some(worker) = self.worker_registry.get_by_url(worker_url) {
-                        worker.decrement_load();
-                        RouterMetrics::set_running_requests(worker_url, worker.load());
-                    }
-                }
-
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     format!("Request failed: {}", e),
@@ -969,35 +959,12 @@ impl Router {
                     } else {
                         StatusCode::INTERNAL_SERVER_ERROR
                     };
-                    // Decrement load on this early-return path (both rewritten
-                    // 400s and genuine 500s) — we bypass the normal
-                    // non-streaming cleanup at the bottom of this function,
-                    // and the caller's retry closure no longer decrements
-                    // (removed to avoid double-decrement now that
-                    // send_typed_request owns the load lifecycle). Without
-                    // this, each retry attempt's increment leaks → phantom
-                    // load.
-                    if load_incremented {
-                        if let Some(worker) = self.worker_registry.get_by_url(worker_url) {
-                            worker.decrement_load();
-                            RouterMetrics::set_running_requests(worker_url, worker.load());
-                        }
-                    }
                     let mut response = Response::new(axum::body::Body::from(body));
                     *response.status_mut() = status;
                     *response.headers_mut() = response_headers;
                     return response;
                 }
                 Err(e) => {
-                    // Same lifecycle rule as the Ok branch: this early return
-                    // bypasses the cleanup at the bottom of the function and
-                    // nobody else decrements.
-                    if load_incremented {
-                        if let Some(worker) = self.worker_registry.get_by_url(worker_url) {
-                            worker.decrement_load();
-                            RouterMetrics::set_running_requests(worker_url, worker.load());
-                        }
-                    }
                     tracing::error!(
                         "Failed to read 500 response body from worker_url={}: {}",
                         worker_url,
@@ -1034,31 +1001,21 @@ impl Router {
                     response
                 }
                 Err(e) => {
-                    // IMPORTANT: Decrement load on error before returning
-                    if load_incremented {
-                        if let Some(worker) = self.worker_registry.get_by_url(worker_url) {
-                            worker.decrement_load();
-                            RouterMetrics::set_running_requests(worker_url, worker.load());
-                        }
-                    }
-
                     let error_msg = format!("Failed to get response body: {}", e);
                     (StatusCode::INTERNAL_SERVER_ERROR, error_msg).into_response()
                 }
             };
 
-            // Decrement load counter for non-streaming requests if it was incremented
-            if load_incremented {
-                if let Some(worker) = self.worker_registry.get_by_url(worker_url) {
-                    worker.decrement_load();
-                    RouterMetrics::set_running_requests(worker_url, worker.load());
-                }
-            }
-
             response
-        } else if load_incremented {
-            // For streaming with load tracking, we need to manually decrement when done
-            let registry = Arc::clone(&self.worker_registry);
+        } else if let Some(guard) = load_guard {
+            // Keep the load guard in the forwarding task until the stream ends.
+            // Release retryable responses before the retry executor selects again.
+            let task_guard = if is_retryable_status(status) {
+                guard.release();
+                guard.share()
+            } else {
+                guard
+            };
             let worker_url = worker_url.to_string();
             // Only record per-run usage on successful responses, matching the
             // non-streaming path. A non-success status may still carry a body
@@ -1082,10 +1039,10 @@ impl Router {
             let stream = res.bytes_stream();
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
-            // Spawn task to forward stream and detect completion
+            // Spawn task to forward the stream. Dropping the guard releases load.
             tokio::spawn(async move {
+                let _guard = task_guard;
                 let mut stream = stream;
-                let mut decremented = false;
                 let mut usage_extractor = stream_run_id.map(usage_metrics::SseUsageExtractor::new);
                 loop {
                     match tokio::time::timeout(std::time::Duration::from_secs(300), stream.next())
@@ -1099,21 +1056,6 @@ impl Router {
                                     // boundaries can split SSE lines.
                                     if let Some(extractor) = usage_extractor.as_mut() {
                                         extractor.push_chunk(&bytes);
-                                    }
-                                    // Check for stream end marker
-                                    if bytes
-                                        .as_ref()
-                                        .windows(12)
-                                        .any(|window| window == b"data: [DONE]")
-                                    {
-                                        if let Some(worker) = registry.get_by_url(&worker_url) {
-                                            worker.decrement_load();
-                                            RouterMetrics::set_running_requests(
-                                                &worker_url,
-                                                worker.load(),
-                                            );
-                                            decremented = true;
-                                        }
                                     }
                                     if tx.send(Ok(bytes)).is_err() {
                                         break;
@@ -1143,12 +1085,6 @@ impl Router {
                             ));
                             break;
                         }
-                    }
-                }
-                if !decremented {
-                    if let Some(worker) = registry.get_by_url(&worker_url) {
-                        worker.decrement_load();
-                        RouterMetrics::set_running_requests(&worker_url, worker.load());
                     }
                 }
             });

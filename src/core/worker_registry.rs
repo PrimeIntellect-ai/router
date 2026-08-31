@@ -473,7 +473,6 @@ impl WorkerRegistry {
         let registry = self.clone();
 
         let handle = tokio::spawn(async move {
-            const LOAD_RESET_INTERVAL: u64 = 10;
             const MODEL_REFRESH_INTERVAL: u64 = 5;
 
             let mut interval =
@@ -494,7 +493,9 @@ impl WorkerRegistry {
                     .map(|entry| entry.value().clone())
                     .collect();
 
-                // Perform health checks concurrently (not sequentially)
+                // Perform health checks concurrently. Health checking must not
+                // mutate load accounting. A failed probe does not cancel
+                // in-flight requests, so valid load can survive recovery.
                 let health_checks = workers.iter().map(|worker| {
                     let worker_url = worker.url().to_string();
                     let was_healthy = worker.is_healthy();
@@ -557,20 +558,6 @@ impl WorkerRegistry {
                         }
                     }
                 }
-
-                // Only reset loads when traffic is idle to prevent drift
-                if check_count.is_multiple_of(LOAD_RESET_INTERVAL) {
-                    let max_load = workers.iter().map(|w| w.load()).max().unwrap_or(0);
-                    if max_load <= 2 {
-                        tracing::debug!(
-                            "Resetting worker loads to prevent drift (max_load: {})",
-                            max_load
-                        );
-                        for worker in &workers {
-                            worker.reset_load();
-                        }
-                    }
-                }
             }
         });
 
@@ -599,8 +586,60 @@ pub struct WorkerRegistryStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{CircuitBreakerConfig, WorkerFactory};
+    use crate::core::error::WorkerResult;
+    use crate::core::worker::WorkerMetadata;
+    use crate::core::{BasicWorker, CircuitBreakerConfig, HealthConfig, WorkerFactory};
+    use async_trait::async_trait;
     use std::collections::HashMap;
+
+    #[derive(Debug)]
+    struct NoopHealthWorker(Arc<BasicWorker>);
+
+    #[async_trait]
+    impl Worker for NoopHealthWorker {
+        fn url(&self) -> &str {
+            self.0.url()
+        }
+        fn worker_type(&self) -> WorkerType {
+            self.0.worker_type()
+        }
+        fn connection_mode(&self) -> ConnectionMode {
+            self.0.connection_mode()
+        }
+        fn is_healthy(&self) -> bool {
+            self.0.is_healthy()
+        }
+        fn set_healthy(&self, healthy: bool) {
+            self.0.set_healthy(healthy);
+        }
+        async fn check_health_async(&self) -> WorkerResult<()> {
+            Ok(())
+        }
+        fn load(&self) -> usize {
+            self.0.load()
+        }
+        fn increment_load(&self) {
+            self.0.increment_load();
+        }
+        fn decrement_load(&self) {
+            self.0.decrement_load();
+        }
+        fn reset_load(&self) {
+            self.0.reset_load();
+        }
+        fn processed_requests(&self) -> usize {
+            self.0.processed_requests()
+        }
+        fn increment_processed(&self) {
+            self.0.increment_processed();
+        }
+        fn metadata(&self) -> &WorkerMetadata {
+            self.0.metadata()
+        }
+        fn circuit_breaker(&self) -> &crate::core::CircuitBreaker {
+            self.0.circuit_breaker()
+        }
+    }
 
     #[test]
     fn test_worker_registry() {
@@ -848,5 +887,68 @@ mod tests {
             0,
             "LoRA index should be empty after worker removal"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_health_checker_preserves_inflight_load() {
+        let registry = WorkerRegistry::new();
+        let worker: Arc<dyn Worker> = Arc::new(NoopHealthWorker(Arc::new(BasicWorker::new(
+            "http://worker:8080".to_string(),
+            WorkerType::Regular,
+        ))));
+        registry.register(worker.clone());
+
+        for _ in 0..5 {
+            worker.increment_load();
+        }
+
+        let checker = registry.start_health_checker(1);
+        for _ in 0..12 {
+            tokio::time::advance(std::time::Duration::from_secs(1)).await;
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(worker.load(), 5);
+        drop(checker);
+    }
+
+    async fn start_healthy_mock_server() -> (String, tokio::task::JoinHandle<()>) {
+        use axum::{http::StatusCode, routing::get, Router as AxumRouter};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = AxumRouter::new().route("/health", get(|| async { StatusCode::OK }));
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{}", addr), handle)
+    }
+
+    #[tokio::test]
+    async fn test_health_checker_preserves_load_across_recovery() {
+        let (url, _server) = start_healthy_mock_server().await;
+        let registry = WorkerRegistry::new();
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorker::new(url, WorkerType::Regular).with_health_config(HealthConfig {
+                timeout_secs: 2,
+                check_interval_secs: 1,
+                endpoint: "/health".to_string(),
+                failure_threshold: 3,
+                success_threshold: 1,
+            }),
+        );
+        worker.set_healthy(false);
+        for _ in 0..3 {
+            worker.increment_load();
+        }
+        registry.register(worker.clone());
+
+        let checker = registry.start_health_checker(1);
+        tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+        checker.shutdown().await;
+
+        assert!(worker.is_healthy());
+        assert_eq!(worker.load(), 3);
     }
 }
