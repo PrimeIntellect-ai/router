@@ -12,7 +12,10 @@ RUN cargo build --release --bin vllm-router
 # Stage 2: Minimal runtime image
 FROM debian:bookworm-slim
 
-RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN apt-get update \
+    && apt-get upgrade -y \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /build/target/release/vllm-router /usr/local/bin/vllm-router
 

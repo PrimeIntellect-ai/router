@@ -228,10 +228,11 @@ atomically; ties use rendezvous hashing. Existing sessions keep their healthy
 worker, even if session counts later become uneven. Unavailable workers cause
 reassignment on the next request. Prefill and decode pools track sessions separately.
 
-Session IDs use the same header priority as `consistent_hash`, then the JSON fields
-`session_params.session_id`, `user`, `session_id`, and `user_id`. Prefer
-`X-Session-ID` for multi-turn work; a per-request ID creates a separate session for
-each request. Requests without an explicit identifier do not reserve a session.
+Session IDs prefer stable headers (`x-session-id`, `x-user-id`, `x-tenant-id`,
+and `x-correlation-id`), then the JSON fields `session_params.session_id`, `user`,
+`session_id`, and `user_id`. Per-request `x-request-id` and `x-trace-id` headers
+remain available to `consistent_hash` but do not reserve sticky sessions. Requests
+without an explicit session identifier do not reserve a session.
 
 Release a session after its final request completes:
 
@@ -254,8 +255,14 @@ are checked for expiry before refreshing their affinity. State is local to one
 router process and is lost on restart. Multiple routers need consistent ingress
 routing and session release on each router that tracked the session.
 The policy keeps one entry per active session and serializes assignment under a
-mutex, so callers should release sessions
-promptly and choose a TTL appropriate for their workload.
+mutex, so callers should release sessions promptly and choose a TTL appropriate
+for their workload.
+
+Each policy instance retains at most 100,000 sessions and accepts session IDs up
+to 256 bytes. Override these limits with `VLLM_ROUTER_SLL_MAX_SESSIONS` and
+`VLLM_ROUTER_SLL_MAX_SESSION_ID_BYTES`. Requests that introduce a session beyond
+either limit continue to route least-loaded without affinity; existing tracked
+sessions remain sticky.
 
 ## Advanced Features
 

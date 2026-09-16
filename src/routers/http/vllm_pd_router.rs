@@ -2626,6 +2626,7 @@ mod tests {
                     json!({"model": "test", "prompt": prompt, "max_tokens": 2}),
                     "/v1/completions",
                     Some(&headers),
+                    None,
                 )
                 .await;
             assert_eq!(response.status(), StatusCode::OK);

@@ -622,7 +622,14 @@ impl Router {
     ) -> Response {
         let start = Instant::now();
         let is_stream = typed_req.is_stream();
-        let policy = match model_id {
+        // Fall back to the body's `model` field when the caller doesn't pass one, but
+        // only use it as a routing filter when the registry has already indexed that
+        // model. This keeps compatibility for generic upstream model validation while
+        // still preventing known LoRA requests from being sent to workers that have not
+        // loaded the adapter. Run-scoped requests keep the body model as a hard filter.
+        let effective_model_id = Self::normalize_model_id(model_id)
+            .or_else(|| self.resolve_body_model_filter(route, typed_req.get_model(), run_id));
+        let policy = match effective_model_id {
             Some(model) => self.policy_registry.get_policy_or_default(model),
             None => self.policy_registry.get_default_policy(),
         };
@@ -640,14 +647,6 @@ impl Router {
         } else {
             typed_req.extract_text_for_routing()
         };
-
-        // Fall back to the body's `model` field when the caller doesn't pass one, but
-        // only use it as a routing filter when the registry has already indexed that
-        // model. This keeps compatibility for generic upstream model validation while
-        // still preventing known LoRA requests from being sent to workers that have not
-        // loaded the adapter. Run-scoped requests keep the body model as a hard filter.
-        let effective_model_id = Self::normalize_model_id(model_id)
-            .or_else(|| self.resolve_body_model_filter(route, typed_req.get_model(), run_id));
 
         let response = RetryExecutor::execute_response_with_retry(
             &self.retry_config,

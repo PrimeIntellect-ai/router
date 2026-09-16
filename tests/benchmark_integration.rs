@@ -23,6 +23,7 @@ fn default_generate_request() -> GenerateRequest {
         // vLLM Extensions
         lora_path: None,
         session_params: None,
+        user: None,
         session_id: None,
         user_id: None,
         return_hidden_states: false,
@@ -215,6 +216,7 @@ fn test_benchmark_serialization_roundtrip() {
 
     let generate_req = GenerateRequest {
         text: Some("Test prompt".to_string()),
+        user: Some("test-user".to_string()),
         ..default_generate_request()
     };
 
@@ -226,6 +228,7 @@ fn test_benchmark_serialization_roundtrip() {
     assert_eq!(generate_req.text, deserialized.text);
     assert_eq!(generate_req.stream, deserialized.stream);
     assert_eq!(generate_req.return_logprob, deserialized.return_logprob);
+    assert_eq!(generate_req.user, deserialized.user);
 }
 
 #[test]

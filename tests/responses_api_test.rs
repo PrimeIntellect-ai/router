@@ -34,6 +34,8 @@ fn test_responses_request_creation() {
         top_p: Some(0.9),
         truncation: Truncation::Disabled,
         user: Some("test-user".to_string()),
+        session_id: None,
+        user_id: None,
         request_id: "resp_test123".to_string(),
         priority: 0,
         frequency_penalty: 0.0,
@@ -75,6 +77,8 @@ fn test_sampling_params_conversion() {
         top_p: Some(0.95),
         truncation: Truncation::Auto,
         user: None,
+        session_id: None,
+        user_id: None,
         request_id: "resp_test456".to_string(),
         priority: 0,
         frequency_penalty: 0.1,
@@ -187,6 +191,8 @@ fn test_json_serialization() {
         top_p: Some(0.8),
         truncation: Truncation::Auto,
         user: Some("test_user".to_string()),
+        session_id: Some("test-session".to_string()),
+        user_id: Some("test-user-id".to_string()),
         request_id: "resp_comprehensive_test".to_string(),
         priority: 1,
         frequency_penalty: 0.3,
@@ -207,4 +213,6 @@ fn test_json_serialization() {
     assert!(parsed.background);
     assert!(parsed.stream);
     assert_eq!(parsed.tools.len(), 1);
+    assert_eq!(parsed.session_id.as_deref(), Some("test-session"));
+    assert_eq!(parsed.user_id.as_deref(), Some("test-user-id"));
 }

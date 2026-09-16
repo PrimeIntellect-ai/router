@@ -7,14 +7,22 @@ use super::RequestHeaders;
 use crate::policies::ConsistentHashPolicy;
 use tracing::debug;
 
-/// HTTP header names to check for session ID (case-insensitive, checked in order)
-pub(crate) const SESSION_HEADER_NAMES: &[&str] = &[
+/// HTTP header names used by consistent hashing (case-insensitive, checked in order).
+pub(crate) const HASH_HEADER_NAMES: &[&str] = &[
     "x-session-id",
     "x-user-id",
     "x-tenant-id",
     "x-correlation-id", // per-session — check before per-request
     "x-request-id",
     "x-trace-id",
+];
+
+/// Headers whose values are expected to remain stable for a complete session.
+const SESSION_HEADER_NAMES: &[&str] = &[
+    "x-session-id",
+    "x-user-id",
+    "x-tenant-id",
+    "x-correlation-id",
 ];
 
 /// Extract hash key with priority: HTTP headers > body fields > request content hash
@@ -61,8 +69,8 @@ pub(crate) fn extract_hash_key(
 /// session id so that a matching `finish_session(session_id)` call can later
 /// release the session.
 ///
-/// Lookup order mirrors [`extract_hash_key`]:
-/// 1. HTTP headers: x-session-id, x-user-id, x-tenant-id, x-correlation-id, x-request-id, x-trace-id
+/// Lookup order:
+/// 1. Stable HTTP headers: x-session-id, x-user-id, x-tenant-id, x-correlation-id
 /// 2. Body: session_params.session_id (nested)
 /// 3. Body: user (OpenAI format)
 /// 4. Body: session_id (legacy)
@@ -98,7 +106,7 @@ pub(crate) fn extract_session_id(
 
 /// Extract hash key from HTTP headers
 pub(crate) fn extract_hash_key_from_headers(headers: &RequestHeaders) -> Option<String> {
-    for header_name in SESSION_HEADER_NAMES {
+    for header_name in HASH_HEADER_NAMES {
         if let Some(value) = headers.get(*header_name) {
             if !value.is_empty() {
                 debug!(
@@ -544,6 +552,20 @@ mod tests {
             extract_session_id(Some(body), Some(&headers)),
             Some("from-header".to_string())
         );
+    }
+
+    #[test]
+    fn test_extract_session_id_body_precedes_request_headers() {
+        let mut headers = HashMap::new();
+        headers.insert("x-request-id".to_string(), "request-1".to_string());
+        headers.insert("x-trace-id".to_string(), "trace-1".to_string());
+        let body = r#"{"session_id": "body-session"}"#;
+
+        assert_eq!(
+            extract_session_id(Some(body), Some(&headers)),
+            Some("body-session".to_string())
+        );
+        assert_eq!(extract_session_id(None, Some(&headers)), None);
     }
 
     #[test]
