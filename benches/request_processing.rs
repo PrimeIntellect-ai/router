@@ -20,6 +20,9 @@ fn default_generate_request() -> GenerateRequest {
         // VLLM Extensions
         lora_path: None,
         session_params: None,
+        user: None,
+        session_id: None,
+        user_id: None,
         return_hidden_states: false,
         rid: None,
     }

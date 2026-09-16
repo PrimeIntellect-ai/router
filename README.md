@@ -206,6 +206,7 @@ The router supports multiple load balancing policies:
 | `round_robin` | Sequential distribution across workers | No | General purpose, even distribution |
 | `random` | Uniform random selection | No | Simple deployments |
 | `consistent_hash` | Routes same session/user to same worker | Yes | Multi-turn chat, KV cache reuse |
+| `sticky_least_loaded` | Assigns new sessions to the worker with the fewest active sessions | Yes | Multi-turn workloads with explicit session lifetimes |
 | `power_of_two` | Picks least loaded of two random workers | No | Load-sensitive workloads |
 | `cache_aware` | Optimizes for prefix cache hits | Yes | Repeated prompts, few-shot |
 
@@ -218,6 +219,50 @@ curl -X POST http://router:8000/v1/chat/completions \
 ```
 
 For detailed configuration options, hash key priorities, and usage examples, see [Load Balancing Documentation](docs/load_balancing/README.md).
+
+#### Sticky least-loaded sessions
+
+Use `--policy sticky_least_loaded` to balance **active sessions**, not concurrent
+requests, token counts, or GPU utilization. New sessions reserve a worker
+atomically; ties use rendezvous hashing. Existing sessions keep their healthy
+worker, even if session counts later become uneven. Unavailable workers cause
+reassignment on the next request. Prefill and decode pools track sessions separately.
+
+Session IDs prefer stable headers (`x-session-id`, `x-user-id`, `x-tenant-id`,
+and `x-correlation-id`), then the JSON fields `session_params.session_id`, `user`,
+`session_id`, and `user_id`. Per-request `x-request-id` and `x-trace-id` headers
+remain available to `consistent_hash` but do not reserve sticky sessions. Requests
+without an explicit session identifier do not reserve a session.
+
+Release a session after its final request completes:
+
+```bash
+curl -X POST 'http://router:8000/finish_session?session_id=my-session-123'
+```
+
+This endpoint uses the router's configured API-key validation. It releases the ID
+across default, per-model, prefill, and decode policies. Repeated or unknown IDs
+are harmless. It does not cancel generation; use globally unique IDs and finish
+only after all requests for that session have completed. Models using the shared
+default policy must include the model in their session ID (for example,
+`model-a:conversation-123`), or use separate per-model policy instances. Reusing
+one ID across disjoint model pools reassigns its single reservation between pools.
+
+Idle sessions expire after two hours. Set
+`VLLM_ROUTER_SLL_SESSION_EXPIRATION_IN_S` on the router to override the TTL; expired
+entries are swept on routing requests at most once per minute. Revisited sessions
+are checked for expiry before refreshing their affinity. State is local to one
+router process and is lost on restart. Multiple routers need consistent ingress
+routing and session release on each router that tracked the session.
+The policy keeps one entry per active session and serializes assignment under a
+mutex, so callers should release sessions promptly and choose a TTL appropriate
+for their workload.
+
+Each policy instance retains at most 100,000 sessions and accepts session IDs up
+to 256 bytes. Override these limits with `VLLM_ROUTER_SLL_MAX_SESSIONS` and
+`VLLM_ROUTER_SLL_MAX_SESSION_ID_BYTES`. Requests that introduce a session beyond
+either limit continue to route least-loaded without affinity; existing tracked
+sessions remain sticky.
 
 ## Advanced Features
 

@@ -7,14 +7,22 @@ use super::RequestHeaders;
 use crate::policies::ConsistentHashPolicy;
 use tracing::debug;
 
-/// HTTP header names to check for session ID (case-insensitive, checked in order)
-pub(crate) const SESSION_HEADER_NAMES: &[&str] = &[
+/// HTTP header names used by consistent hashing (case-insensitive, checked in order).
+pub(crate) const HASH_HEADER_NAMES: &[&str] = &[
     "x-session-id",
     "x-user-id",
     "x-tenant-id",
     "x-correlation-id", // per-session — check before per-request
     "x-request-id",
     "x-trace-id",
+];
+
+/// Headers whose values are expected to remain stable for a complete session.
+const SESSION_HEADER_NAMES: &[&str] = &[
+    "x-session-id",
+    "x-user-id",
+    "x-tenant-id",
+    "x-correlation-id",
 ];
 
 /// Extract hash key with priority: HTTP headers > body fields > request content hash
@@ -51,9 +59,54 @@ pub(crate) fn extract_hash_key(
     }
 }
 
+/// Extract a raw session identifier (the *value* only, without any prefix) from
+/// HTTP headers or request body.
+///
+/// Unlike [`extract_hash_key`], this does NOT fall back to hashing the request
+/// body when no explicit session/user identifier is present; it returns `None`
+/// instead. This is used by load-balancing policies (e.g.
+/// `sticky_least_loaded`) that need a stable, externally-addressable
+/// session id so that a matching `finish_session(session_id)` call can later
+/// release the session.
+///
+/// Lookup order:
+/// 1. Stable HTTP headers: x-session-id, x-user-id, x-tenant-id, x-correlation-id
+/// 2. Body: session_params.session_id (nested)
+/// 3. Body: user (OpenAI format)
+/// 4. Body: session_id (legacy)
+/// 5. Body: user_id (legacy)
+pub(crate) fn extract_session_id(
+    request_text: Option<&str>,
+    headers: Option<&RequestHeaders>,
+) -> Option<String> {
+    if let Some(hdrs) = headers {
+        for header_name in SESSION_HEADER_NAMES {
+            if let Some(value) = hdrs.get(*header_name) {
+                if !value.is_empty() {
+                    return Some(value.clone());
+                }
+            }
+        }
+    }
+
+    let body: serde_json::Value = serde_json::from_str(request_text?).ok()?;
+    let session_id = [
+        body.pointer("/session_params/session_id"),
+        body.get("user"),
+        body.get("session_id"),
+        body.get("user_id"),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(serde_json::Value::as_str)
+    .find(|value| !value.is_empty())
+    .map(str::to_owned);
+    session_id
+}
+
 /// Extract hash key from HTTP headers
 pub(crate) fn extract_hash_key_from_headers(headers: &RequestHeaders) -> Option<String> {
-    for header_name in SESSION_HEADER_NAMES {
+    for header_name in HASH_HEADER_NAMES {
         if let Some(value) = headers.get(*header_name) {
             if !value.is_empty() {
                 debug!(
@@ -475,5 +528,73 @@ mod tests {
     fn test_find_field_start_missing() {
         let text = r#"{"other": "value"}"#;
         assert_eq!(find_field_start(text, "field"), None);
+    }
+
+    // === extract_session_id tests ===
+
+    #[test]
+    fn test_extract_session_id_from_header() {
+        let mut headers = HashMap::new();
+        headers.insert("x-session-id".to_string(), "traj-42".to_string());
+        // Returns the raw value, without any "header:" prefix
+        assert_eq!(
+            extract_session_id(None, Some(&headers)),
+            Some("traj-42".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_session_id_header_priority_over_body() {
+        let mut headers = HashMap::new();
+        headers.insert("x-session-id".to_string(), "from-header".to_string());
+        let body = r#"{"session_id": "from-body"}"#;
+        assert_eq!(
+            extract_session_id(Some(body), Some(&headers)),
+            Some("from-header".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_session_id_body_precedes_request_headers() {
+        let mut headers = HashMap::new();
+        headers.insert("x-request-id".to_string(), "request-1".to_string());
+        headers.insert("x-trace-id".to_string(), "trace-1".to_string());
+        let body = r#"{"session_id": "body-session"}"#;
+
+        assert_eq!(
+            extract_session_id(Some(body), Some(&headers)),
+            Some("body-session".to_string())
+        );
+        assert_eq!(extract_session_id(None, Some(&headers)), None);
+    }
+
+    #[test]
+    fn test_extract_session_id_from_body() {
+        let body = r#"{"session_id": "legacy123", "prompt": "hi"}"#;
+        assert_eq!(
+            extract_session_id(Some(body), None),
+            Some("legacy123".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_session_id_no_fallback() {
+        // No explicit session identifier -> None (unlike extract_hash_key)
+        let body = r#"{"prompt": "hello", "model": "llama"}"#;
+        assert_eq!(extract_session_id(Some(body), None), None);
+        assert_eq!(extract_session_id(None, None), None);
+    }
+
+    #[test]
+    fn test_extract_session_id_preserves_json_escapes() {
+        let id = "session-\"quoted\\path";
+        let body = serde_json::json!({"session_params": {"session_id": id}}).to_string();
+        assert_eq!(extract_session_id(Some(&body), None), Some(id.to_string()));
+    }
+
+    #[test]
+    fn test_extract_session_id_ignores_unrelated_nested_fields() {
+        let body = r#"{"metadata":{"session_id":"not-a-session"},"user":null}"#;
+        assert_eq!(extract_session_id(Some(body), None), None);
     }
 }
