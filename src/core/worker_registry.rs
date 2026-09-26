@@ -2,8 +2,9 @@
 //!
 //! Provides centralized registry for workers with model-based indexing
 
-use crate::core::{ConnectionMode, Worker, WorkerType};
+use crate::core::{ConnectionMode, Worker, WorkerType, UNKNOWN_MODEL_ID};
 use dashmap::DashMap;
+use parking_lot::Mutex;
 use std::sync::{Arc, RwLock};
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -78,6 +79,11 @@ pub struct WorkerRegistry {
     /// the Worker trait's model_id() reads from immutable metadata.
     /// A worker can serve multiple models (e.g. base model + LoRA adapters).
     known_models: Arc<DashMap<String, Vec<String>>>,
+
+    /// Serializes the writers (`register`, `remove`, `sync_worker_models`). Each
+    /// updates several maps, so a model sync interleaved with a replacement or
+    /// removal would re-index the worker that was just dropped. Reads don't lock.
+    write_lock: Arc<Mutex<()>>,
 }
 
 impl WorkerRegistry {
@@ -91,16 +97,32 @@ impl WorkerRegistry {
             connection_workers: Arc::new(DashMap::new()),
             url_to_id: Arc::new(DashMap::new()),
             known_models: Arc::new(DashMap::new()),
+            write_lock: Arc::new(Mutex::new(())),
         }
     }
 
-    /// Register a new worker
+    /// Register a worker, replacing any worker already registered at its URL
     pub fn register(&self, worker: Arc<dyn Worker>) -> WorkerId {
-        let worker_id = if let Some(existing_id) = self.url_to_id.get(worker.url()) {
-            // Worker with this URL already exists, update it
-            existing_id.clone()
-        } else {
-            WorkerId::new()
+        self.register_replacing(worker).0
+    }
+
+    /// `register`, also returning the worker it replaced, so callers that track
+    /// per-model state (e.g. `PolicyRegistry` counts) can release the old one.
+    pub fn register_replacing(
+        &self,
+        worker: Arc<dyn Worker>,
+    ) -> (WorkerId, Option<Arc<dyn Worker>>) {
+        let _guard = self.write_lock.lock();
+        // A replacement keeps the existing ID, but the old worker leaves every
+        // index first, including the models discovered for it, so none of them
+        // outlive it.
+        let existing_id = self.url_to_id.get(worker.url()).map(|id| id.clone());
+        let (worker_id, replaced) = match existing_id {
+            Some(id) => {
+                let replaced = self.remove_unlocked(&id);
+                (id, replaced)
+            }
+            None => (WorkerId::new(), None),
         };
 
         // Store worker
@@ -137,11 +159,17 @@ impl WorkerRegistry {
             .or_default()
             .push(worker_id.clone());
 
-        worker_id
+        (worker_id, replaced)
     }
 
     /// Remove a worker by ID
     pub fn remove(&self, worker_id: &WorkerId) -> Option<Arc<dyn Worker>> {
+        let _guard = self.write_lock.lock();
+        self.remove_unlocked(worker_id)
+    }
+
+    /// `remove` for callers that already hold `write_lock`.
+    fn remove_unlocked(&self, worker_id: &WorkerId) -> Option<Arc<dyn Worker>> {
         if let Some((_, worker)) = self.workers.remove(worker_id) {
             // Remove from URL mapping
             self.url_to_id.remove(worker.url());
@@ -192,11 +220,9 @@ impl WorkerRegistry {
 
     /// Remove a worker by URL
     pub fn remove_by_url(&self, url: &str) -> Option<Arc<dyn Worker>> {
-        if let Some((_, worker_id)) = self.url_to_id.remove(url) {
-            self.remove(&worker_id)
-        } else {
-            None
-        }
+        let _guard = self.write_lock.lock();
+        let (_, worker_id) = self.url_to_id.remove(url)?;
+        self.remove_unlocked(&worker_id)
     }
 
     /// Get a worker by ID
@@ -305,6 +331,7 @@ impl WorkerRegistry {
     /// it to indexes for newly discovered models. This supports workers that
     /// serve multiple models (e.g. a base model + LoRA adapters).
     pub fn sync_worker_models(&self, url: &str, new_models: &[String]) {
+        let _guard = self.write_lock.lock();
         let Some(worker) = self.get_by_url(url) else {
             return;
         };
@@ -362,6 +389,25 @@ impl WorkerRegistry {
         // Record current models for next refresh cycle
         self.known_models
             .insert(url.to_string(), new_models.to_vec());
+    }
+
+    /// Models a worker is indexed under: the set last discovered from its
+    /// `/v1/models`, else the `model_id` label it was registered with.
+    pub fn worker_models(&self, url: &str) -> Vec<String> {
+        if let Some(models) = self.known_models.get(url) {
+            return models.clone();
+        }
+        self.get_by_url(url)
+            .map(|worker| vec![worker.model_id().to_string()])
+            .unwrap_or_default()
+    }
+
+    /// Whether a worker is in no real model's pool: every model it is indexed
+    /// under is the placeholder.
+    fn has_unknown_model(&self, url: &str) -> bool {
+        self.worker_models(url)
+            .iter()
+            .all(|model| model == UNKNOWN_MODEL_ID)
     }
 
     /// Get all model IDs with workers
@@ -462,9 +508,12 @@ impl WorkerRegistry {
     ///
     /// Periodically checks `/health` on every worker and refreshes the model index
     /// by querying `/v1/models`. If a worker's loaded model changes (e.g. `LoRA`
-    /// load/evict), the model index is updated automatically.
+    /// load/evict), the model index is updated automatically. Workers whose models
+    /// are still unknown are queried on every check.
     #[must_use]
     pub fn start_health_checker(&self, check_interval_secs: u64) -> crate::core::HealthChecker {
+        use futures::stream::{self, StreamExt};
+        use std::collections::HashMap;
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
 
@@ -475,6 +524,7 @@ impl WorkerRegistry {
         let handle = tokio::spawn(async move {
             const LOAD_RESET_INTERVAL: u64 = 10;
             const MODEL_REFRESH_INTERVAL: u64 = 5;
+            const MAX_CONCURRENT_MODEL_FETCHES: usize = 32;
 
             let mut interval =
                 tokio::time::interval(tokio::time::Duration::from_secs(check_interval_secs));
@@ -528,33 +578,42 @@ impl WorkerRegistry {
 
                 check_count += 1;
 
-                // Periodically refresh model discovery
+                // Refresh model discovery: every MODEL_REFRESH_INTERVAL checks
+                // to pick up LoRA adapter loads and evictions, and on every
+                // check for workers still under the placeholder model (not
+                // serving yet when registered), so they join their model's
+                // pool as soon as they are up instead of minutes later.
                 // TODO: notify PolicyRegistry on model changes so per-model
                 // policies stay in sync (requires a callback or moving this
                 // logic to a layer that has access to both registries).
-                if check_count.is_multiple_of(MODEL_REFRESH_INTERVAL) {
-                    // Deduplicate by base URL so DP workers (@0, @1, …)
-                    // sharing the same endpoint only trigger one fetch.
-                    let mut fetched: std::collections::HashMap<String, Vec<String>> =
-                        std::collections::HashMap::new();
-
-                    for worker in &workers {
-                        if !worker.is_healthy() {
-                            continue;
-                        }
-                        let base_url = strip_dp_rank(worker.url()).to_string();
-                        let new_models = match fetched.entry(base_url.clone()) {
-                            std::collections::hash_map::Entry::Occupied(e) => e.get().clone(),
-                            std::collections::hash_map::Entry::Vacant(e) => {
-                                let models =
-                                    crate::core::worker::fetch_models_from_worker(&base_url).await;
-                                e.insert(models.clone());
-                                models
-                            }
-                        };
-                        if !new_models.is_empty() {
-                            registry.sync_worker_models(worker.url(), &new_models);
-                        }
+                let full_refresh = check_count.is_multiple_of(MODEL_REFRESH_INTERVAL);
+                // Group the URLs of workers due for a refresh by base URL, so DP
+                // workers (@0, @1, …) sharing an endpoint share one fetch.
+                let mut due: HashMap<String, Vec<String>> = HashMap::new();
+                for worker in &workers {
+                    if worker.is_healthy()
+                        && (full_refresh || registry.has_unknown_model(worker.url()))
+                    {
+                        due.entry(strip_dp_rank(worker.url()).to_string())
+                            .or_default()
+                            .push(worker.url().to_string());
+                    }
+                }
+                // Fetch concurrently (bounded) and apply each result as it
+                // arrives: unreachable workers cost the cycle about one request
+                // timeout in total and don't hold up the rest.
+                let mut fetches = stream::iter(due)
+                    .map(|(base_url, urls)| async move {
+                        let models = crate::core::worker::fetch_models_from_worker(&base_url).await;
+                        (urls, models)
+                    })
+                    .buffer_unordered(MAX_CONCURRENT_MODEL_FETCHES);
+                while let Some((urls, models)) = fetches.next().await {
+                    if models.is_empty() {
+                        continue;
+                    }
+                    for url in urls {
+                        registry.sync_worker_models(&url, &models);
                     }
                 }
 
@@ -848,5 +907,53 @@ mod tests {
             0,
             "LoRA index should be empty after worker removal"
         );
+    }
+
+    /// Re-registering a URL (e.g. POST /workers for a worker that now serves
+    /// another model) must not carry over what was discovered for the old one.
+    #[test]
+    fn test_reregistering_url_replaces_discovered_models() {
+        let registry = WorkerRegistry::new();
+        let url = "http://worker1:8000";
+        let worker_serving = |model: &str| -> Arc<dyn Worker> {
+            let labels = HashMap::from([("model_id".to_string(), model.to_string())]);
+            Arc::from(WorkerFactory::create_regular_with_labels(
+                url.to_string(),
+                labels,
+                CircuitBreakerConfig::default(),
+            ))
+        };
+
+        let old_id = registry.register(worker_serving("old-model"));
+        registry.sync_worker_models(url, &["old-model".to_string(), "old-lora".to_string()]);
+
+        let (new_id, replaced) = registry.register_replacing(worker_serving("new-model"));
+        assert_eq!(new_id, old_id);
+        assert_eq!(replaced.unwrap().model_id(), "old-model");
+        assert_eq!(registry.worker_models(url), ["new-model"]);
+        assert!(registry.get_by_model_fast("old-model").is_empty());
+        assert!(registry.get_by_model_fast("old-lora").is_empty());
+        assert_eq!(registry.get_by_model_fast("new-model").len(), 1);
+        assert_eq!(registry.get_by_type(&WorkerType::Regular).len(), 1);
+    }
+
+    /// A worker whose models list only the placeholder, even more than once, is
+    /// still in no real model's pool and must be retried on every check.
+    #[test]
+    fn test_has_unknown_model_ignores_duplicate_placeholders() {
+        let registry = WorkerRegistry::new();
+        let url = "http://worker1:8000";
+        registry.register(Arc::new(crate::core::BasicWorker::new(
+            url.to_string(),
+            WorkerType::Regular,
+        )));
+        assert!(registry.has_unknown_model(url));
+
+        let placeholder = UNKNOWN_MODEL_ID.to_string();
+        registry.sync_worker_models(url, &[placeholder.clone(), placeholder]);
+        assert!(registry.has_unknown_model(url));
+
+        registry.sync_worker_models(url, &["base-model".to_string()]);
+        assert!(!registry.has_unknown_model(url));
     }
 }

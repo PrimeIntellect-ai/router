@@ -1094,6 +1094,7 @@ async fn list_workers_rest(
                 let mut worker_info = serde_json::json!({
                     "url": worker.url(),
                     "model_id": worker.model_id(),
+                    "models": state.context.worker_registry.worker_models(worker.url()),
                     "worker_type": match worker.worker_type() {
                         WorkerType::Regular => "regular",
                         WorkerType::Prefill { .. } => "prefill",

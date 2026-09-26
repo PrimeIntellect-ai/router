@@ -15,6 +15,10 @@ static WORKER_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
         .expect("Failed to create worker HTTP client")
 });
 
+/// Placeholder `model_id` for a worker registered without one, e.g. because its
+/// `/v1/models` could not be read yet.
+pub const UNKNOWN_MODEL_ID: &str = "unknown";
+
 /// Query a worker's `/v1/models` endpoint and return the list of model IDs.
 ///
 /// Returns an empty vec if the endpoint is unreachable or returns an unexpected format.
@@ -217,7 +221,7 @@ pub trait Worker: Send + Sync + fmt::Debug {
             .labels
             .get("model_id")
             .map(|s| s.as_str())
-            .unwrap_or("unknown")
+            .unwrap_or(UNKNOWN_MODEL_ID)
     }
 
     /// Get the priority of this worker (higher value = higher priority)

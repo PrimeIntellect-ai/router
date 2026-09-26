@@ -211,7 +211,13 @@ impl RouterManager {
 
         // Register worker
         let worker_arc: Arc<dyn Worker> = Arc::from(worker);
-        let worker_id = self.worker_registry.register(worker_arc.clone());
+        let (worker_id, replaced) = self.worker_registry.register_replacing(worker_arc.clone());
+
+        // A worker replaced at the same URL leaves its model's policy count, as
+        // on removal, before the replacement joins its own model's
+        if let Some(replaced) = replaced {
+            self.policy_registry.on_worker_removed(replaced.model_id());
+        }
 
         // Notify PolicyRegistry about the new worker
         // Extract policy hint from labels if provided
@@ -252,21 +258,12 @@ impl RouterManager {
         &self,
         url: &str,
     ) -> Result<WorkerApiResponse, WorkerErrorResponse> {
-        // Get worker to extract model_id before removing
-        let model_id = self
-            .worker_registry
-            .get_by_url(url)
-            .map(|worker| worker.model_id().to_string());
-
-        if let Some(_worker) = self.worker_registry.remove_by_url(url) {
-            // Notify PolicyRegistry about worker removal
-            if let Some(ref model_id) = model_id {
-                self.policy_registry.on_worker_removed(model_id);
-
-                info!("Removed worker with URL {} for model {}", url, model_id);
-            } else {
-                info!("Removed worker with URL {}", url);
-            }
+        // Take the model from the worker actually removed, so a replacement that
+        // lands in between can't make us release the wrong model's count
+        if let Some(worker) = self.worker_registry.remove_by_url(url) {
+            let model_id = worker.model_id();
+            self.policy_registry.on_worker_removed(model_id);
+            info!("Removed worker with URL {} for model {}", url, model_id);
 
             Ok(WorkerApiResponse {
                 success: true,
@@ -348,6 +345,7 @@ impl RouterManager {
             id: id.to_string(),
             url: worker.url().to_string(),
             model_id: worker.model_id().to_string(),
+            models: self.worker_registry.worker_models(worker.url()),
             priority: worker.priority(),
             cost: worker.cost(),
             worker_type: match worker.worker_type() {
@@ -844,5 +842,57 @@ impl std::fmt::Debug for RouterManager {
             .field("workers_count", &self.worker_registry.get_all().len())
             .field("default_router", &*self.default_router.read().unwrap())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn worker_request(url: &str, model: &str) -> WorkerConfigRequest {
+        WorkerConfigRequest {
+            url: url.to_string(),
+            model_id: Some(model.to_string()),
+            worker_type: None,
+            priority: None,
+            cost: None,
+            labels: HashMap::new(),
+            bootstrap_port: None,
+        }
+    }
+
+    /// Replacing a worker at the same URL releases the old model's policy count,
+    /// and removing the replacement releases its own, so nothing leaks.
+    #[tokio::test]
+    async fn test_replacing_worker_rebalances_policy_counts() {
+        let policy_registry = Arc::new(crate::policies::PolicyRegistry::new(
+            crate::config::PolicyConfig::RoundRobin,
+        ));
+        let manager = RouterManager::new(
+            RouterConfig::default(),
+            reqwest::Client::new(),
+            Arc::new(WorkerRegistry::new()),
+            policy_registry.clone(),
+        );
+        let url = "http://worker1:8000";
+
+        manager
+            .add_worker(worker_request(url, "old-model"))
+            .await
+            .unwrap();
+        manager
+            .add_worker(worker_request(url, "new-model"))
+            .await
+            .unwrap();
+        assert_eq!(
+            policy_registry.get_worker_counts(),
+            HashMap::from([("new-model".to_string(), 1)])
+        );
+        assert!(policy_registry.get_policy("old-model").is_none());
+
+        manager.remove_worker_from_registry(url).unwrap();
+        assert!(policy_registry.get_worker_counts().is_empty());
+        assert!(policy_registry.get_policy("new-model").is_none());
     }
 }

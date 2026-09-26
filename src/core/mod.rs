@@ -22,6 +22,6 @@ pub use retry::{is_retryable_status, BackoffCalculator, RetryError, RetryExecuto
 pub use worker::{
     fetch_models_from_worker, start_health_checker, BasicWorker, ConnectionMode, DPAwareWorker,
     HealthChecker, HealthConfig, Worker, WorkerCollection, WorkerFactory, WorkerLoadGuard,
-    WorkerType,
+    WorkerType, UNKNOWN_MODEL_ID,
 };
 pub use worker_registry::{strip_dp_rank, WorkerId, WorkerRegistry, WorkerRegistryStats};

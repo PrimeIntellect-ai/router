@@ -48,6 +48,10 @@ pub struct WorkerInfo {
     /// Model ID this worker serves
     pub model_id: String,
 
+    /// Models the worker is indexed under: last discovered from its
+    /// `/v1/models`, else `model_id`, which is fixed at registration
+    pub models: Vec<String>,
+
     /// Worker priority
     pub priority: u32,
 

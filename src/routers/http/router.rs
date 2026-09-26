@@ -2494,27 +2494,43 @@ mod tests {
         (format!("http://{}", addr), handle)
     }
 
+    /// Helper: start a mock worker that lists `models` on `/v1/models`. Until
+    /// `ready_after` elapses, `/health` and `/v1/models` return 503, like an
+    /// engine that is still loading.
     async fn start_model_listing_worker(
         models: Vec<&'static str>,
+        ready_after: Duration,
     ) -> (String, tokio::task::JoinHandle<()>) {
         use axum::{routing::get, Json, Router as AxumRouter};
         use tokio::net::TcpListener;
 
-        let models: Vec<String> = models.into_iter().map(String::from).collect();
+        let start = Instant::now();
+        let data: Vec<serde_json::Value> = models
+            .iter()
+            .map(|id| serde_json::json!({"id": id, "object": "model"}))
+            .collect();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let app = AxumRouter::new()
-            .route("/health", get(|| async { StatusCode::OK }))
+            .route(
+                "/health",
+                get(move || async move {
+                    if start.elapsed() < ready_after {
+                        StatusCode::SERVICE_UNAVAILABLE
+                    } else {
+                        StatusCode::OK
+                    }
+                }),
+            )
             .route(
                 "/v1/models",
                 get(move || {
-                    let models = models.clone();
+                    let data = data.clone();
                     async move {
-                        let data: Vec<serde_json::Value> = models
-                            .iter()
-                            .map(|id| serde_json::json!({"id": id, "object": "model"}))
-                            .collect();
-                        Json(serde_json::json!({"object": "list", "data": data}))
+                        if start.elapsed() < ready_after {
+                            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                        }
+                        Json(serde_json::json!({"object": "list", "data": data})).into_response()
                     }
                 }),
             );
@@ -2592,7 +2608,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_router_new_indexes_all_discovered_models_immediately() {
-        let (url, _handle) = start_model_listing_worker(vec!["base-model", "rft-run-1"]).await;
+        let (url, _handle) =
+            start_model_listing_worker(vec!["base-model", "rft-run-1"], Duration::ZERO).await;
         let config = crate::config::types::RouterConfig {
             mode: crate::config::types::RoutingMode::Regular {
                 worker_urls: vec![url.clone()],
@@ -2624,6 +2641,35 @@ mod tests {
             .select_worker_for_model(Some("rft-run-1"), Some(r#"{"prompt":"x"}"#), None)
             .expect("LoRA model should be routable immediately after registration");
         assert_eq!(worker.url(), url);
+    }
+
+    #[tokio::test]
+    async fn test_late_worker_joins_model_index_on_next_health_check() {
+        // Still loading when registered, so the worker is filed under the
+        // placeholder model, as when it misses Router::new's model discovery.
+        let (url, _handle) =
+            start_model_listing_worker(vec!["base-model"], Duration::from_millis(500)).await;
+        let registry = WorkerRegistry::new();
+        registry.register(Arc::new(BasicWorker::new(url.clone(), WorkerType::Regular)));
+        assert!(registry.get_by_model_fast("base-model").is_empty());
+
+        // Checks run every second and the periodic full refresh is only due on
+        // the 5th (~4s), so the model has to come from the per-check retry.
+        let health_checker = registry.start_health_checker(1);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while registry.get_by_model_fast("base-model").is_empty() {
+            assert!(
+                Instant::now() < deadline,
+                "late worker was not indexed under its model before the periodic refresh"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(registry
+            .get_by_model_fast(crate::core::UNKNOWN_MODEL_ID)
+            .is_empty());
+        assert_eq!(registry.worker_models(&url), ["base-model"]);
+
+        health_checker.shutdown().await;
     }
 
     #[test]
