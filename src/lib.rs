@@ -302,7 +302,7 @@ impl Router {
         health_failure_threshold = 3,
         health_success_threshold = 2,
         health_check_timeout_secs = 5,
-        health_check_interval_secs = 60,
+        health_check_interval_secs = 20,
         health_check_endpoint = String::from("/health"),
         // IGW defaults
         enable_igw = false,

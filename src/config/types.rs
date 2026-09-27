@@ -363,7 +363,7 @@ impl Default for HealthCheckConfig {
             failure_threshold: 3,
             success_threshold: 2,
             timeout_secs: 5,
-            check_interval_secs: 60,
+            check_interval_secs: 20,
             endpoint: "/health".to_string(),
         }
     }

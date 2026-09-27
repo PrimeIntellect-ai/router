@@ -462,8 +462,7 @@ impl WorkerRegistry {
     ///
     /// Periodically checks `/health` on every worker and refreshes the model index
     /// by querying `/v1/models`. If a worker's loaded model changes (e.g. `LoRA`
-    /// load/evict), the model index is updated automatically. Models are also
-    /// refreshed when a worker transitions from unhealthy to healthy.
+    /// load/evict), the model index is updated automatically.
     #[must_use]
     pub fn start_health_checker(&self, check_interval_secs: u64) -> crate::core::HealthChecker {
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -475,7 +474,7 @@ impl WorkerRegistry {
 
         let handle = tokio::spawn(async move {
             const LOAD_RESET_INTERVAL: u64 = 10;
-            const MODEL_REFRESH_INTERVAL: u64 = 5;
+            const MODEL_REFRESH_INTERVAL: u64 = 1;
 
             let mut interval =
                 tokio::time::interval(tokio::time::Duration::from_secs(check_interval_secs));
@@ -503,7 +502,7 @@ impl WorkerRegistry {
                     async move {
                         match worker.check_health_async().await {
                             Ok(()) => {
-                                if !was_healthy && worker.is_healthy() {
+                                if !was_healthy {
                                     tracing::info!("Worker {} is now healthy", worker_url);
                                 }
                             }
@@ -523,26 +522,24 @@ impl WorkerRegistry {
                                 }
                             }
                         }
-                        !was_healthy && worker.is_healthy()
                     }
                 });
-                let became_healthy = futures::future::join_all(health_checks).await;
+                futures::future::join_all(health_checks).await;
 
                 check_count += 1;
 
-                // Refresh model discovery periodically and when workers become healthy.
+                // Periodically refresh model discovery
                 // TODO: notify PolicyRegistry on model changes so per-model
                 // policies stay in sync (requires a callback or moving this
                 // logic to a layer that has access to both registries).
-                let full_refresh = check_count.is_multiple_of(MODEL_REFRESH_INTERVAL);
-                if full_refresh || became_healthy.iter().any(|&recovered| recovered) {
+                if check_count.is_multiple_of(MODEL_REFRESH_INTERVAL) {
                     // Deduplicate by base URL so DP workers (@0, @1, …)
                     // sharing the same endpoint only trigger one fetch.
                     let mut fetched: std::collections::HashMap<String, Vec<String>> =
                         std::collections::HashMap::new();
 
-                    for (worker, recovered) in workers.iter().zip(&became_healthy) {
-                        if !worker.is_healthy() || (!full_refresh && !recovered) {
+                    for worker in &workers {
+                        if !worker.is_healthy() {
                             continue;
                         }
                         let base_url = strip_dp_rank(worker.url()).to_string();
