@@ -474,7 +474,7 @@ impl WorkerRegistry {
 
         let handle = tokio::spawn(async move {
             const LOAD_RESET_INTERVAL: u64 = 10;
-            const MODEL_REFRESH_INTERVAL: u64 = 5;
+            const MODEL_REFRESH_INTERVAL: u64 = 1;
 
             let mut interval =
                 tokio::time::interval(tokio::time::Duration::from_secs(check_interval_secs));

@@ -321,7 +321,7 @@ struct CliArgs {
     health_check_timeout_secs: u64,
 
     /// Interval in seconds between runtime health checks
-    #[arg(long, default_value_t = 60)]
+    #[arg(long, default_value_t = 20)]
     health_check_interval_secs: u64,
 
     /// Health check endpoint path
