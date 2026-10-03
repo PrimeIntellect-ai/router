@@ -529,7 +529,11 @@ impl VllmPDRouter {
         decode_json: &mut Value,
     ) -> Result<bool, String> {
         let merged =
-            routed_experts_merge::merge_routed_experts_in_json(prefill_response_json, decode_json)?;
+            routed_experts_merge::merge_routed_experts_in_json(prefill_response_json, decode_json)?
+                | routed_experts_merge::merge_routed_payload_in_json(
+                    prefill_response_json,
+                    decode_json,
+                )?;
         if merged {
             debug!("Successfully merged routed experts from prefill and decode responses");
         }
