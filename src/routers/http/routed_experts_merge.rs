@@ -83,6 +83,97 @@ fn dtype_itemsize(dtype: &str) -> Option<usize> {
 
 pub fn prefill_has_routed_experts(prefill_json: &Value) -> bool {
     prefill_choice_routed_experts(prefill_json).is_some()
+        || !routed_payload_segments(&prefill_json["choices"][0]).is_empty()
+}
+
+/// By-handle twin of [`merge_routed_experts_in_json`]: choices carry `payload`
+/// segments (`field`, `file`, `offset`, `pos`, `rows`, `dtype`, `shape`) instead
+/// of inline `routed_experts`. A routed_experts segment covers the absolute token
+/// positions `[pos, pos + rows)`. Under P/D the decode instance's rows start at
+/// its first forward (`prompt_len - 1`), so they overlap the end of prefill's.
+/// Each decode choice gets the prefill choice's routed_experts segments, then its
+/// own segments with routed_experts rows before the prefill coverage end dropped.
+/// Other fields pass through.
+pub fn merge_routed_payload_in_json(
+    prefill_json: &Value,
+    decode_json: &mut Value,
+) -> Result<bool, String> {
+    let prefill_segments = routed_payload_segments(&prefill_json["choices"][0]);
+    let decode_has = decode_json["choices"].as_array().is_some_and(|choices| {
+        choices
+            .iter()
+            .any(|c| !routed_payload_segments(c).is_empty())
+    });
+    if prefill_segments.is_empty() && !decode_has {
+        return Ok(false);
+    }
+    if prefill_segments.is_empty() {
+        return Err("decode payload contained routed_experts, but prefill payload did not".into());
+    }
+    let mut cut = 0;
+    for segment in &prefill_segments {
+        cut = cut.max(segment_u64(segment, "pos")? + segment_u64(segment, "rows")?);
+    }
+
+    let choices = decode_json["choices"]
+        .as_array_mut()
+        .ok_or_else(|| "decode response choices must be an array".to_string())?;
+    for choice in choices {
+        let mut merged: Vec<Value> = prefill_segments.iter().map(|s| (*s).clone()).collect();
+        let decode_segments = choice["payload"].as_array().cloned().unwrap_or_default();
+        for mut segment in decode_segments {
+            if segment["field"] == "routed_experts" {
+                let (pos, rows) = (
+                    segment_u64(&segment, "pos")?,
+                    segment_u64(&segment, "rows")?,
+                );
+                if pos + rows <= cut {
+                    continue;
+                }
+                if pos < cut {
+                    let offset = segment_u64(&segment, "offset")?;
+                    segment["offset"] = json!(offset + (cut - pos) * segment_row_bytes(&segment)?);
+                    segment["pos"] = json!(cut);
+                    segment["rows"] = json!(pos + rows - cut);
+                }
+            }
+            merged.push(segment);
+        }
+        choice["payload"] = Value::Array(merged);
+    }
+    Ok(true)
+}
+
+fn routed_payload_segments(choice: &Value) -> Vec<&Value> {
+    choice["payload"]
+        .as_array()
+        .map(|segments| {
+            segments
+                .iter()
+                .filter(|segment| segment["field"] == "routed_experts")
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn segment_u64(segment: &Value, key: &str) -> Result<u64, String> {
+    segment[key]
+        .as_u64()
+        .ok_or_else(|| format!("payload segment {key} must be a non-negative integer"))
+}
+
+fn segment_row_bytes(segment: &Value) -> Result<u64, String> {
+    let dtype = segment["dtype"].as_str().unwrap_or_default();
+    let itemsize = dtype_itemsize(dtype)
+        .ok_or_else(|| format!("unsupported payload segment dtype {dtype:?}"))?;
+    let shape = segment["shape"]
+        .as_array()
+        .ok_or_else(|| "payload segment shape must be an array".to_string())?;
+    shape.iter().try_fold(itemsize as u64, |bytes, dim| {
+        dim.as_u64()
+            .map(|dim| bytes * dim)
+            .ok_or_else(|| "payload segment shape dimension must be a non-negative integer".into())
+    })
 }
 
 pub fn merge_routed_experts_in_json(
@@ -262,5 +353,42 @@ mod tests {
         );
         assert_eq!(merged.dtype, "uint16");
         assert_eq!(merged.data, vec![10, 0, 11, 0, 0, 1, 2, 1]);
+    }
+
+    fn segment(field: &str, file: &str, offset: u64, pos: u64, rows: u64, dtype: &str) -> Value {
+        json!({"field": field, "file": file, "offset": offset, "pos": pos, "rows": rows,
+               "dtype": dtype, "shape": [2, 4]})
+    }
+
+    #[test]
+    fn merge_payload_prepends_prefill_routing_and_drops_decode_rows_before_cut() {
+        // prompt_len 3, 3 completion tokens. Prefill covers [0, 3); decode's
+        // first forward is at prompt_len - 1, so it covers [2, 5).
+        let prefill = json!({"choices": [{"payload": [
+            segment("routed_experts", "p.bin", 0, 0, 3, "uint8"),
+            segment("sampling_mask", "p.bin", 24, 3, 1, "int32"),
+        ]}]});
+        let mut decode = json!({"choices": [{"payload": [
+            segment("routed_experts", "d.bin", 0, 2, 3, "uint16"),
+            segment("sampling_mask", "d.bin", 48, 3, 3, "int32"),
+        ]}]});
+
+        assert!(merge_routed_payload_in_json(&prefill, &mut decode).unwrap());
+        assert_eq!(
+            decode["choices"][0]["payload"],
+            json!([
+                segment("routed_experts", "p.bin", 0, 0, 3, "uint8"),
+                segment("routed_experts", "d.bin", 16, 3, 2, "uint16"),
+                segment("sampling_mask", "d.bin", 48, 3, 3, "int32"),
+            ])
+        );
+    }
+
+    #[test]
+    fn merge_payload_is_noop_without_routed_segments() {
+        let prefill = json!({"choices": [{"payload": [segment("sampling_mask", "p.bin", 0, 2, 1, "int32")]}]});
+        let mut decode = json!({"choices": [{"text": "x"}]});
+        assert!(!merge_routed_payload_in_json(&prefill, &mut decode).unwrap());
+        assert_eq!(decode, json!({"choices": [{"text": "x"}]}));
     }
 }
