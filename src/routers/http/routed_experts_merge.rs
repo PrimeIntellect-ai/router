@@ -9,10 +9,15 @@ struct RoutedExpertsPayload {
     seq_len: usize,
     layers: usize,
     topk: usize,
+    dtype: String,
     data: Vec<u8>,
 }
 
 impl RoutedExpertsPayload {
+    fn row_bytes(&self) -> usize {
+        self.layers * self.topk * dtype_itemsize(&self.dtype).expect("dtype validated on decode")
+    }
+
     fn suffix_rows(&self, row_count: usize) -> Result<Self, String> {
         if row_count > self.seq_len {
             return Err(format!(
@@ -20,26 +25,22 @@ impl RoutedExpertsPayload {
                 self.seq_len
             ));
         }
-        let row_size = self.layers * self.topk;
-        let byte_start = row_count * row_size;
-        let data = self
-            .data
-            .get(byte_start..)
-            .ok_or_else(|| {
-                format!(
-                    "decode routed_experts has {} rows, expected at least {row_count}",
-                    self.seq_len
-                )
-            })?
-            .to_vec();
-
         Ok(Self {
             start: self.start + row_count,
             seq_len: self.seq_len - row_count,
-            layers: self.layers,
-            topk: self.topk,
-            data,
+            data: self.data[row_count * self.row_bytes()..].to_vec(),
+            ..self.clone()
         })
+    }
+
+    /// prime-rl picks uint16 only when an expert id exceeds 255, so prefill can be
+    /// uint8 while decode is uint16; zero-extend the little-endian uint8 elements.
+    fn widen_to_uint16(&self) -> Self {
+        Self {
+            dtype: "uint16".to_string(),
+            data: self.data.iter().flat_map(|&byte| [byte, 0]).collect(),
+            ..self.clone()
+        }
     }
 
     fn concat_rows(&self, other: &Self) -> Result<Self, String> {
@@ -49,17 +50,34 @@ impl RoutedExpertsPayload {
                 self.seq_len, self.layers, self.topk, other.seq_len, other.layers, other.topk,
             ));
         }
-        let mut data = Vec::with_capacity(self.data.len() + other.data.len());
-        data.extend_from_slice(&self.data);
-        data.extend_from_slice(&other.data);
+        let (head, tail) = match (self.dtype.as_str(), other.dtype.as_str()) {
+            (a, b) if a == b => (self.clone(), other.clone()),
+            ("uint8", "uint16") => (self.widen_to_uint16(), other.clone()),
+            ("uint16", "uint8") => (self.clone(), other.widen_to_uint16()),
+            (a, b) => {
+                return Err(format!(
+                    "cannot concatenate routed_experts with dtypes {a} and {b}"
+                ))
+            }
+        };
+        let mut data = head.data;
+        data.extend_from_slice(&tail.data);
 
         Ok(Self {
-            start: self.start,
             seq_len: self.seq_len + other.seq_len,
-            layers: self.layers,
-            topk: self.topk,
+            dtype: head.dtype,
             data,
+            ..self.clone()
         })
+    }
+}
+
+fn dtype_itemsize(dtype: &str) -> Option<usize> {
+    match dtype {
+        "uint8" => Some(1),
+        "uint16" => Some(2),
+        "int32" | "float32" => Some(4),
+        _ => None,
     }
 }
 
@@ -138,12 +156,20 @@ fn decode_routed_experts_value(value: &Value, name: &str) -> Result<RoutedExpert
     let start =
         usize::try_from(start).map_err(|error| format!("{name} start parse failed: {error}"))?;
     let (seq_len, layers, topk) = parse_shape(payload.get("shape"), name)?;
+    let dtype = payload
+        .get("dtype")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("{name} dtype must be a string"))?
+        .to_string();
+    let itemsize =
+        dtype_itemsize(&dtype).ok_or_else(|| format!("{name} has unsupported dtype {dtype:?}"))?;
     let bytes = STANDARD
         .decode(data_payload)
         .map_err(|error| format!("{name} base64 decode failed: {error}"))?;
     let expected_data_len = seq_len
         .checked_mul(layers)
         .and_then(|size| size.checked_mul(topk))
+        .and_then(|size| size.checked_mul(itemsize))
         .ok_or_else(|| format!("{name} shape is too large"))?;
     if bytes.len() != expected_data_len {
         return Err(format!(
@@ -157,6 +183,7 @@ fn decode_routed_experts_value(value: &Value, name: &str) -> Result<RoutedExpert
         seq_len,
         layers,
         topk,
+        dtype,
         data: bytes,
     })
 }
@@ -187,6 +214,7 @@ fn encode_routed_experts_payload(payload: &RoutedExpertsPayload) -> Value {
         "data": STANDARD.encode(&payload.data),
         "shape": [payload.seq_len, payload.layers, payload.topk],
         "start": payload.start,
+        "dtype": payload.dtype,
     })
 }
 
@@ -195,34 +223,44 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn uint8_payload(seq_len: usize, layers: usize, topk: usize, data: &[u8]) -> Value {
+    fn payload(seq_len: usize, layers: usize, topk: usize, dtype: &str, data: &[u8]) -> Value {
         let payload = RoutedExpertsPayload {
             start: 0,
             seq_len,
             layers,
             topk,
+            dtype: dtype.to_string(),
             data: data.to_vec(),
         };
         encode_routed_experts_payload(&payload)
     }
 
+    fn merge(prompt_payload: Value, decode_payload: Value) -> RoutedExpertsPayload {
+        let prefill = json!({"choices": [{"routed_experts": prompt_payload}]});
+        let mut decode = json!({"choices": [{"routed_experts": decode_payload}]});
+        assert!(merge_routed_experts_in_json(&prefill, &mut decode).unwrap());
+        decode_routed_experts_value(&decode["choices"][0]["routed_experts"], "merged").unwrap()
+    }
+
     #[test]
     fn merge_replaces_decode_prompt_routing_with_prefill_routing() {
-        let prompt_payload = uint8_payload(2, 1, 2, &[10, 11, 20, 21]);
-        let decode_payload = uint8_payload(3, 1, 2, &[0, 0, 1, 1, 30, 31]);
-        let prefill = json!({
-            "choices": [{"routed_experts": prompt_payload}],
-        });
-        let mut decode = json!({"choices": [{"routed_experts": decode_payload}]});
-
-        assert!(merge_routed_experts_in_json(&prefill, &mut decode).unwrap());
-        let merged = decode_routed_experts_value(
-            decode["choices"][0].get("routed_experts").unwrap(),
-            "merged routed_experts",
-        )
-        .unwrap();
+        let merged = merge(
+            payload(2, 1, 2, "uint8", &[10, 11, 20, 21]),
+            payload(3, 1, 2, "uint8", &[0, 0, 1, 1, 30, 31]),
+        );
 
         assert_eq!(merged.seq_len, 3);
         assert_eq!(merged.data, vec![10, 11, 20, 21, 30, 31]);
+    }
+
+    #[test]
+    fn merge_honors_payload_dtype() {
+        // uint8 prompt rows widen to the uint16 decode rows (little-endian).
+        let merged = merge(
+            payload(1, 1, 2, "uint8", &[10, 11]),
+            payload(2, 1, 2, "uint16", &[0, 0, 0, 0, 0, 1, 2, 1]),
+        );
+        assert_eq!(merged.dtype, "uint16");
+        assert_eq!(merged.data, vec![10, 0, 11, 0, 0, 1, 2, 1]);
     }
 }
