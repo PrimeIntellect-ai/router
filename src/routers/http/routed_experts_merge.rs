@@ -70,6 +70,7 @@ fn dtype_itemsize(dtype: &str) -> Option<usize> {
     match dtype {
         "uint8" => Some(1),
         "uint16" => Some(2),
+        "float32" => Some(4),
         _ => None,
     }
 }
