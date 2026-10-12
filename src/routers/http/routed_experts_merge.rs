@@ -33,16 +33,6 @@ impl RoutedExpertsPayload {
         })
     }
 
-    /// prime-rl picks uint16 only when an expert id exceeds 255, so prefill can be
-    /// uint8 while decode is uint16; zero-extend the little-endian uint8 elements.
-    fn widen_to_uint16(&self) -> Self {
-        Self {
-            dtype: "uint16".to_string(),
-            data: self.data.iter().flat_map(|&byte| [byte, 0]).collect(),
-            ..self.clone()
-        }
-    }
-
     fn concat_rows(&self, other: &Self) -> Result<Self, String> {
         if self.layers != other.layers || self.topk != other.topk {
             return Err(format!(
@@ -50,22 +40,24 @@ impl RoutedExpertsPayload {
                 self.seq_len, self.layers, self.topk, other.seq_len, other.layers, other.topk,
             ));
         }
-        let (head, tail) = match (self.dtype.as_str(), other.dtype.as_str()) {
-            (a, b) if a == b => (self.clone(), other.clone()),
-            ("uint8", "uint16") => (self.widen_to_uint16(), other.clone()),
-            ("uint16", "uint8") => (self.clone(), other.widen_to_uint16()),
-            (a, b) => {
-                return Err(format!(
-                    "cannot concatenate routed_experts with dtypes {a} and {b}"
-                ))
-            }
-        };
-        let mut data = head.data;
-        data.extend_from_slice(&tail.data);
+        if self.dtype != other.dtype {
+            return Err(format!(
+                "cannot concatenate routed_experts with dtypes {} and {}",
+                self.dtype, other.dtype
+            ));
+        }
+        if other.start != self.start + self.seq_len {
+            return Err(format!(
+                "decode routed_experts start at row {}, but prefill rows end at {}",
+                other.start,
+                self.start + self.seq_len
+            ));
+        }
+        let mut data = self.data.clone();
+        data.extend_from_slice(&other.data);
 
         Ok(Self {
             seq_len: self.seq_len + other.seq_len,
-            dtype: head.dtype,
             data,
             ..self.clone()
         })
@@ -76,7 +68,6 @@ fn dtype_itemsize(dtype: &str) -> Option<usize> {
     match dtype {
         "uint8" => Some(1),
         "uint16" => Some(2),
-        "int32" | "float32" => Some(4),
         _ => None,
     }
 }
@@ -202,7 +193,9 @@ pub fn merge_routed_experts_in_json(
             .filter(|value| !value.is_null())
             .ok_or_else(|| "decode choice routed_experts is missing".to_string())?;
         let decode = decode_routed_experts_value(routed_experts, "decode routed_experts")?;
-        let completion = decode.suffix_rows(prompt.seq_len)?;
+        // Decode rows start at the decode's first forward; drop the ones prefill already covers.
+        let completion =
+            decode.suffix_rows((prompt.start + prompt.seq_len).saturating_sub(decode.start))?;
         let merged = prompt.concat_rows(&completion)?;
         choice["routed_experts"] = encode_routed_experts_payload(&merged);
     }
@@ -314,12 +307,12 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn payload(seq_len: usize, layers: usize, topk: usize, dtype: &str, data: &[u8]) -> Value {
+    fn payload(start: usize, seq_len: usize, dtype: &str, data: &[u8]) -> Value {
         let payload = RoutedExpertsPayload {
-            start: 0,
+            start,
             seq_len,
-            layers,
-            topk,
+            layers: 1,
+            topk: 2,
             dtype: dtype.to_string(),
             data: data.to_vec(),
         };
@@ -336,8 +329,8 @@ mod tests {
     #[test]
     fn merge_replaces_decode_prompt_routing_with_prefill_routing() {
         let merged = merge(
-            payload(2, 1, 2, "uint8", &[10, 11, 20, 21]),
-            payload(3, 1, 2, "uint8", &[0, 0, 1, 1, 30, 31]),
+            payload(0, 2, "uint8", &[10, 11, 20, 21]),
+            payload(0, 3, "uint8", &[0, 0, 1, 1, 30, 31]),
         );
 
         assert_eq!(merged.seq_len, 3);
@@ -345,14 +338,14 @@ mod tests {
     }
 
     #[test]
-    fn merge_honors_payload_dtype() {
-        // uint8 prompt rows widen to the uint16 decode rows (little-endian).
+    fn merge_cuts_decode_rows_by_start() {
+        // Decode rows begin at its first forward (row 1), so only row 1 overlaps prefill.
         let merged = merge(
-            payload(1, 1, 2, "uint8", &[10, 11]),
-            payload(2, 1, 2, "uint16", &[0, 0, 0, 0, 0, 1, 2, 1]),
+            payload(0, 2, "uint16", &[10, 0, 11, 0, 20, 0, 21, 0]),
+            payload(1, 2, "uint16", &[1, 1, 1, 1, 0, 1, 2, 1]),
         );
-        assert_eq!(merged.dtype, "uint16");
-        assert_eq!(merged.data, vec![10, 0, 11, 0, 0, 1, 2, 1]);
+        assert_eq!((merged.start, merged.seq_len), (0, 3));
+        assert_eq!(merged.data, vec![10, 0, 11, 0, 20, 0, 21, 0, 0, 1, 2, 1]);
     }
 
     fn segment(field: &str, file: &str, offset: u64, pos: u64, rows: u64, dtype: &str) -> Value {
