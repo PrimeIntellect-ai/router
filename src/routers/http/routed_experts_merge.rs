@@ -117,7 +117,7 @@ pub fn merge_routed_payload_in_json(
     }
     let mut cut = 0;
     for segment in &prefill_segments {
-        cut = cut.max(segment_u64(segment, "pos")? + segment_u64(segment, "rows")?);
+        cut = cut.max(segment_end(segment)?);
     }
 
     let choices = decode_json["choices"]
@@ -128,18 +128,19 @@ pub fn merge_routed_payload_in_json(
         let decode_segments = choice["payload"].as_array().cloned().unwrap_or_default();
         for mut segment in decode_segments {
             if segment["field"] == "routed_experts" {
-                let (pos, rows) = (
-                    segment_u64(&segment, "pos")?,
-                    segment_u64(&segment, "rows")?,
-                );
-                if pos + rows <= cut {
+                let (pos, end) = (segment_u64(&segment, "pos")?, segment_end(&segment)?);
+                if end <= cut {
                     continue;
                 }
                 if pos < cut {
                     let offset = segment_u64(&segment, "offset")?;
-                    segment["offset"] = json!(offset + (cut - pos) * segment_row_bytes(&segment)?);
+                    let offset = (cut - pos)
+                        .checked_mul(segment_row_bytes(&segment)?)
+                        .and_then(|skipped| skipped.checked_add(offset))
+                        .ok_or_else(|| "payload segment offset overflows u64".to_string())?;
+                    segment["offset"] = json!(offset);
                     segment["pos"] = json!(cut);
-                    segment["rows"] = json!(pos + rows - cut);
+                    segment["rows"] = json!(end - cut);
                 }
             }
             merged.push(segment);
@@ -167,6 +168,12 @@ fn segment_u64(segment: &Value, key: &str) -> Result<u64, String> {
         .ok_or_else(|| format!("payload segment {key} must be a non-negative integer"))
 }
 
+fn segment_end(segment: &Value) -> Result<u64, String> {
+    segment_u64(segment, "pos")?
+        .checked_add(segment_u64(segment, "rows")?)
+        .ok_or_else(|| "payload segment pos + rows overflows u64".to_string())
+}
+
 fn segment_row_bytes(segment: &Value) -> Result<u64, String> {
     let dtype = segment["dtype"].as_str().unwrap_or_default();
     let itemsize = dtype_itemsize(dtype)
@@ -175,9 +182,12 @@ fn segment_row_bytes(segment: &Value) -> Result<u64, String> {
         .as_array()
         .ok_or_else(|| "payload segment shape must be an array".to_string())?;
     shape.iter().try_fold(itemsize as u64, |bytes, dim| {
-        dim.as_u64()
-            .map(|dim| bytes * dim)
-            .ok_or_else(|| "payload segment shape dimension must be a non-negative integer".into())
+        let dim = dim.as_u64().ok_or_else(|| {
+            "payload segment shape dimension must be a non-negative integer".to_string()
+        })?;
+        bytes
+            .checked_mul(dim)
+            .ok_or_else(|| "payload segment shape is too large".to_string())
     })
 }
 
@@ -393,6 +403,21 @@ mod tests {
         let mut decode = json!({"choices": [{"text": "x"}]});
         assert!(!merge_routed_payload_in_json(&prefill, &mut decode).unwrap());
         assert_eq!(decode, json!({"choices": [{"text": "x"}]}));
+    }
+
+    #[test]
+    fn merge_payload_rejects_overflowing_metadata() {
+        // Prefill pos + rows overflows; decode offset adjustment overflows.
+        let cases = [((u64::MAX, 1), (0, 0)), ((0, 3), (2, u64::MAX))];
+        for ((prefill_pos, prefill_rows), (decode_pos, decode_offset)) in cases {
+            let prefill = json!({"choices": [{"payload": [
+                segment("routed_experts", "p.bin", 0, prefill_pos, prefill_rows, "uint8"),
+            ]}]});
+            let mut decode = json!({"choices": [{"payload": [
+                segment("routed_experts", "d.bin", decode_offset, decode_pos, 3, "uint8"),
+            ]}]});
+            assert!(merge_routed_payload_in_json(&prefill, &mut decode).is_err());
+        }
     }
 
     #[test]
