@@ -9,10 +9,22 @@ struct RoutedExpertsPayload {
     seq_len: usize,
     layers: usize,
     topk: usize,
+    dtype: String,
     data: Vec<u8>,
 }
 
 impl RoutedExpertsPayload {
+    fn row_bytes(&self) -> Result<usize, String> {
+        let itemsize = dtype_itemsize(&self.dtype).expect("dtype validated on decode");
+        shape_bytes(itemsize, &[self.layers, self.topk])
+    }
+
+    fn end(&self) -> Result<usize, String> {
+        self.start
+            .checked_add(self.seq_len)
+            .ok_or_else(|| "routed_experts row range overflows usize".to_string())
+    }
+
     fn suffix_rows(&self, row_count: usize) -> Result<Self, String> {
         if row_count > self.seq_len {
             return Err(format!(
@@ -20,25 +32,11 @@ impl RoutedExpertsPayload {
                 self.seq_len
             ));
         }
-        let row_size = self.layers * self.topk;
-        let byte_start = row_count * row_size;
-        let data = self
-            .data
-            .get(byte_start..)
-            .ok_or_else(|| {
-                format!(
-                    "decode routed_experts has {} rows, expected at least {row_count}",
-                    self.seq_len
-                )
-            })?
-            .to_vec();
-
         Ok(Self {
             start: self.start + row_count,
             seq_len: self.seq_len - row_count,
-            layers: self.layers,
-            topk: self.topk,
-            data,
+            data: self.data[row_count * self.row_bytes()?..].to_vec(),
+            ..self.clone()
         })
     }
 
@@ -49,17 +47,42 @@ impl RoutedExpertsPayload {
                 self.seq_len, self.layers, self.topk, other.seq_len, other.layers, other.topk,
             ));
         }
-        let mut data = Vec::with_capacity(self.data.len() + other.data.len());
-        data.extend_from_slice(&self.data);
+        if self.dtype != other.dtype {
+            return Err(format!(
+                "cannot concatenate routed_experts with dtypes {} and {}",
+                self.dtype, other.dtype
+            ));
+        }
+        let end = self.end()?;
+        if other.start != end {
+            return Err(format!(
+                "decode routed_experts start at row {}, but prefill rows end at {end}",
+                other.start
+            ));
+        }
+        let mut data = self.data.clone();
         data.extend_from_slice(&other.data);
 
         Ok(Self {
-            start: self.start,
-            seq_len: self.seq_len + other.seq_len,
-            layers: self.layers,
-            topk: self.topk,
+            seq_len: other.end()? - self.start,
             data,
+            ..self.clone()
         })
+    }
+}
+
+/// Bytes of an array with `dims` of `itemsize`-byte items; Err if it overflows usize.
+fn shape_bytes(itemsize: usize, dims: &[usize]) -> Result<usize, String> {
+    dims.iter()
+        .try_fold(itemsize, |bytes, &dim| bytes.checked_mul(dim))
+        .ok_or_else(|| "routed_experts shape is too large".to_string())
+}
+
+fn dtype_itemsize(dtype: &str) -> Option<usize> {
+    match dtype {
+        "uint8" => Some(1),
+        "uint16" => Some(2),
+        _ => None,
     }
 }
 
@@ -93,7 +116,8 @@ pub fn merge_routed_experts_in_json(
             .filter(|value| !value.is_null())
             .ok_or_else(|| "decode choice routed_experts is missing".to_string())?;
         let decode = decode_routed_experts_value(routed_experts, "decode routed_experts")?;
-        let completion = decode.suffix_rows(prompt.seq_len)?;
+        // Decode rows start at the decode's first forward; drop the ones prefill already covers.
+        let completion = decode.suffix_rows(prompt.end()?.saturating_sub(decode.start))?;
         let merged = prompt.concat_rows(&completion)?;
         choice["routed_experts"] = encode_routed_experts_payload(&merged);
     }
@@ -138,13 +162,18 @@ fn decode_routed_experts_value(value: &Value, name: &str) -> Result<RoutedExpert
     let start =
         usize::try_from(start).map_err(|error| format!("{name} start parse failed: {error}"))?;
     let (seq_len, layers, topk) = parse_shape(payload.get("shape"), name)?;
+    let dtype = payload
+        .get("dtype")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("{name} dtype must be a string"))?
+        .to_string();
+    let itemsize =
+        dtype_itemsize(&dtype).ok_or_else(|| format!("{name} has unsupported dtype {dtype:?}"))?;
     let bytes = STANDARD
         .decode(data_payload)
         .map_err(|error| format!("{name} base64 decode failed: {error}"))?;
-    let expected_data_len = seq_len
-        .checked_mul(layers)
-        .and_then(|size| size.checked_mul(topk))
-        .ok_or_else(|| format!("{name} shape is too large"))?;
+    let expected_data_len = shape_bytes(itemsize, &[seq_len, layers, topk])
+        .map_err(|_| format!("{name} shape is too large"))?;
     if bytes.len() != expected_data_len {
         return Err(format!(
             "{name} has {} data bytes, expected {expected_data_len}",
@@ -157,6 +186,7 @@ fn decode_routed_experts_value(value: &Value, name: &str) -> Result<RoutedExpert
         seq_len,
         layers,
         topk,
+        dtype,
         data: bytes,
     })
 }
@@ -187,6 +217,7 @@ fn encode_routed_experts_payload(payload: &RoutedExpertsPayload) -> Value {
         "data": STANDARD.encode(&payload.data),
         "shape": [payload.seq_len, payload.layers, payload.topk],
         "start": payload.start,
+        "dtype": payload.dtype,
     })
 }
 
@@ -195,34 +226,61 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn uint8_payload(seq_len: usize, layers: usize, topk: usize, data: &[u8]) -> Value {
+    fn payload(start: usize, seq_len: usize, dtype: &str, data: &[u8]) -> Value {
         let payload = RoutedExpertsPayload {
-            start: 0,
+            start,
             seq_len,
-            layers,
-            topk,
+            layers: 1,
+            topk: 2,
+            dtype: dtype.to_string(),
             data: data.to_vec(),
         };
         encode_routed_experts_payload(&payload)
     }
 
+    fn merge(prompt_payload: Value, decode_payload: Value) -> RoutedExpertsPayload {
+        let prefill = json!({"choices": [{"routed_experts": prompt_payload}]});
+        let mut decode = json!({"choices": [{"routed_experts": decode_payload}]});
+        assert!(merge_routed_experts_in_json(&prefill, &mut decode).unwrap());
+        decode_routed_experts_value(&decode["choices"][0]["routed_experts"], "merged").unwrap()
+    }
+
     #[test]
     fn merge_replaces_decode_prompt_routing_with_prefill_routing() {
-        let prompt_payload = uint8_payload(2, 1, 2, &[10, 11, 20, 21]);
-        let decode_payload = uint8_payload(3, 1, 2, &[0, 0, 1, 1, 30, 31]);
-        let prefill = json!({
-            "choices": [{"routed_experts": prompt_payload}],
-        });
-        let mut decode = json!({"choices": [{"routed_experts": decode_payload}]});
-
-        assert!(merge_routed_experts_in_json(&prefill, &mut decode).unwrap());
-        let merged = decode_routed_experts_value(
-            decode["choices"][0].get("routed_experts").unwrap(),
-            "merged routed_experts",
-        )
-        .unwrap();
+        let merged = merge(
+            payload(0, 2, "uint8", &[10, 11, 20, 21]),
+            payload(0, 3, "uint8", &[0, 0, 1, 1, 30, 31]),
+        );
 
         assert_eq!(merged.seq_len, 3);
         assert_eq!(merged.data, vec![10, 11, 20, 21, 30, 31]);
+    }
+
+    #[test]
+    fn merge_cuts_decode_rows_by_start() {
+        // Decode rows begin at its first forward (row 1), so only row 1 overlaps prefill.
+        let merged = merge(
+            payload(0, 2, "uint16", &[10, 0, 11, 0, 20, 0, 21, 0]),
+            payload(1, 2, "uint16", &[1, 1, 1, 1, 0, 1, 2, 1]),
+        );
+        assert_eq!((merged.start, merged.seq_len), (0, 3));
+        assert_eq!(merged.data, vec![10, 0, 11, 0, 20, 0, 21, 0, 0, 1, 2, 1]);
+    }
+
+    #[test]
+    fn merge_rejects_overflowing_metadata() {
+        let wide = json!({"data": "", "shape": [0, u64::MAX, 2], "start": 0, "dtype": "uint8"});
+        let cases = [
+            (
+                payload(usize::MAX, 1, "uint8", &[1, 2]),
+                payload(0, 1, "uint8", &[1, 2]),
+            ),
+            (wide.clone(), wide),
+        ];
+        for (prompt_payload, decode_payload) in cases {
+            let prefill = json!({"choices": [{"routed_experts": prompt_payload}]});
+            let mut decode = json!({"choices": [{"routed_experts": decode_payload}]});
+            assert!(merge_routed_experts_in_json(&prefill, &mut decode).is_err());
+        }
     }
 }
