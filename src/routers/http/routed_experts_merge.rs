@@ -1,5 +1,7 @@
 //! Stitch compact routed-experts payloads for vLLM P/D disaggregation.
 
+use std::collections::HashMap;
+
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde_json::{json, Value};
 
@@ -82,6 +84,7 @@ fn dtype_itemsize(dtype: &str) -> Option<usize> {
     match dtype {
         "uint8" => Some(1),
         "uint16" => Some(2),
+        "float32" => Some(4),
         _ => None,
     }
 }
@@ -91,14 +94,19 @@ pub fn prefill_has_routed_experts(prefill_json: &Value) -> bool {
         || !routed_payload_segments(&prefill_json["choices"][0]).is_empty()
 }
 
+/// Payload fields the forward pass produces for every position, prompt included, so the
+/// prefill worker holds the prompt's rows and the decode worker the rest. Other fields
+/// (sampling masks and their logprobs) cover sampled tokens only and come from decode.
+const STITCHED_FIELDS: [&str; 2] = ["routed_experts", "routed_expert_weights"];
+
 /// By-handle twin of [`merge_routed_experts_in_json`]: choices carry `payload`
 /// segments (`field`, `file`, `offset`, `pos`, `rows`, `dtype`, `shape`) instead
-/// of inline `routed_experts`. A routed_experts segment covers the absolute token
-/// positions `[pos, pos + rows)`. Under P/D the decode instance's rows start at
-/// its first forward (`prompt_len - 1`), so they overlap the end of prefill's.
-/// Each decode choice gets the prefill choice's routed_experts segments, then its
-/// own segments with routed_experts rows before the prefill coverage end dropped.
-/// Other fields pass through.
+/// of inline `routed_experts`. A segment covers the absolute token positions
+/// `[pos, pos + rows)`. Under P/D the decode instance's rows start at its first
+/// forward (`prompt_len - 1`), so they overlap the end of prefill's. Each decode
+/// choice gets the prefill choice's segments of every [`STITCHED_FIELDS`] field,
+/// then its own segments with those fields' rows before the field's prefill
+/// coverage end dropped. Other fields pass through.
 pub fn merge_routed_payload_in_json(
     prefill_json: &Value,
     decode_json: &mut Value,
@@ -112,12 +120,13 @@ pub fn merge_routed_payload_in_json(
     if prefill_segments.is_empty() && !decode_has {
         return Ok(false);
     }
-    if prefill_segments.is_empty() {
-        return Err("decode payload contained routed_experts, but prefill payload did not".into());
-    }
-    let mut cut = 0;
+    let mut cuts: HashMap<&str, u64> = HashMap::new();
     for segment in &prefill_segments {
-        cut = cut.max(segment_end(segment)?);
+        let end = segment_end(segment)?;
+        let cut = cuts
+            .entry(segment["field"].as_str().unwrap_or_default())
+            .or_default();
+        *cut = (*cut).max(end);
     }
 
     let choices = decode_json["choices"]
@@ -127,7 +136,11 @@ pub fn merge_routed_payload_in_json(
         let mut merged: Vec<Value> = prefill_segments.iter().map(|s| (*s).clone()).collect();
         let decode_segments = choice["payload"].as_array().cloned().unwrap_or_default();
         for mut segment in decode_segments {
-            if segment["field"] == "routed_experts" {
+            if is_stitched(&segment) {
+                let field = segment["field"].as_str().unwrap_or_default();
+                let cut = *cuts.get(field).ok_or_else(|| {
+                    format!("decode payload contained {field}, but prefill payload did not")
+                })?;
                 let (pos, end) = (segment_u64(&segment, "pos")?, segment_end(&segment)?);
                 if end <= cut {
                     continue;
@@ -150,15 +163,16 @@ pub fn merge_routed_payload_in_json(
     Ok(true)
 }
 
+fn is_stitched(segment: &Value) -> bool {
+    segment["field"]
+        .as_str()
+        .is_some_and(|field| STITCHED_FIELDS.contains(&field))
+}
+
 fn routed_payload_segments(choice: &Value) -> Vec<&Value> {
     choice["payload"]
         .as_array()
-        .map(|segments| {
-            segments
-                .iter()
-                .filter(|segment| segment["field"] == "routed_experts")
-                .collect()
-        })
+        .map(|segments| segments.iter().filter(|s| is_stitched(s)).collect())
         .unwrap_or_default()
 }
 
@@ -379,11 +393,14 @@ mod tests {
         // first forward is at prompt_len - 1, so it covers [2, 5).
         let prefill = json!({"choices": [{"payload": [
             segment("routed_experts", "p.bin", 0, 0, 3, "uint8"),
-            segment("sampling_mask", "p.bin", 24, 3, 1, "int32"),
+            segment("routed_expert_weights", "p.bin", 24, 0, 3, "float32"),
+            segment("sampling_mask", "p.bin", 120, 3, 1, "int32"),
         ]}]});
         let mut decode = json!({"choices": [{"payload": [
             segment("routed_experts", "d.bin", 0, 2, 3, "uint16"),
-            segment("sampling_mask", "d.bin", 48, 3, 3, "int32"),
+            segment("routed_expert_weights", "d.bin", 48, 2, 3, "float32"),
+            segment("sampling_mask", "d.bin", 144, 3, 3, "int32"),
+            segment("sampling_mask_logprobs", "d.bin", 240, 3, 3, "float32"),
         ]}]});
 
         assert!(merge_routed_payload_in_json(&prefill, &mut decode).unwrap());
@@ -391,8 +408,11 @@ mod tests {
             decode["choices"][0]["payload"],
             json!([
                 segment("routed_experts", "p.bin", 0, 0, 3, "uint8"),
+                segment("routed_expert_weights", "p.bin", 24, 0, 3, "float32"),
                 segment("routed_experts", "d.bin", 16, 3, 2, "uint16"),
-                segment("sampling_mask", "d.bin", 48, 3, 3, "int32"),
+                segment("routed_expert_weights", "d.bin", 80, 3, 2, "float32"),
+                segment("sampling_mask", "d.bin", 144, 3, 3, "int32"),
+                segment("sampling_mask_logprobs", "d.bin", 240, 3, 3, "float32"),
             ])
         );
     }
