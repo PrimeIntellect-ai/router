@@ -1353,6 +1353,16 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     };
     println!("DEBUG: Logging initialized");
 
+    // Every proxied request holds a client socket and a worker socket, so the
+    // common 1024 soft limit caps the router near 500 concurrent requests.
+    #[cfg(unix)]
+    match rlimit::increase_nofile_limit(u64::MAX)
+        .and_then(|_| rlimit::getrlimit(rlimit::Resource::NOFILE))
+    {
+        Ok((soft, hard)) => info!("Open file limit: {soft} (hard {hard})"),
+        Err(e) => warn!("Failed to raise the open file limit: {e}"),
+    }
+
     // Initialize prometheus metrics exporter
     println!("DEBUG: Initializing Prometheus metrics");
     if let Some(prometheus_config) = config.prometheus_config {
