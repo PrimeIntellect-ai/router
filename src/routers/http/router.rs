@@ -379,12 +379,15 @@ impl Router {
         }
     }
 
+    /// Base URL of the first worker, for proxied GETs. A DP-aware worker's `url()` carries an
+    /// `@<dp_rank>` suffix that is not part of a requestable URL: `http://host:port@1/v1/models`
+    /// parses as userinfo `host:port` and host `1`, i.e. 0.0.0.1.
     fn select_first_worker(&self) -> Result<String, String> {
         let workers = self.worker_registry.get_all();
         if workers.is_empty() {
             Err("No workers are available".to_string())
         } else {
-            Ok(workers[0].url().to_string())
+            Ok(workers[0].base_url().to_string())
         }
     }
 
@@ -400,7 +403,7 @@ impl Router {
                 model_id
             ))
         } else {
-            Ok(workers[0].url().to_string())
+            Ok(workers[0].base_url().to_string())
         }
     }
 
@@ -2187,6 +2190,27 @@ mod tests {
         let url = result.unwrap();
         // DashMap doesn't guarantee order, so just check we get one of the workers
         assert!(url == "http://worker1:8080" || url == "http://worker2:8080");
+    }
+
+    #[test]
+    fn test_select_first_worker_dp_aware() {
+        let router = create_test_regular_router();
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        for rank in 0..4 {
+            worker_registry.register(Arc::new(DPAwareWorker::new(
+                "http://worker1:8080".to_string(),
+                rank,
+                4,
+                WorkerType::Regular,
+            )));
+        }
+        let router = Router {
+            worker_registry,
+            intra_node_data_parallel_size: 4,
+            ..router
+        };
+
+        assert_eq!(router.select_first_worker().unwrap(), "http://worker1:8080");
     }
 
     #[tokio::test]
