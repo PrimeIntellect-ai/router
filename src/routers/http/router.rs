@@ -466,69 +466,115 @@ impl Router {
         response
     }
 
-    // Helper method to proxy GET requests to the first available worker
+    // Preserve the single-attempt behavior of the other proxied GET endpoints.
     async fn proxy_get_request(&self, req: Request<Body>, endpoint: &str) -> Response {
-        let incoming_headers = req.headers();
-        let headers = header_utils::copy_request_headers(&req);
-
         match self.select_first_worker() {
             Ok(worker_url) => {
-                let url = format!("{}/{}", worker_url, endpoint);
-                let route_name = format!("/{}", endpoint);
-                let mut request_builder = self.client.get(&url);
-                for (name, value) in headers {
-                    let name_lc = name.to_lowercase();
-                    if name_lc != "content-type"
-                        && name_lc != "content-length"
-                        && !header_utils::TRACE_HEADER_NAMES.contains(&name_lc.as_str())
-                    {
-                        request_builder = request_builder.header(name, value);
-                    }
-                }
+                self.proxy_get_from_worker(req.headers(), endpoint, &worker_url, None)
+                    .await
+            }
+            Err(e) => (StatusCode::SERVICE_UNAVAILABLE, e).into_response(),
+        }
+    }
 
-                match otel_http::send_client_request(
-                    request_builder,
-                    Some(incoming_headers),
-                    ClientRequestOptions {
-                        method: "GET",
-                        url: &url,
-                        route: Some(&route_name),
-                        request_phase: None,
-                    },
-                )
-                .await
-                {
-                    Ok(res) => {
-                        let status = StatusCode::from_u16(res.status().as_u16())
-                            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    async fn proxy_get_from_worker(
+        &self,
+        incoming_headers: &HeaderMap,
+        endpoint: &str,
+        worker_url: &str,
+        timeout: Option<Duration>,
+    ) -> Response {
+        let headers = incoming_headers
+            .iter()
+            .filter_map(|(name, value)| value.to_str().ok().map(|value| (name.as_str(), value)));
+        let url = format!("{}/{}", worker_url, endpoint);
+        let route_name = format!("/{}", endpoint);
+        let mut request_builder = self.client.get(&url);
+        if let Some(timeout) = timeout {
+            request_builder = request_builder.timeout(timeout);
+        }
+        for (name, value) in headers {
+            let name_lc = name.to_lowercase();
+            if name_lc != "content-type"
+                && name_lc != "content-length"
+                && !header_utils::TRACE_HEADER_NAMES.contains(&name_lc.as_str())
+            {
+                request_builder = request_builder.header(name, value);
+            }
+        }
 
-                        // Preserve headers from backend
-                        let response_headers =
-                            header_utils::preserve_response_headers(res.headers());
+        match otel_http::send_client_request(
+            request_builder,
+            Some(incoming_headers),
+            ClientRequestOptions {
+                method: "GET",
+                url: &url,
+                route: Some(&route_name),
+                request_phase: None,
+            },
+        )
+        .await
+        {
+            Ok(res) => {
+                let status = StatusCode::from_u16(res.status().as_u16())
+                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
 
-                        match res.bytes().await {
-                            Ok(body) => {
-                                let mut response = Response::new(axum::body::Body::from(body));
-                                *response.status_mut() = status;
-                                *response.headers_mut() = response_headers;
-                                response
-                            }
-                            Err(e) => (
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                format!("Failed to read response: {}", e),
-                            )
-                                .into_response(),
-                        }
+                // Preserve headers from backend
+                let response_headers = header_utils::preserve_response_headers(res.headers());
+
+                match res.bytes().await {
+                    Ok(body) => {
+                        let mut response = Response::new(axum::body::Body::from(body));
+                        *response.status_mut() = status;
+                        *response.headers_mut() = response_headers;
+                        response
                     }
                     Err(e) => (
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Request failed: {}", e),
+                        format!("Failed to read response: {}", e),
                     )
                         .into_response(),
                 }
             }
-            Err(e) => (StatusCode::SERVICE_UNAVAILABLE, e).into_response(),
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Request failed: {}", e),
+            )
+                .into_response(),
         }
+    }
+
+    /// Model metadata must tolerate a worker reloading, just as completions do.
+    async fn proxy_get_models(&self, req: Request<Body>) -> Response {
+        let mut attempted = std::collections::HashSet::new();
+        let mut response = (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "No available model workers",
+        )
+            .into_response();
+        for worker in self.worker_registry.get_all() {
+            // DP ranks share a metadata server. Try each healthy base URL once,
+            // and recheck health before each attempt in case a worker just went down.
+            if !worker.is_available() || !attempted.insert(worker.base_url().to_string()) {
+                continue;
+            }
+            // Inference clients can have very long timeouts. Bound each metadata
+            // attempt so a stalled worker cannot prevent trying another one.
+            response = self
+                .proxy_get_from_worker(
+                    req.headers(),
+                    "v1/models",
+                    worker.base_url(),
+                    Some(Duration::from_secs(5)),
+                )
+                .await;
+            if !is_retryable_status(response.status())
+                || attempted.len() >= self.retry_config.max_retries.max(1) as usize
+            {
+                break;
+            }
+        }
+        response
     }
 
     /// Convert axum HeaderMap to policy RequestHeaders (HashMap<String, String>)
@@ -1683,7 +1729,7 @@ impl RouterTrait for Router {
     }
 
     async fn get_models(&self, req: Request<Body>) -> Response {
-        self.proxy_get_request(req, "v1/models").await
+        self.proxy_get_models(req).await
     }
 
     async fn get_model_info(&self, req: Request<Body>) -> Response {
@@ -2211,6 +2257,256 @@ mod tests {
         };
 
         assert_eq!(router.select_first_worker().unwrap(), "http://worker1:8080");
+    }
+
+    fn model_metadata_router(urls: &[String]) -> Router {
+        let router = create_test_regular_router();
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        for url in urls {
+            worker_registry.register(Arc::new(BasicWorker::new(url.clone(), WorkerType::Regular)));
+        }
+        Router {
+            worker_registry,
+            ..router
+        }
+    }
+
+    async fn start_metadata_worker(
+        status: Arc<std::sync::atomic::AtomicU16>,
+        requests: Arc<std::sync::Mutex<Vec<HeaderMap>>>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use axum::{routing::get, Router as AxumRouter};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = AxumRouter::new().route(
+            "/v1/models",
+            get(move |headers: HeaderMap| {
+                let status = status.clone();
+                let requests = requests.clone();
+                async move {
+                    requests.lock().unwrap().push(headers);
+                    let code = status.load(std::sync::atomic::Ordering::SeqCst);
+                    if code == 0 {
+                        // A server that accepts a connection but never sends headers.
+                        std::future::pending::<()>().await;
+                    }
+                    (
+                        StatusCode::from_u16(code).unwrap(),
+                        [("x-metadata-worker", "healthy")],
+                        Json(serde_json::json!({"object": "list", "data": [{"id": "base-model"}]})),
+                    )
+                }
+            }),
+        );
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}"), handle)
+    }
+
+    #[tokio::test]
+    async fn test_models_skips_unhealthy_worker_and_preserves_headers() {
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let status = Arc::new(std::sync::atomic::AtomicU16::new(200));
+        let (url, handle) = start_metadata_worker(status, requests.clone()).await;
+        let router = model_metadata_router(&["http://127.0.0.1:1".to_string(), url.clone()]);
+        router
+            .worker_registry
+            .get_by_url("http://127.0.0.1:1")
+            .unwrap()
+            .set_healthy(false);
+        let req = Request::builder()
+            .header("authorization", "Bearer test-token")
+            .header("x-session-id", "metadata-test")
+            .header(
+                "traceparent",
+                "00-12345678901234567890123456789012-1234567890123456-01",
+            )
+            .body(Body::empty())
+            .unwrap();
+        let response = router.get_models(req).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["x-metadata-worker"], "healthy");
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()["data"][0]["id"],
+            "base-model"
+        );
+        let received = requests.lock().unwrap();
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0]["authorization"], "Bearer test-token");
+        assert_eq!(received[0]["x-session-id"], "metadata-test");
+        assert!(received[0].contains_key("traceparent"));
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_models_returns_unavailable_without_healthy_workers() {
+        let router = model_metadata_router(&["http://127.0.0.1:1".to_string()]);
+        for worker in router.worker_registry.get_all() {
+            worker.set_healthy(false);
+        }
+        assert_eq!(
+            router
+                .get_models(Request::new(Body::empty()))
+                .await
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        let empty = model_metadata_router(&[]);
+        assert_eq!(
+            empty.get_models(Request::new(Body::empty())).await.status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[tokio::test]
+    async fn test_models_retries_transient_status_and_transport_failure() {
+        use std::sync::atomic::{AtomicU16, Ordering};
+        // Force the first registered candidate to fail, independently of DashMap order.
+        for failure in [500, 503, 0] {
+            let counts = [
+                Arc::new(std::sync::Mutex::new(Vec::new())),
+                Arc::new(std::sync::Mutex::new(Vec::new())),
+            ];
+            let statuses = [Arc::new(AtomicU16::new(200)), Arc::new(AtomicU16::new(200))];
+            let (a, mut ah) = start_metadata_worker(statuses[0].clone(), counts[0].clone()).await;
+            let (b, mut bh) = start_metadata_worker(statuses[1].clone(), counts[1].clone()).await;
+            let router = model_metadata_router(&[a.clone(), b.clone()]);
+            let first = if router.worker_registry.get_all()[0].base_url() == a {
+                0
+            } else {
+                1
+            };
+            if failure == 0 {
+                if first == 0 {
+                    ah.abort();
+                } else {
+                    bh.abort();
+                }
+                // Ensure the listener has closed before the request.
+                if first == 0 {
+                    let _ = (&mut ah).await;
+                } else {
+                    let _ = (&mut bh).await;
+                }
+            } else {
+                statuses[first].store(failure, Ordering::SeqCst);
+            }
+            assert_eq!(
+                router
+                    .get_models(Request::new(Body::empty()))
+                    .await
+                    .status(),
+                StatusCode::OK,
+                "failure {failure}"
+            );
+            assert_eq!(counts[1 - first].lock().unwrap().len(), 1);
+            if failure != 0 {
+                assert_eq!(counts[first].lock().unwrap().len(), 1);
+            }
+            ah.abort();
+            bh.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_models_does_not_retry_client_errors() {
+        let counts = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let status = Arc::new(std::sync::atomic::AtomicU16::new(401));
+        let (a, ah) = start_metadata_worker(status.clone(), counts.clone()).await;
+        let (b, bh) = start_metadata_worker(status, counts.clone()).await;
+        let router = model_metadata_router(&[a, b]);
+        assert_eq!(
+            router
+                .get_models(Request::new(Body::empty()))
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(counts.lock().unwrap().len(), 1);
+        ah.abort();
+        bh.abort();
+    }
+
+    #[tokio::test]
+    async fn test_models_bounds_attempts_and_deduplicates_dp_ranks() {
+        let counts = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let status = Arc::new(std::sync::atomic::AtomicU16::new(503));
+        let (url, handle) = start_metadata_worker(status.clone(), counts.clone()).await;
+        let router = model_metadata_router(&[]);
+        for rank in 0..4 {
+            router.worker_registry.register(Arc::new(DPAwareWorker::new(
+                url.clone(),
+                rank,
+                4,
+                WorkerType::Regular,
+            )));
+        }
+        assert_eq!(
+            router
+                .get_models(Request::new(Body::empty()))
+                .await
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            counts.lock().unwrap().len(),
+            1,
+            "DP ranks must not retry the same metadata server"
+        );
+        handle.abort();
+        for budget in [0, 1, 2] {
+            let counts = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let mut urls = Vec::new();
+            let mut handles = Vec::new();
+            for _ in 0..3 {
+                let (url, handle) = start_metadata_worker(status.clone(), counts.clone()).await;
+                urls.push(url);
+                handles.push(handle);
+            }
+            let mut router = model_metadata_router(&urls);
+            router.retry_config.max_retries = budget;
+            assert_eq!(
+                router
+                    .get_models(Request::new(Body::empty()))
+                    .await
+                    .status(),
+                StatusCode::SERVICE_UNAVAILABLE
+            );
+            assert_eq!(counts.lock().unwrap().len(), budget.max(1) as usize);
+            for handle in handles {
+                handle.abort();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_models_times_out_stalled_worker_and_fails_over() {
+        let counts = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let statuses = [
+            Arc::new(std::sync::atomic::AtomicU16::new(200)),
+            Arc::new(std::sync::atomic::AtomicU16::new(200)),
+        ];
+        let (a, ah) = start_metadata_worker(statuses[0].clone(), counts.clone()).await;
+        let (b, bh) = start_metadata_worker(statuses[1].clone(), counts.clone()).await;
+        let router = model_metadata_router(&[a.clone(), b]);
+        let first = if router.worker_registry.get_all()[0].base_url() == a {
+            0
+        } else {
+            1
+        };
+        statuses[first].store(0, std::sync::atomic::Ordering::SeqCst);
+        let response = tokio::time::timeout(
+            Duration::from_secs(8),
+            router.get_models(Request::new(Body::empty())),
+        )
+        .await
+        .expect("metadata failover must be bounded");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(counts.lock().unwrap().len(), 2);
+        ah.abort();
+        bh.abort();
     }
 
     #[tokio::test]
