@@ -270,6 +270,11 @@ pub enum UserMessageContent {
     Parts(Vec<ContentPart>),
 }
 
+/// User message content part types forwarded to vLLM.
+///
+/// A part whose `type` is not listed here makes the whole `Parts`
+/// deserialization fail, and the `ChatMessage` deserializer then falls back to
+/// empty text, so new vLLM part types must be added here.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type")]
 pub enum ContentPart {
@@ -277,6 +282,12 @@ pub enum ContentPart {
     Text { text: String },
     #[serde(rename = "image_url")]
     ImageUrl { image_url: ImageUrl },
+    #[serde(rename = "video_url")]
+    VideoUrl { video_url: VideoUrl },
+    #[serde(rename = "audio_url")]
+    AudioUrl { audio_url: AudioUrl },
+    #[serde(rename = "input_audio")]
+    InputAudio { input_audio: InputAudio },
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -284,6 +295,22 @@ pub struct ImageUrl {
     pub url: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>, // "auto", "low", or "high"
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct VideoUrl {
+    pub url: String, // URL or base64 data URL
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AudioUrl {
+    pub url: String, // URL or base64 data URL
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct InputAudio {
+    pub data: String,   // base64-encoded audio
+    pub format: String, // "wav" or "mp3"
 }
 
 // ============= Response Format Types =============
@@ -3726,6 +3753,54 @@ mod tests {
             },
             _ => panic!("Expected User message"),
         }
+    }
+
+    /// Parses a user message, checks it re-serializes to the same bytes and
+    /// returns its content parts.
+    fn assert_user_message_round_trips(json: &str) -> Vec<ContentPart> {
+        let message: ChatMessage = serde_json::from_str(json).unwrap();
+        let parts = match &message {
+            ChatMessage::User {
+                content: UserMessageContent::Parts(parts),
+                ..
+            } => parts.clone(),
+            other => panic!("Expected user content parts, got {:?}", other),
+        };
+        assert_eq!(serde_json::to_string(&message).unwrap(), json);
+        parts
+    }
+
+    #[test]
+    fn test_chat_message_user_video_url_part_round_trips() {
+        let parts = assert_user_message_round_trips(
+            r#"{"role":"user","content":[{"type":"video_url","video_url":{"url":"data:video/mp4;base64,AAAA"}},{"type":"text","text":"Describe the clip."}]}"#,
+        );
+        assert!(matches!(
+            parts.as_slice(),
+            [ContentPart::VideoUrl { .. }, ContentPart::Text { .. }]
+        ));
+    }
+
+    #[test]
+    fn test_chat_message_user_audio_url_part_round_trips() {
+        let parts = assert_user_message_round_trips(
+            r#"{"role":"user","content":[{"type":"audio_url","audio_url":{"url":"data:audio/wav;base64,AAAA"}},{"type":"text","text":"Transcribe this."}]}"#,
+        );
+        assert!(matches!(
+            parts.as_slice(),
+            [ContentPart::AudioUrl { .. }, ContentPart::Text { .. }]
+        ));
+    }
+
+    #[test]
+    fn test_chat_message_user_input_audio_part_round_trips() {
+        let parts = assert_user_message_round_trips(
+            r#"{"role":"user","content":[{"type":"input_audio","input_audio":{"data":"AAAA","format":"wav"}},{"type":"text","text":"Transcribe this."}]}"#,
+        );
+        assert!(matches!(
+            parts.as_slice(),
+            [ContentPart::InputAudio { .. }, ContentPart::Text { .. }]
+        ));
     }
 
     #[test]
