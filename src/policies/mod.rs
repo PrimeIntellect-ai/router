@@ -108,6 +108,19 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
         // Default: no-op for policies that don't track sessions
     }
 
+    /// Whether the policy wants [`SessionRequestGuard`] callbacks for the
+    /// requests it routes.
+    fn tracks_session_requests(&self) -> bool {
+        false
+    }
+
+    /// A request of `session_id` was routed and is now in flight.
+    fn on_session_request_start(&self, _session_id: &str) {}
+
+    /// A request of `session_id` finished: its response was fully sent, or it
+    /// failed or was cancelled.
+    fn on_session_request_complete(&self, _session_id: &str) {}
+
     /// Get policy name for metrics and debugging
     fn name(&self) -> &'static str;
 
@@ -177,6 +190,38 @@ impl Default for CacheAwareConfig {
             eviction_interval_secs: 30,
             max_tree_size: 10000,
         }
+    }
+}
+
+/// Keeps a routed session request in flight for its policy: reports the start
+/// when created and the completion when dropped, so the end of a response
+/// (including a streamed one, when the guard lives in its body) and every error
+/// path are reported exactly once.
+pub struct SessionRequestGuard {
+    policy: Arc<dyn LoadBalancingPolicy>,
+    session_id: String,
+}
+
+impl SessionRequestGuard {
+    /// Returns `None` when the policy does not track session requests or the
+    /// request carries no session identifier.
+    pub fn new(
+        policy: Arc<dyn LoadBalancingPolicy>,
+        request_text: Option<&str>,
+        headers: Option<&RequestHeaders>,
+    ) -> Option<Self> {
+        if !policy.tracks_session_requests() {
+            return None;
+        }
+        let session_id = hash_key::extract_session_id(request_text, headers)?;
+        policy.on_session_request_start(&session_id);
+        Some(Self { policy, session_id })
+    }
+}
+
+impl Drop for SessionRequestGuard {
+    fn drop(&mut self) {
+        self.policy.on_session_request_complete(&self.session_id);
     }
 }
 

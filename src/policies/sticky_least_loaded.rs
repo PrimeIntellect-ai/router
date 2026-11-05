@@ -20,7 +20,11 @@
 //! - Sessions expire after a configurable TTL (default 2 hours, overridable via
 //!   the `VLLM_ROUTER_SLL_SESSION_EXPIRATION_IN_S` environment variable). This
 //!   protects against leaked sessions when a `finish_session` call is never
-//!   received (e.g. a cancelled trajectory).
+//!   received (e.g. a cancelled trajectory). The TTL counts idle time: a session
+//!   with a request in flight (reported through `SessionRequestGuard`) never
+//!   expires, and the clock restarts when the request completes. Otherwise a
+//!   generation that outlives the TTL would send the session's next turn to a
+//!   different replica, which prefills the whole context again.
 //! - Sessions can be released explicitly via [`finish_session`].
 //!
 //! Requests without any session identifier are still load-balanced to the
@@ -66,6 +70,14 @@ const SWEEP_INTERVAL_SECS: u64 = 60;
 struct SessionEntry {
     worker_url: String,
     last_access: Instant,
+    /// Routed requests that have not completed yet.
+    in_flight: usize,
+}
+
+impl SessionEntry {
+    fn is_expired(&self, expiration: Duration, now: Instant) -> bool {
+        self.in_flight == 0 && now.duration_since(self.last_access) >= expiration
+    }
 }
 
 /// Internal mutable state guarded by a single mutex so that "find least-loaded
@@ -169,7 +181,7 @@ impl StickyLeastLoadedPolicy {
         let expired: Vec<String> = state
             .sessions
             .iter()
-            .filter(|(_, entry)| now.duration_since(entry.last_access) >= expiration)
+            .filter(|(_, entry)| entry.is_expired(expiration, now))
             .map(|(key, _)| key.clone())
             .collect();
 
@@ -327,15 +339,20 @@ impl LoadBalancingPolicy for StickyLeastLoadedPolicy {
             }
         };
 
+        // Requests still running on a previous assignment complete against the new one.
+        let mut in_flight = 0;
+
         // Existing session: route to the same replica if it's still healthy.
-        if let Some((worker_url, last_access)) = state
-            .sessions
-            .get(&session_id)
-            .map(|e| (e.worker_url.clone(), e.last_access))
-        {
-            if let Some((idx, _)) = candidates.iter().find(|(_, url)| {
-                *url == worker_url && now.duration_since(last_access) < self.session_expiration
-            }) {
+        if let Some((worker_url, expired)) = state.sessions.get(&session_id).map(|e| {
+            (
+                e.worker_url.clone(),
+                e.is_expired(self.session_expiration, now),
+            )
+        }) {
+            if let Some((idx, _)) = candidates
+                .iter()
+                .find(|(_, url)| *url == worker_url && !expired)
+            {
                 let idx = *idx;
                 if let Some(entry) = state.sessions.get_mut(&session_id) {
                     entry.last_access = now;
@@ -350,7 +367,10 @@ impl LoadBalancingPolicy for StickyLeastLoadedPolicy {
             }
 
             // Expired session or unavailable replica: release the old assignment.
-            state.sessions.remove(&session_id);
+            in_flight = state
+                .sessions
+                .remove(&session_id)
+                .map_or(0, |e| e.in_flight);
             Self::decrement_count(&mut state.active_counts, &worker_url);
             debug!(
                 "SLL: session '{}' replica '{}' unavailable, reassigning",
@@ -381,6 +401,7 @@ impl LoadBalancingPolicy for StickyLeastLoadedPolicy {
             SessionEntry {
                 worker_url: worker_url.clone(),
                 last_access: now,
+                in_flight,
             },
         );
         *state.active_counts.entry(worker_url.clone()).or_insert(0) += 1;
@@ -405,6 +426,23 @@ impl LoadBalancingPolicy for StickyLeastLoadedPolicy {
             );
         } else {
             debug!("SLL: finish_session for unknown session '{}'", session_id);
+        }
+    }
+
+    fn tracks_session_requests(&self) -> bool {
+        true
+    }
+
+    fn on_session_request_start(&self, session_id: &str) {
+        if let Some(entry) = self.state.lock().unwrap().sessions.get_mut(session_id) {
+            entry.in_flight += 1;
+        }
+    }
+
+    fn on_session_request_complete(&self, session_id: &str) {
+        if let Some(entry) = self.state.lock().unwrap().sessions.get_mut(session_id) {
+            entry.in_flight = entry.in_flight.saturating_sub(1);
+            entry.last_access = Instant::now();
         }
     }
 
@@ -448,6 +486,7 @@ impl Default for StickyLeastLoadedPolicy {
 mod tests {
     use super::*;
     use crate::core::{BasicWorker, WorkerType};
+    use crate::policies::SessionRequestGuard;
     use std::collections::HashMap as StdHashMap;
 
     fn make_workers(urls: &[&str]) -> Vec<Arc<dyn Worker>> {
@@ -733,6 +772,90 @@ mod tests {
         );
         assert_eq!(policy.active_count_for(workers[0].url()), 1);
         assert_eq!(policy.active_count_for(workers[1].url()), 1);
+    }
+
+    /// Two sessions pinned to the first of two replicas, so a reassignment would
+    /// go to the second.
+    fn pinned_session_policy() -> (Arc<StickyLeastLoadedPolicy>, Vec<Arc<dyn Worker>>) {
+        let policy = Arc::new(StickyLeastLoadedPolicy::with_expiration_secs(1));
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+        for session in ["long", "other"] {
+            policy.select_worker_with_headers(
+                &workers[..1],
+                None,
+                Some(&header_with_session(session)),
+            );
+        }
+        (policy, workers)
+    }
+
+    fn start_request(policy: &Arc<StickyLeastLoadedPolicy>, session: &str) -> SessionRequestGuard {
+        let policy: Arc<dyn LoadBalancingPolicy> = policy.clone();
+        SessionRequestGuard::new(policy, None, Some(&header_with_session(session))).unwrap()
+    }
+
+    fn backdate(policy: &StickyLeastLoadedPolicy, session: &str) {
+        policy
+            .state
+            .lock()
+            .unwrap()
+            .sessions
+            .get_mut(session)
+            .unwrap()
+            .last_access = Instant::now() - Duration::from_secs(2);
+    }
+
+    #[test]
+    fn test_in_flight_session_outlives_expiration() {
+        let (policy, workers) = pinned_session_policy();
+        let _request = start_request(&policy, "long");
+        backdate(&policy, "long");
+        policy.state.lock().unwrap().last_sweep =
+            Instant::now() - Duration::from_secs(SWEEP_INTERVAL_SECS + 1);
+
+        assert_eq!(
+            policy.select_worker_with_headers(&workers, None, Some(&header_with_session("long"))),
+            Some(0),
+            "a session whose request is still generating must keep its replica"
+        );
+        assert_eq!(policy.active_count_for(workers[0].url()), 2);
+    }
+
+    #[test]
+    fn test_completion_restarts_idle_clock() {
+        let (policy, workers) = pinned_session_policy();
+        let request = start_request(&policy, "long");
+        backdate(&policy, "long");
+        drop(request);
+
+        assert_eq!(
+            policy.select_worker_with_headers(&workers, None, Some(&header_with_session("long"))),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn test_idle_session_expires_after_completion() {
+        let (policy, workers) = pinned_session_policy();
+        drop(start_request(&policy, "long"));
+        backdate(&policy, "long");
+
+        assert_eq!(
+            policy.select_worker_with_headers(&workers, None, Some(&header_with_session("long"))),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn test_rebind_keeps_in_flight_requests() {
+        let (policy, workers) = pinned_session_policy();
+        let _request = start_request(&policy, "long");
+        workers[0].set_healthy(false);
+        policy.select_worker_with_headers(&workers, None, Some(&header_with_session("long")));
+
+        let state = policy.state.lock().unwrap();
+        assert_eq!(state.sessions["long"].worker_url, "http://w2:8000");
+        assert_eq!(state.sessions["long"].in_flight, 1);
     }
 
     #[test]
