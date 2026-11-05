@@ -6,7 +6,7 @@ use crate::core::{
 };
 use crate::metrics::RouterMetrics;
 use crate::otel_http::{self, ClientRequestOptions};
-use crate::policies::{LoadBalancingPolicy, PolicyRegistry};
+use crate::policies::{LoadBalancingPolicy, PolicyRegistry, SessionRequestGuard};
 use crate::protocols::spec::{
     ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, GenerationRequest,
     InferenceGenerateRequest, RerankRequest, RerankResponse, RerankResult, ResponsesRequest,
@@ -48,6 +48,17 @@ pub struct Router {
     circuit_breaker_config: CircuitBreakerConfig,
     _worker_loads: Arc<tokio::sync::watch::Receiver<HashMap<String, isize>>>,
     _load_monitor_handle: Option<Arc<tokio::task::JoinHandle<()>>>,
+}
+
+/// Moves `guard` into the response body, so it drops when the body is fully
+/// sent or the client goes away.
+fn hold_until_body_ends(response: Response, guard: SessionRequestGuard) -> Response {
+    let (parts, body) = response.into_parts();
+    let body = Body::from_stream(body.into_data_stream().map(move |chunk| {
+        let _ = &guard;
+        chunk
+    }));
+    Response::from_parts(parts, body)
 }
 
 /// Check if a 500 response body is actually a vLLM input validation error
@@ -683,6 +694,14 @@ impl Router {
                     false
                 };
 
+                // Keeps the session in flight until the response is complete, so
+                // a long generation cannot expire its session mid-request.
+                let session_request = SessionRequestGuard::new(
+                    Arc::clone(&policy),
+                    Some(&text),
+                    Self::headers_to_request_headers(headers).as_ref(),
+                );
+
                 let response = self
                     .send_typed_request(
                         headers,
@@ -707,7 +726,12 @@ impl Router {
                 // let the load counter drift and concentrated cache-aware
                 // routing onto phantom-loaded workers.
 
-                response
+                // A streamed body outlives this attempt; a buffered one is
+                // complete here, where the guard drops.
+                match session_request {
+                    Some(guard) if is_stream => hold_until_body_ends(response, guard),
+                    _ => response,
+                }
             },
             // should_retry predicate
             |res, _attempt| is_retryable_status(res.status()),
@@ -2852,5 +2876,63 @@ mod tests {
         );
 
         health_checker.shutdown().await;
+    }
+
+    #[derive(Debug, Default)]
+    struct InFlightCounter {
+        in_flight: std::sync::atomic::AtomicIsize,
+    }
+
+    impl LoadBalancingPolicy for InFlightCounter {
+        fn select_worker_with_headers(
+            &self,
+            _workers: &[Arc<dyn Worker>],
+            _request_text: Option<&str>,
+            _headers: Option<&crate::policies::RequestHeaders>,
+        ) -> Option<usize> {
+            Some(0)
+        }
+
+        fn tracks_session_requests(&self) -> bool {
+            true
+        }
+
+        fn on_session_request_start(&self, _session_id: &str) {
+            self.in_flight
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn on_session_request_complete(&self, _session_id: &str) {
+            self.in_flight
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn name(&self) -> &'static str {
+            "in_flight_counter"
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[tokio::test]
+    async fn test_streamed_body_keeps_session_request_in_flight() {
+        let counter = Arc::new(InFlightCounter::default());
+        let policy: Arc<dyn LoadBalancingPolicy> = counter.clone();
+        let headers =
+            crate::policies::RequestHeaders::from([("x-session-id".to_string(), "s".to_string())]);
+        let guard = SessionRequestGuard::new(policy, None, Some(&headers)).unwrap();
+        let chunks = futures_util::stream::iter([
+            Ok::<_, std::io::Error>("data: a\n\n"),
+            Ok("data: [DONE]\n\n"),
+        ]);
+        let response = hold_until_body_ends(Response::new(Body::from_stream(chunks)), guard);
+        let in_flight = || counter.in_flight.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(in_flight(), 1);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&body[..], b"data: a\n\ndata: [DONE]\n\n");
+        assert_eq!(in_flight(), 0);
     }
 }
