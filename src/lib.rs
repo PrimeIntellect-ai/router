@@ -6,6 +6,7 @@ use std::collections::HashMap;
 pub mod auth;
 pub mod core;
 pub mod data_connector;
+pub mod engine_metrics;
 pub mod metrics;
 pub mod middleware;
 pub mod otel_http;

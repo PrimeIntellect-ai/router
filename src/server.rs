@@ -3,6 +3,7 @@ use crate::{
     config::{HistoryBackend, RouterConfig, TraceConfig},
     core::{WorkerRegistry, WorkerType},
     data_connector::{MemoryResponseStorage, NoOpResponseStorage, SharedResponseStorage},
+    engine_metrics,
     logging::{self, LoggingConfig},
     metrics::{self, PrometheusConfig},
     middleware::{self, QueuedRequest, TokenBucket},
@@ -1009,6 +1010,29 @@ async fn get_loads(State(state): State<Arc<AppState>>, headers: http::HeaderMap)
     state.router.get_worker_loads().await
 }
 
+/// GET /engine_metrics
+///
+/// Scrapes every worker's `/metrics` and returns the engines' load samples
+/// with each worker's role, the router's in-flight count per worker, and the
+/// depth of the router's own request queue (see `engine_metrics`).
+async fn get_engine_metrics(
+    State(state): State<Arc<AppState>>,
+    headers: http::HeaderMap,
+) -> Response {
+    if let Err(response) = authorize_request(&state, &headers).await {
+        return response;
+    }
+
+    let metrics = engine_metrics::collect(
+        &state.context.client,
+        state.context.worker_registry.get_all(),
+        headers.get(http::header::AUTHORIZATION),
+        middleware::queued_requests(),
+    )
+    .await;
+    Json(metrics).into_response()
+}
+
 #[derive(Deserialize)]
 struct FinishSessionQuery {
     session_id: String,
@@ -1272,6 +1296,7 @@ pub fn build_app_with_request_tracing(
         .route("/list_workers", get(list_workers))
         .route("/flush_cache", post(flush_cache))
         .route("/get_loads", get(get_loads))
+        .route("/engine_metrics", get(get_engine_metrics))
         .route("/finish_session", post(finish_session));
 
     // Worker management routes

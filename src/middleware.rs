@@ -3,7 +3,7 @@ use axum::{
     response::IntoResponse, response::Response,
 };
 use rand::Rng;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
@@ -462,6 +462,30 @@ impl QueueProcessor {
     }
 }
 
+/// Requests currently waiting in the concurrency queue for a token.
+static QUEUED_REQUESTS: AtomicUsize = AtomicUsize::new(0);
+
+pub fn queued_requests() -> usize {
+    QUEUED_REQUESTS.load(Ordering::Relaxed)
+}
+
+/// Counts a request in `QUEUED_REQUESTS` until dropped, so a client that
+/// disconnects while queued stops counting too.
+struct QueuedGuard;
+
+impl QueuedGuard {
+    fn new() -> Self {
+        QUEUED_REQUESTS.fetch_add(1, Ordering::Relaxed);
+        Self
+    }
+}
+
+impl Drop for QueuedGuard {
+    fn drop(&mut self) {
+        QUEUED_REQUESTS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 /// State for the concurrency limiter
 pub struct ConcurrencyLimiter {
     pub queue_tx: Option<mpsc::Sender<QueuedRequest>>,
@@ -535,7 +559,10 @@ pub async fn concurrency_limit_middleware(
                     }
 
                     // Wait for token from queue processor
-                    match permit_rx.await {
+                    let queued = QueuedGuard::new();
+                    let permit = permit_rx.await;
+                    drop(queued);
+                    match permit {
                         Ok(Ok(())) => {
                             debug!("Acquired token from queue");
                             // Dequeue for embeddings
