@@ -25,6 +25,13 @@
 //!   expires, and the clock restarts when the request completes. Otherwise a
 //!   generation that outlives the TTL would send the session's next turn to a
 //!   different replica, which prefills the whole context again.
+//! - A session counts toward its replica's load only while it is *active*: it
+//!   has a request in flight, or its last request started or finished within
+//!   the active window (default: the session expiration, overridable via the
+//!   `VLLM_ROUTER_SLL_ACTIVE_WINDOW_IN_S` environment variable). An inactive
+//!   session stays pinned until it expires but no longer steers new sessions
+//!   away from its replica, so sessions that clients never finish stop counting
+//!   as load long before they expire.
 //! - Sessions can be released explicitly via [`finish_session`].
 //!
 //! Requests without any session identifier are still load-balanced to the
@@ -62,21 +69,29 @@ pub const DEFAULT_MAX_SESSION_ID_BYTES: usize = 256;
 /// Environment variable to override the maximum session identifier size.
 pub const MAX_SESSION_ID_BYTES_ENV: &str = "VLLM_ROUTER_SLL_MAX_SESSION_ID_BYTES";
 
+/// Environment variable to override the active window (in seconds): how long
+/// after its last request starts or finishes a session still counts toward its
+/// replica's load. Defaults to the session expiration.
+pub const ACTIVE_WINDOW_ENV: &str = "VLLM_ROUTER_SLL_ACTIVE_WINDOW_IN_S";
+
 /// Minimum interval between full expiration sweeps to bound per-request cost.
 const SWEEP_INTERVAL_SECS: u64 = 60;
 
-/// Bookkeeping for a single active session.
+/// Bookkeeping for a single pinned session.
 #[derive(Debug)]
 struct SessionEntry {
     worker_url: String,
+    /// Start or end of the session's last request.
     last_access: Instant,
     /// Routed requests that have not completed yet.
     in_flight: usize,
+    /// Whether the session counts toward `active_counts`.
+    active: bool,
 }
 
 impl SessionEntry {
-    fn is_expired(&self, expiration: Duration, now: Instant) -> bool {
-        self.in_flight == 0 && now.duration_since(self.last_access) >= expiration
+    fn is_idle(&self, period: Duration, now: Instant) -> bool {
+        self.in_flight == 0 && now.duration_since(self.last_access) >= period
     }
 }
 
@@ -86,12 +101,91 @@ impl SessionEntry {
 struct SllState {
     /// session id -> assigned replica
     sessions: HashMap<String, SessionEntry>,
-    /// replica url -> number of active sessions
+    /// replica url -> number of active sessions, the load used for placement
     active_counts: HashMap<String, usize>,
+    /// replica url -> number of pinned sessions, active or not
+    pinned_counts: HashMap<String, usize>,
     /// Round-robin cursor for requests without a session identifier.
     stateless_cursor: usize,
     /// Timestamp of the last expiration sweep.
     last_sweep: Instant,
+}
+
+fn count(counts: &HashMap<String, usize>, worker_url: &str) -> usize {
+    counts.get(worker_url).copied().unwrap_or(0)
+}
+
+fn increment_count(counts: &mut HashMap<String, usize>, worker_url: &str) {
+    *counts.entry(worker_url.to_string()).or_insert(0) += 1;
+}
+
+/// Decrement the session count for a replica, removing the entry when it
+/// reaches zero.
+fn decrement_count(counts: &mut HashMap<String, usize>, worker_url: &str) {
+    if let Some(count) = counts.get_mut(worker_url) {
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            counts.remove(worker_url);
+        }
+    }
+}
+
+impl SllState {
+    /// Pin a session to `worker_url` as an active session.
+    fn insert_session(
+        &mut self,
+        session_id: String,
+        worker_url: String,
+        now: Instant,
+        in_flight: usize,
+    ) {
+        increment_count(&mut self.pinned_counts, &worker_url);
+        increment_count(&mut self.active_counts, &worker_url);
+        self.publish(&worker_url);
+        self.sessions.insert(
+            session_id,
+            SessionEntry {
+                worker_url,
+                last_access: now,
+                in_flight,
+                active: true,
+            },
+        );
+    }
+
+    /// Unpin a session, returning its entry.
+    fn remove_session(&mut self, session_id: &str) -> Option<SessionEntry> {
+        let entry = self.sessions.remove(session_id)?;
+        decrement_count(&mut self.pinned_counts, &entry.worker_url);
+        if entry.active {
+            decrement_count(&mut self.active_counts, &entry.worker_url);
+        }
+        self.publish(&entry.worker_url);
+        Some(entry)
+    }
+
+    /// Count a pinned session toward its replica's load again.
+    fn mark_active(&mut self, session_id: &str) {
+        let Some(entry) = self.sessions.get_mut(session_id) else {
+            return;
+        };
+        if entry.active {
+            return;
+        }
+        entry.active = true;
+        let worker_url = entry.worker_url.clone();
+        increment_count(&mut self.active_counts, &worker_url);
+        self.publish(&worker_url);
+    }
+
+    /// Export a replica's session counts.
+    fn publish(&self, worker_url: &str) {
+        RouterMetrics::set_sll_sessions(
+            worker_url,
+            count(&self.active_counts, worker_url),
+            count(&self.pinned_counts, worker_url),
+        );
+    }
 }
 
 /// Sticky least-loaded routing policy.
@@ -99,19 +193,29 @@ struct SllState {
 pub struct StickyLeastLoadedPolicy {
     state: Mutex<SllState>,
     session_expiration: Duration,
+    active_window: Duration,
     max_sessions: usize,
     max_session_id_bytes: usize,
 }
 
 impl StickyLeastLoadedPolicy {
-    /// Create a new policy, reading the session expiration from the environment
-    /// (falling back to [`DEFAULT_SESSION_EXPIRATION_SECS`]).
+    /// Create a new policy, reading its settings from the environment (falling
+    /// back to [`DEFAULT_SESSION_EXPIRATION_SECS`], an active window equal to the
+    /// expiration).
     pub fn new() -> Self {
-        Self::with_limits(
-            Self::expiration_secs_from_env(),
-            Self::usize_from_env(MAX_SESSIONS_ENV, DEFAULT_MAX_SESSIONS),
-            Self::usize_from_env(MAX_SESSION_ID_BYTES_ENV, DEFAULT_MAX_SESSION_ID_BYTES),
+        let expiration_secs = Self::env_or(SESSION_EXPIRATION_ENV, DEFAULT_SESSION_EXPIRATION_SECS);
+        let policy = Self::with_limits(
+            expiration_secs,
+            Self::env_or(MAX_SESSIONS_ENV, DEFAULT_MAX_SESSIONS),
+            Self::env_or(MAX_SESSION_ID_BYTES_ENV, DEFAULT_MAX_SESSION_ID_BYTES),
         )
+        .with_active_window_secs(Self::env_or(ACTIVE_WINDOW_ENV, expiration_secs));
+        info!(
+            "SLL: session expiration {}s, active window {}s",
+            policy.session_expiration.as_secs(),
+            policy.active_window.as_secs()
+        );
+        policy
     }
 
     /// Create a new policy with an explicit session expiration (in seconds).
@@ -119,88 +223,81 @@ impl StickyLeastLoadedPolicy {
         Self::with_limits(secs, DEFAULT_MAX_SESSIONS, DEFAULT_MAX_SESSION_ID_BYTES)
     }
 
+    /// Count sessions toward their replica's load only for `secs` after their
+    /// last request starts or finishes, or while a request is in flight.
+    pub fn with_active_window_secs(mut self, secs: u64) -> Self {
+        self.active_window = Duration::from_secs(secs);
+        self
+    }
+
     fn with_limits(expiration_secs: u64, max_sessions: usize, max_session_id_bytes: usize) -> Self {
         Self {
             state: Mutex::new(SllState {
                 sessions: HashMap::new(),
                 active_counts: HashMap::new(),
+                pinned_counts: HashMap::new(),
                 stateless_cursor: 0,
                 last_sweep: Instant::now(),
             }),
             session_expiration: Duration::from_secs(expiration_secs),
+            active_window: Duration::from_secs(expiration_secs),
             max_sessions,
             max_session_id_bytes,
         }
     }
 
-    fn expiration_secs_from_env() -> u64 {
-        match std::env::var(SESSION_EXPIRATION_ENV) {
-            Ok(val) => match val.trim().parse::<u64>() {
-                Ok(secs) => secs,
-                Err(_) => {
-                    warn!(
-                        "Invalid {} value '{}', using default {}s",
-                        SESSION_EXPIRATION_ENV, val, DEFAULT_SESSION_EXPIRATION_SECS
-                    );
-                    DEFAULT_SESSION_EXPIRATION_SECS
-                }
-            },
-            Err(_) => DEFAULT_SESSION_EXPIRATION_SECS,
-        }
-    }
-
-    fn usize_from_env(name: &str, default: usize) -> usize {
+    fn env_or<T: std::str::FromStr + std::fmt::Display>(name: &str, default: T) -> T {
         match std::env::var(name) {
-            Ok(value) => match value.trim().parse::<usize>() {
-                Ok(parsed) => parsed,
-                Err(_) => {
-                    warn!(
-                        "Invalid {} value '{}', using default {}",
-                        name, value, default
-                    );
-                    default
-                }
-            },
+            Ok(value) => value.trim().parse().unwrap_or_else(|_| {
+                warn!(
+                    "Invalid {} value '{}', using default {}",
+                    name, value, default
+                );
+                default
+            }),
             Err(_) => default,
         }
     }
 
-    /// Decrement the active-session count for a replica, removing the entry when
-    /// it reaches zero.
-    fn decrement_count(counts: &mut HashMap<String, usize>, worker_url: &str) {
-        if let Some(count) = counts.get_mut(worker_url) {
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                counts.remove(worker_url);
-            }
-        }
-    }
-
-    /// Remove sessions that have not been accessed within the expiration window.
-    fn sweep_expired(state: &mut SllState, expiration: Duration, now: Instant) {
+    /// Remove sessions idle for the expiration period, and stop counting
+    /// sessions idle for the active window toward their replica's load.
+    fn sweep(&self, state: &mut SllState, now: Instant) {
         let expired: Vec<String> = state
             .sessions
             .iter()
-            .filter(|(_, entry)| entry.is_expired(expiration, now))
+            .filter(|(_, entry)| entry.is_idle(self.session_expiration, now))
             .map(|(key, _)| key.clone())
             .collect();
 
         for key in expired {
-            if let Some(entry) = state.sessions.remove(&key) {
-                Self::decrement_count(&mut state.active_counts, &entry.worker_url);
+            if let Some(entry) = state.remove_session(&key) {
                 debug!("SLL: expired session '{}' on '{}'", key, entry.worker_url);
             }
+        }
+
+        let mut deactivated: Vec<String> = Vec::new();
+        for entry in state.sessions.values_mut() {
+            if entry.active && entry.is_idle(self.active_window, now) {
+                entry.active = false;
+                decrement_count(&mut state.active_counts, &entry.worker_url);
+                if !deactivated.contains(&entry.worker_url) {
+                    deactivated.push(entry.worker_url.clone());
+                }
+            }
+        }
+        for worker_url in deactivated {
+            state.publish(&worker_url);
         }
 
         state.last_sweep = now;
     }
 
     /// Sweep at most once per [`SWEEP_INTERVAL_SECS`] during normal routing.
-    fn sweep_expired_if_due(state: &mut SllState, expiration: Duration, now: Instant) {
+    fn sweep_if_due(&self, state: &mut SllState, now: Instant) {
         if now.duration_since(state.last_sweep) < Duration::from_secs(SWEEP_INTERVAL_SECS) {
             return;
         }
-        Self::sweep_expired(state, expiration, now);
+        self.sweep(state, now);
     }
 
     /// Pick the least-loaded replica among `candidates`, breaking ties with
@@ -278,20 +375,20 @@ impl StickyLeastLoadedPolicy {
         RouterMetrics::record_policy_decision(self.name(), worker.url());
     }
 
-    /// Number of currently active (tracked) sessions. Exposed for tests/metrics.
+    /// Number of retained sessions, including inactive pins. Exposed for tests.
+    /// Per-worker placement load is reported by `active_count_for`.
     pub fn active_session_count(&self) -> usize {
         self.state.lock().unwrap().sessions.len()
     }
 
     /// Number of active sessions assigned to a specific replica. For tests.
     pub fn active_count_for(&self, worker_url: &str) -> usize {
-        self.state
-            .lock()
-            .unwrap()
-            .active_counts
-            .get(worker_url)
-            .copied()
-            .unwrap_or(0)
+        count(&self.state.lock().unwrap().active_counts, worker_url)
+    }
+
+    /// Number of sessions pinned to a specific replica, active or not. For tests.
+    pub fn pinned_count_for(&self, worker_url: &str) -> usize {
+        count(&self.state.lock().unwrap().pinned_counts, worker_url)
     }
 }
 
@@ -325,7 +422,7 @@ impl LoadBalancingPolicy for StickyLeastLoadedPolicy {
 
         let mut state = self.state.lock().unwrap();
         let now = Instant::now();
-        Self::sweep_expired_if_due(&mut state, self.session_expiration, now);
+        self.sweep_if_due(&mut state, now);
 
         // Requests without a session id: load-balance but don't record state.
         let session_id = match session_id {
@@ -346,7 +443,7 @@ impl LoadBalancingPolicy for StickyLeastLoadedPolicy {
         if let Some((worker_url, expired)) = state.sessions.get(&session_id).map(|e| {
             (
                 e.worker_url.clone(),
-                e.is_expired(self.session_expiration, now),
+                e.is_idle(self.session_expiration, now),
             )
         }) {
             if let Some((idx, _)) = candidates
@@ -357,6 +454,7 @@ impl LoadBalancingPolicy for StickyLeastLoadedPolicy {
                 if let Some(entry) = state.sessions.get_mut(&session_id) {
                     entry.last_access = now;
                 }
+                state.mark_active(&session_id);
                 drop(state);
                 self.record_selection(&workers[idx]);
                 debug!(
@@ -367,20 +465,16 @@ impl LoadBalancingPolicy for StickyLeastLoadedPolicy {
             }
 
             // Expired session or unavailable replica: release the old assignment.
-            in_flight = state
-                .sessions
-                .remove(&session_id)
-                .map_or(0, |e| e.in_flight);
-            Self::decrement_count(&mut state.active_counts, &worker_url);
+            in_flight = state.remove_session(&session_id).map_or(0, |e| e.in_flight);
             debug!(
-                "SLL: session '{}' replica '{}' unavailable, reassigning",
+                "SLL: session '{}' replica '{}' unavailable or expired, reassigning",
                 session_id, worker_url
             );
         }
 
         // New session: assign to least-loaded replica (tie-broken by hashing).
         if state.sessions.len() >= self.max_sessions {
-            Self::sweep_expired(&mut state, self.session_expiration, now);
+            self.sweep(&mut state, now);
         }
         if state.sessions.len() >= self.max_sessions {
             let idx = Self::select_stateless(&mut state, &candidates);
@@ -396,16 +490,8 @@ impl LoadBalancingPolicy for StickyLeastLoadedPolicy {
 
         let idx = Self::select_least_loaded(&state.active_counts, &candidates, &session_id);
         let worker_url = workers[idx].url().to_string();
-        state.sessions.insert(
-            session_id.clone(),
-            SessionEntry {
-                worker_url: worker_url.clone(),
-                last_access: now,
-                in_flight,
-            },
-        );
-        *state.active_counts.entry(worker_url.clone()).or_insert(0) += 1;
-        let new_count = state.active_counts[&worker_url];
+        state.insert_session(session_id.clone(), worker_url.clone(), now, in_flight);
+        let new_count = count(&state.active_counts, &worker_url);
         drop(state);
 
         self.record_selection(&workers[idx]);
@@ -418,8 +504,7 @@ impl LoadBalancingPolicy for StickyLeastLoadedPolicy {
 
     fn finish_session(&self, session_id: &str) {
         let mut state = self.state.lock().unwrap();
-        if let Some(entry) = state.sessions.remove(session_id) {
-            Self::decrement_count(&mut state.active_counts, &entry.worker_url);
+        if let Some(entry) = state.remove_session(session_id) {
             info!(
                 "SLL: finished session '{}' on replica '{}'",
                 session_id, entry.worker_url
@@ -434,16 +519,21 @@ impl LoadBalancingPolicy for StickyLeastLoadedPolicy {
     }
 
     fn on_session_request_start(&self, session_id: &str) {
-        if let Some(entry) = self.state.lock().unwrap().sessions.get_mut(session_id) {
+        let mut state = self.state.lock().unwrap();
+        if let Some(entry) = state.sessions.get_mut(session_id) {
             entry.in_flight += 1;
         }
+        // A session with a request in flight always counts as load.
+        state.mark_active(session_id);
     }
 
     fn on_session_request_complete(&self, session_id: &str) {
-        if let Some(entry) = self.state.lock().unwrap().sessions.get_mut(session_id) {
+        let mut state = self.state.lock().unwrap();
+        if let Some(entry) = state.sessions.get_mut(session_id) {
             entry.in_flight = entry.in_flight.saturating_sub(1);
             entry.last_access = Instant::now();
         }
+        state.mark_active(session_id);
     }
 
     fn name(&self) -> &'static str {
@@ -464,8 +554,13 @@ impl LoadBalancingPolicy for StickyLeastLoadedPolicy {
 
     fn reset(&self) {
         let mut state = self.state.lock().unwrap();
+        let worker_urls: Vec<String> = state.pinned_counts.keys().cloned().collect();
         state.sessions.clear();
         state.active_counts.clear();
+        state.pinned_counts.clear();
+        for worker_url in worker_urls {
+            state.publish(&worker_url);
+        }
         state.stateless_cursor = 0;
         state.last_sweep = Instant::now();
         info!("SLL: policy reset - all sessions cleared");
@@ -886,5 +981,115 @@ mod tests {
         );
         assert_eq!(policy.active_count_for(workers[original].url()), 0);
         assert_eq!(policy.active_count_for(remaining[0].url()), 1);
+    }
+
+    /// Pin `n` sessions named `{prefix}-{i}` to `workers` (a one-worker slice).
+    fn pin(policy: &StickyLeastLoadedPolicy, workers: &[Arc<dyn Worker>], prefix: &str, n: usize) {
+        for i in 0..n {
+            let headers = header_with_session(&format!("{prefix}-{i}"));
+            policy.select_worker_with_headers(workers, None, Some(&headers));
+        }
+    }
+
+    fn sweep_now(policy: &StickyLeastLoadedPolicy) {
+        let mut state = policy.state.lock().unwrap();
+        policy.sweep(&mut state, Instant::now());
+    }
+
+    fn route(
+        policy: &StickyLeastLoadedPolicy,
+        workers: &[Arc<dyn Worker>],
+        session: &str,
+    ) -> usize {
+        policy
+            .select_worker_with_headers(workers, None, Some(&header_with_session(session)))
+            .unwrap()
+    }
+
+    #[test]
+    fn test_active_window_defaults_to_expiration() {
+        let policy = StickyLeastLoadedPolicy::new();
+        assert_eq!(policy.active_window, policy.session_expiration);
+
+        // Sessions idle for less than the expiration keep counting as load, so
+        // placement is unchanged.
+        let policy = StickyLeastLoadedPolicy::with_expiration_secs(3600);
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+        pin(&policy, &workers[..1], "idle", 2);
+        pin(&policy, &workers[1..], "busy", 1);
+        for session in ["idle-0", "idle-1"] {
+            backdate(&policy, session);
+        }
+        sweep_now(&policy);
+        assert_eq!(policy.active_count_for(workers[0].url()), 2);
+        assert_eq!(policy.pinned_count_for(workers[0].url()), 2);
+        assert_eq!(route(&policy, &workers, "new"), 1);
+    }
+
+    #[test]
+    fn test_idle_session_stops_counting_after_active_window() {
+        let policy = StickyLeastLoadedPolicy::with_expiration_secs(3600).with_active_window_secs(1);
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+        pin(&policy, &workers[..1], "idle", 2);
+        pin(&policy, &workers[1..], "busy", 1);
+        for session in ["idle-0", "idle-1"] {
+            backdate(&policy, session);
+        }
+        sweep_now(&policy);
+
+        assert_eq!(policy.active_count_for(workers[0].url()), 0);
+        assert_eq!(policy.pinned_count_for(workers[0].url()), 2);
+        assert_eq!(
+            route(&policy, &workers, "new"),
+            0,
+            "idle sessions must not steer new sessions away"
+        );
+
+        // An inactive session keeps its replica and counts again once it returns.
+        assert_eq!(route(&policy, &workers, "idle-0"), 0);
+        assert_eq!(policy.active_count_for(workers[0].url()), 2);
+        assert_eq!(policy.pinned_count_for(workers[0].url()), 3);
+    }
+
+    #[test]
+    fn test_in_flight_session_counts_beyond_active_window() {
+        let policy = Arc::new(
+            StickyLeastLoadedPolicy::with_expiration_secs(3600).with_active_window_secs(1),
+        );
+        let workers = make_workers(&["http://w1:8000"]);
+        route(&policy, &workers, "long");
+        let request = start_request(&policy, "long");
+        backdate(&policy, "long");
+        sweep_now(&policy);
+        assert_eq!(policy.active_count_for(workers[0].url()), 1);
+
+        // Completion restarts the window; going idle afterwards deactivates.
+        drop(request);
+        sweep_now(&policy);
+        assert_eq!(policy.active_count_for(workers[0].url()), 1);
+        backdate(&policy, "long");
+        sweep_now(&policy);
+        assert_eq!(policy.active_count_for(workers[0].url()), 0);
+        assert_eq!(policy.pinned_count_for(workers[0].url()), 1);
+
+        // A request in flight counts as load even without a new routing decision.
+        let _request = start_request(&policy, "long");
+        assert_eq!(policy.active_count_for(workers[0].url()), 1);
+    }
+
+    #[test]
+    fn test_expiry_releases_inactive_session() {
+        let policy = StickyLeastLoadedPolicy::with_expiration_secs(1).with_active_window_secs(0);
+        let workers = make_workers(&["http://w1:8000"]);
+        route(&policy, &workers, "idle");
+        sweep_now(&policy);
+        assert_eq!(policy.active_count_for(workers[0].url()), 0);
+        assert_eq!(policy.pinned_count_for(workers[0].url()), 1);
+
+        backdate(&policy, "idle");
+        sweep_now(&policy);
+        assert_eq!(policy.active_session_count(), 0);
+        assert_eq!(policy.active_count_for(workers[0].url()), 0);
+        assert_eq!(policy.pinned_count_for(workers[0].url()), 0);
     }
 }

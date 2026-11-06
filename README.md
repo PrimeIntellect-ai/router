@@ -225,8 +225,8 @@ For detailed configuration options, hash key priorities, and usage examples, see
 Use `--policy sticky_least_loaded` to balance **active sessions**, not concurrent
 requests, token counts, or GPU utilization. New sessions reserve a worker
 atomically; ties use rendezvous hashing. Existing sessions keep their healthy
-worker, even if session counts later become uneven. Unavailable workers cause
-reassignment on the next request. Prefill and decode pools track sessions separately.
+worker, even if session counts later become uneven. Unavailable workers cause reassignment on the next request. Prefill
+and decode pools track sessions separately.
 
 Session IDs prefer stable headers (`x-session-id`, `x-user-id`, `x-tenant-id`,
 and `x-correlation-id`), then the JSON fields `session_params.session_id`, `user`,
@@ -263,6 +263,36 @@ to 256 bytes. Override these limits with `VLLM_ROUTER_SLL_MAX_SESSIONS` and
 `VLLM_ROUTER_SLL_MAX_SESSION_ID_BYTES`. Requests that introduce a session beyond
 either limit continue to route least-loaded without affinity; existing tracked
 sessions remain sticky.
+
+By default every pinned session counts toward its worker's load until it is
+finished or expires. Clients that never call `/finish_session` therefore leave
+finished sessions counting as load for the whole TTL, and new sessions are placed
+by a stale picture. `VLLM_ROUTER_SLL_ACTIVE_WINDOW_IN_S` separates placement load
+from affinity retention. It defaults to the session expiration, preserving existing
+placement behavior. A session counts as load while a request is in flight or its
+last request started or finished within the active window. Idle sessions stop
+counting in the request-triggered expiration sweep (at most once per minute), but
+stay pinned until expiration. A returning session reactivates on its healthy worker;
+its cached prefix can be reused if the engine has not evicted it.
+
+The regular router tracks request lifetimes, including streamed responses and
+transparent proxy requests. PD routing does not track in-flight session requests;
+keep the active window at its default there. In PD mode the idle clock is based
+on routing decisions, so a shorter window can uncount an executing request.
+
+This improves placement of new sessions; it does not redistribute existing
+sessions after a worker recovers. `/finish_session` remains optional early cleanup.
+
+For long agent sessions (100k+ token contexts, turns minutes to hours apart)
+whose clients do not finish sessions, a starting point is:
+
+```bash
+VLLM_ROUTER_SLL_SESSION_EXPIRATION_IN_S=14400  # keep affinity for 4 h of idle time
+VLLM_ROUTER_SLL_ACTIVE_WINDOW_IN_S=1800        # count as load for 30 min (15 min is also reasonable)
+```
+
+The router exports `vllm_router_sll_active_sessions{worker}` (sessions counted as
+load) and `vllm_router_sll_pinned_sessions{worker}` (all pinned sessions).
 
 ## Advanced Features
 
