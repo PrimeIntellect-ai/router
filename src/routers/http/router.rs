@@ -597,7 +597,7 @@ impl Router {
         model_id: Option<&str>,
         text: Option<&str>,
         headers: Option<&HeaderMap>,
-    ) -> Option<Arc<dyn Worker>> {
+    ) -> Option<(Arc<dyn Worker>, Option<SessionRequestGuard>)> {
         // Get workers for the specified model (O(1) lookup if model_id is provided)
         let workers = match model_id {
             Some(model) => self.worker_registry.get_by_model_fast(model),
@@ -622,8 +622,9 @@ impl Router {
         // Convert headers for policies that need them (e.g., consistent_hash)
         let request_headers = Self::headers_to_request_headers(headers);
 
-        let idx = policy.select_worker_with_headers(&available, text, request_headers.as_ref())?;
-        Some(available[idx].clone())
+        let (idx, guard) =
+            SessionRequestGuard::select(policy, &available, text, request_headers.as_ref())?;
+        Some((available[idx].clone(), guard))
     }
 
     pub async fn route_typed_request<T: GenerationRequest + serde::Serialize + Clone>(
@@ -666,7 +667,7 @@ impl Router {
             &self.retry_config,
             // operation per attempt
             |_: u32| async {
-                let worker =
+                let (worker, session_request) =
                     match self.select_worker_for_model(effective_model_id, Some(&text), headers) {
                         Some(w) => w,
                         None => {
@@ -693,14 +694,6 @@ impl Router {
                 } else {
                     false
                 };
-
-                // Keeps the session in flight until the response is complete, so
-                // a long generation cannot expire its session mid-request.
-                let session_request = SessionRequestGuard::new(
-                    Arc::clone(&policy),
-                    Some(&text),
-                    Self::headers_to_request_headers(headers).as_ref(),
-                );
 
                 let response = self
                     .send_typed_request(
@@ -1960,7 +1953,8 @@ impl RouterTrait for Router {
         let policy = self.policy_registry.get_default_policy();
         let request_text = serde_json::to_string(&body).ok();
         let request_headers = Self::headers_to_request_headers(headers);
-        let worker_idx = match policy.select_worker_with_headers(
+        let (worker_idx, session_request) = match SessionRequestGuard::select(
+            Arc::clone(&policy),
             &workers,
             request_text.as_deref(),
             request_headers.as_ref(),
@@ -1975,11 +1969,6 @@ impl RouterTrait for Router {
             }
         };
 
-        let session_request = SessionRequestGuard::new(
-            Arc::clone(&policy),
-            request_text.as_deref(),
-            request_headers.as_ref(),
-        );
         let worker: &dyn Worker = workers[worker_idx].as_ref();
         let url = worker.endpoint_url(path);
 
@@ -2343,7 +2332,7 @@ mod tests {
         // Make multiple selections with the same headers - should all pick the same worker
         let mut selected_urls: Vec<String> = Vec::new();
         for _ in 0..10 {
-            let worker = router
+            let (worker, _guard) = router
                 .select_worker_for_model(None, Some(r#"{"prompt": "test"}"#), Some(&header_map))
                 .expect("Should select a worker");
             selected_urls.push(worker.url().to_string());
@@ -2373,7 +2362,7 @@ mod tests {
             }
         }
 
-        let worker = router
+        let (worker, _guard) = router
             .select_worker_for_model(None, Some(r#"{"prompt": "test"}"#), None)
             .expect("Should select the remaining healthy worker");
 
@@ -2413,7 +2402,7 @@ mod tests {
             let session_id = format!("session-{}", i);
             header_map.insert("x-session-id", HeaderValue::from_str(&session_id).unwrap());
 
-            if let Some(worker) = router.select_worker_for_model(
+            if let Some((worker, _guard)) = router.select_worker_for_model(
                 None,
                 Some(r#"{"prompt": "test"}"#),
                 Some(&header_map),
@@ -2457,7 +2446,7 @@ mod tests {
 
         // A request for the LoRA must land on worker1.
         for _ in 0..20 {
-            let worker = router
+            let (worker, _guard) = router
                 .select_worker_for_model(Some("rft-run-1"), Some(r#"{"prompt":"x"}"#), None)
                 .expect("a worker is available");
             assert_eq!(
@@ -2677,7 +2666,7 @@ mod tests {
         assert_eq!(base_workers.len(), 1);
         assert_eq!(lora_workers.len(), 1);
 
-        let worker = router
+        let (worker, _guard) = router
             .select_worker_for_model(Some("rft-run-1"), Some(r#"{"prompt":"x"}"#), None)
             .expect("LoRA model should be routable immediately after registration");
         assert_eq!(worker.url(), url);

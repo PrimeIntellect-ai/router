@@ -294,6 +294,33 @@ VLLM_ROUTER_SLL_ACTIVE_WINDOW_IN_S=1800        # count as load for 30 min (15 mi
 The router exports `vllm_router_sll_active_sessions{worker}` (sessions counted as
 load) and `vllm_router_sll_pinned_sessions{worker}` (all pinned sessions).
 
+### Optional bounded session rebalancing
+
+Set `VLLM_ROUTER_SLL_REBALANCE_RATIO=1.5` to allow voluntary moves on the
+regular router. The default `0` disables moves; enabled ratios must be finite
+and at least `1`. Selection paths without request reservations (including PD)
+never rebalance.
+
+On a session's next request, it may move to the least-loaded healthy worker if
+it has no outstanding requests and its current worker exceeds the destination's
+active-session count by both the ratio (strictly) and at least four sessions.
+The moving session is excluded from the comparison. Selection, reactivation,
+and reservation happen under the same lock, so concurrent requests cannot
+voluntarily move a session after another request has selected its worker.
+
+All policy instances in one router process share a limit of one voluntary move
+per 30 seconds, with no accumulated burst allowance. A moved session has a
+five-minute cooldown. These are conservative bounds, not a KV-cost estimate;
+a moved long-context session may require a costly cold prefill, and prefills
+can overlap if they last longer than 30 seconds. Independent router processes
+do not share the budget. Failed-worker reassignment bypasses both limits.
+
+Moves occur only when sessions make requests: there is no background migration
+or guaranteed recovery time. The policy still counts sessions equally, regardless
+of context length or DEP group. Measure prefix-cache hits, per-rank KV pressure,
+latency and throughput before enabling this on large-context workloads.
+`vllm_router_sll_rebalances_total{from,to}` counts voluntary moves only.
+
 ## Advanced Features
 
 ### Kubernetes Service Discovery
