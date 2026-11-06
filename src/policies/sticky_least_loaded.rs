@@ -37,8 +37,9 @@
 //! Requests without any session identifier are still load-balanced to the
 //! least-loaded replica, but are *not* recorded as active sessions.
 
+use super::SessionReservation;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use tracing::{debug, info, warn};
@@ -74,6 +75,16 @@ pub const MAX_SESSION_ID_BYTES_ENV: &str = "VLLM_ROUTER_SLL_MAX_SESSION_ID_BYTES
 /// replica's load. Defaults to the session expiration.
 pub const ACTIVE_WINDOW_ENV: &str = "VLLM_ROUTER_SLL_ACTIVE_WINDOW_IN_S";
 
+/// Opt-in imbalance ratio. Zero disables voluntary moves.
+pub const REBALANCE_RATIO_ENV: &str = "VLLM_ROUTER_SLL_REBALANCE_RATIO";
+const REBALANCE_MIN_GAP: usize = 4;
+const REBALANCE_INTERVAL: Duration = Duration::from_secs(30);
+const REBALANCE_COOLDOWN: Duration = Duration::from_secs(300);
+
+// Shared across default and per-model policy instances in this router process.
+static REBALANCE_BUDGET: LazyLock<Arc<Mutex<Option<Instant>>>> =
+    LazyLock::new(|| Arc::new(Mutex::new(None)));
+
 /// Minimum interval between full expiration sweeps to bound per-request cost.
 const SWEEP_INTERVAL_SECS: u64 = 60;
 
@@ -87,6 +98,8 @@ struct SessionEntry {
     in_flight: usize,
     /// Whether the session counts toward `active_counts`.
     active: bool,
+    generation: u64,
+    last_rebalanced: Option<Instant>,
 }
 
 impl SessionEntry {
@@ -109,6 +122,7 @@ struct SllState {
     stateless_cursor: usize,
     /// Timestamp of the last expiration sweep.
     last_sweep: Instant,
+    next_generation: u64,
 }
 
 fn count(counts: &HashMap<String, usize>, worker_url: &str) -> usize {
@@ -142,6 +156,7 @@ impl SllState {
         increment_count(&mut self.pinned_counts, &worker_url);
         increment_count(&mut self.active_counts, &worker_url);
         self.publish(&worker_url);
+        self.next_generation += 1;
         self.sessions.insert(
             session_id,
             SessionEntry {
@@ -149,6 +164,8 @@ impl SllState {
                 last_access: now,
                 in_flight,
                 active: true,
+                generation: self.next_generation,
+                last_rebalanced: None,
             },
         );
     }
@@ -194,6 +211,8 @@ pub struct StickyLeastLoadedPolicy {
     state: Mutex<SllState>,
     session_expiration: Duration,
     active_window: Duration,
+    rebalance_ratio: f64,
+    rebalance_budget: Arc<Mutex<Option<Instant>>>,
     max_sessions: usize,
     max_session_id_bytes: usize,
 }
@@ -209,11 +228,13 @@ impl StickyLeastLoadedPolicy {
             Self::env_or(MAX_SESSIONS_ENV, DEFAULT_MAX_SESSIONS),
             Self::env_or(MAX_SESSION_ID_BYTES_ENV, DEFAULT_MAX_SESSION_ID_BYTES),
         )
-        .with_active_window_secs(Self::env_or(ACTIVE_WINDOW_ENV, expiration_secs));
+        .with_active_window_secs(Self::env_or(ACTIVE_WINDOW_ENV, expiration_secs))
+        .with_rebalance_ratio(Self::env_or(REBALANCE_RATIO_ENV, 0.0));
         info!(
-            "SLL: session expiration {}s, active window {}s",
+            "SLL: session expiration {}s, active window {}s, rebalance ratio {}",
             policy.session_expiration.as_secs(),
-            policy.active_window.as_secs()
+            policy.active_window.as_secs(),
+            policy.rebalance_ratio
         );
         policy
     }
@@ -230,6 +251,55 @@ impl StickyLeastLoadedPolicy {
         self
     }
 
+    pub fn with_rebalance_ratio(mut self, ratio: f64) -> Self {
+        self.rebalance_ratio = if ratio == 0.0 || (ratio.is_finite() && ratio >= 1.0) {
+            ratio
+        } else {
+            warn!(
+                "Invalid {} value '{}', rebalancing disabled",
+                REBALANCE_RATIO_ENV, ratio
+            );
+            0.0
+        };
+        self
+    }
+
+    fn should_rebalance(
+        &self,
+        state: &SllState,
+        entry: &SessionEntry,
+        candidates: &[(usize, String)],
+        now: Instant,
+    ) -> bool {
+        if self.rebalance_ratio == 0.0
+            || entry.in_flight > 0
+            || entry
+                .last_rebalanced
+                .is_some_and(|last| now.duration_since(last) < REBALANCE_COOLDOWN)
+        {
+            return false;
+        }
+        let own = count(&state.active_counts, &entry.worker_url)
+            .saturating_sub(usize::from(entry.active));
+        let eligible = candidates
+            .iter()
+            .filter(|(_, url)| *url != entry.worker_url)
+            .map(|(_, url)| count(&state.active_counts, url))
+            .min()
+            .is_some_and(|least| {
+                own >= least + REBALANCE_MIN_GAP && own as f64 > self.rebalance_ratio * least as f64
+            });
+        if !eligible {
+            return false;
+        }
+        let mut last = self.rebalance_budget.lock().unwrap();
+        if last.is_some_and(|last| now.duration_since(last) < REBALANCE_INTERVAL) {
+            return false;
+        }
+        *last = Some(now);
+        true
+    }
+
     fn with_limits(expiration_secs: u64, max_sessions: usize, max_session_id_bytes: usize) -> Self {
         Self {
             state: Mutex::new(SllState {
@@ -238,9 +308,12 @@ impl StickyLeastLoadedPolicy {
                 pinned_counts: HashMap::new(),
                 stateless_cursor: 0,
                 last_sweep: Instant::now(),
+                next_generation: 0,
             }),
             session_expiration: Duration::from_secs(expiration_secs),
             active_window: Duration::from_secs(expiration_secs),
+            rebalance_ratio: 0.0,
+            rebalance_budget: Arc::clone(&REBALANCE_BUDGET),
             max_sessions,
             max_session_id_bytes,
         }
@@ -392,13 +465,14 @@ impl StickyLeastLoadedPolicy {
     }
 }
 
-impl LoadBalancingPolicy for StickyLeastLoadedPolicy {
-    fn select_worker_with_headers(
+impl StickyLeastLoadedPolicy {
+    fn select_inner(
         &self,
         workers: &[Arc<dyn Worker>],
         request_text: Option<&str>,
         headers: Option<&RequestHeaders>,
-    ) -> Option<usize> {
+        reserve: bool,
+    ) -> Option<(usize, Option<SessionReservation>)> {
         let healthy_indices = get_healthy_worker_indices(workers);
         if healthy_indices.is_empty() {
             return None;
@@ -432,12 +506,14 @@ impl LoadBalancingPolicy for StickyLeastLoadedPolicy {
                 drop(state);
                 self.record_selection(&workers[idx]);
                 debug!("SLL: stateless request routed to '{}'", workers[idx].url());
-                return Some(idx);
+                return Some((idx, None));
             }
         };
 
         // Requests still running on a previous assignment complete against the new one.
         let mut in_flight = 0;
+        let mut previous = None;
+        let mut rebalanced_from = None;
 
         // Existing session: route to the same replica if it's still healthy.
         if let Some((worker_url, expired)) = state.sessions.get(&session_id).map(|e| {
@@ -450,22 +526,45 @@ impl LoadBalancingPolicy for StickyLeastLoadedPolicy {
                 .iter()
                 .find(|(_, url)| *url == worker_url && !expired)
             {
-                let idx = *idx;
-                if let Some(entry) = state.sessions.get_mut(&session_id) {
-                    entry.last_access = now;
+                let rebalance = reserve
+                    && self.should_rebalance(
+                        &state,
+                        &state.sessions[&session_id],
+                        &candidates,
+                        now,
+                    );
+                if !rebalance {
+                    let idx = *idx;
+                    if let Some(entry) = state.sessions.get_mut(&session_id) {
+                        entry.last_access = now;
+                    }
+                    state.mark_active(&session_id);
+                    let reservation = if reserve {
+                        let entry = state.sessions.get_mut(&session_id).unwrap();
+                        entry.in_flight += 1;
+                        Some(SessionReservation {
+                            session_id: session_id.clone(),
+                            generation: Some(entry.generation),
+                        })
+                    } else {
+                        None
+                    };
+                    drop(state);
+                    self.record_selection(&workers[idx]);
+                    debug!(
+                        "SLL: session '{}' -> existing replica '{}'",
+                        session_id, worker_url
+                    );
+                    return Some((idx, reservation));
                 }
-                state.mark_active(&session_id);
-                drop(state);
-                self.record_selection(&workers[idx]);
-                debug!(
-                    "SLL: session '{}' -> existing replica '{}'",
-                    session_id, worker_url
-                );
-                return Some(idx);
+                rebalanced_from = Some(worker_url.clone());
             }
 
             // Expired session or unavailable replica: release the old assignment.
-            in_flight = state.remove_session(&session_id).map_or(0, |e| e.in_flight);
+            if let Some(entry) = state.remove_session(&session_id) {
+                in_flight = entry.in_flight;
+                previous = Some((entry.generation, entry.last_rebalanced));
+            }
             debug!(
                 "SLL: session '{}' replica '{}' unavailable or expired, reassigning",
                 session_id, worker_url
@@ -485,12 +584,29 @@ impl LoadBalancingPolicy for StickyLeastLoadedPolicy {
                 self.max_sessions,
                 workers[idx].url()
             );
-            return Some(idx);
+            return Some((idx, None));
         }
 
         let idx = Self::select_least_loaded(&state.active_counts, &candidates, &session_id);
         let worker_url = workers[idx].url().to_string();
-        state.insert_session(session_id.clone(), worker_url.clone(), now, in_flight);
+        state.insert_session(
+            session_id.clone(),
+            worker_url.clone(),
+            now,
+            in_flight + usize::from(reserve),
+        );
+        let entry = state.sessions.get_mut(&session_id).unwrap();
+        if let Some((generation, last_rebalanced)) = previous {
+            entry.generation = generation;
+            entry.last_rebalanced = last_rebalanced;
+        }
+        if rebalanced_from.is_some() {
+            entry.last_rebalanced = Some(now);
+        }
+        let reservation = reserve.then(|| SessionReservation {
+            session_id: session_id.clone(),
+            generation: Some(entry.generation),
+        });
         let new_count = count(&state.active_counts, &worker_url);
         drop(state);
 
@@ -499,7 +615,51 @@ impl LoadBalancingPolicy for StickyLeastLoadedPolicy {
             "SLL: new session '{}' -> replica '{}' (active sessions on replica: {})",
             session_id, worker_url, new_count
         );
-        Some(idx)
+        if let Some(from) = rebalanced_from {
+            RouterMetrics::record_sll_rebalance(&from, &worker_url);
+            info!(
+                "SLL: rebalanced session '{}' from '{}' to '{}'",
+                session_id, from, worker_url
+            );
+        }
+        Some((idx, reservation))
+    }
+}
+
+impl LoadBalancingPolicy for StickyLeastLoadedPolicy {
+    fn select_worker_with_headers(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        request_text: Option<&str>,
+        headers: Option<&RequestHeaders>,
+    ) -> Option<usize> {
+        self.select_inner(workers, request_text, headers, false)
+            .map(|(idx, _)| idx)
+    }
+
+    fn select_worker_for_request(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        request_text: Option<&str>,
+        headers: Option<&RequestHeaders>,
+    ) -> Option<(usize, Option<SessionReservation>)> {
+        self.select_inner(workers, request_text, headers, true)
+    }
+
+    fn complete_session_reservation(&self, reservation: &SessionReservation) {
+        let Some(generation) = reservation.generation else {
+            self.on_session_request_complete(&reservation.session_id);
+            return;
+        };
+        let mut state = self.state.lock().unwrap();
+        if let Some(entry) = state.sessions.get_mut(&reservation.session_id) {
+            if entry.generation != generation {
+                return;
+            }
+            entry.in_flight = entry.in_flight.saturating_sub(1);
+            entry.last_access = Instant::now();
+            state.mark_active(&reservation.session_id);
+        }
     }
 
     fn finish_session(&self, session_id: &str) {
@@ -1091,5 +1251,151 @@ mod tests {
         assert_eq!(policy.active_session_count(), 0);
         assert_eq!(policy.active_count_for(workers[0].url()), 0);
         assert_eq!(policy.pinned_count_for(workers[0].url()), 0);
+    }
+
+    fn rebalancing_policy() -> StickyLeastLoadedPolicy {
+        let mut policy =
+            StickyLeastLoadedPolicy::with_expiration_secs(3600).with_rebalance_ratio(1.5);
+        policy.rebalance_budget = Arc::new(Mutex::new(None));
+        policy
+    }
+
+    fn reserve(
+        policy: &Arc<StickyLeastLoadedPolicy>,
+        workers: &[Arc<dyn Worker>],
+        session: &str,
+    ) -> (usize, SessionRequestGuard) {
+        let policy: Arc<dyn LoadBalancingPolicy> = policy.clone();
+        let (idx, guard) =
+            SessionRequestGuard::select(policy, workers, None, Some(&header_with_session(session)))
+                .unwrap();
+        (idx, guard.unwrap())
+    }
+
+    #[test]
+    fn test_atomic_reservation_prevents_concurrent_rebalance() {
+        let policy = Arc::new(rebalancing_policy());
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+        pin(&policy, &workers[..1], "s", 6);
+        let first = start_request(&policy, "s-0");
+        let (second_idx, second) = reserve(&policy, &workers, "s-0");
+        drop(first);
+        let (third_idx, third) = reserve(&policy, &workers, "s-0");
+        assert_eq!((second_idx, third_idx), (0, 0));
+        assert_eq!(policy.state.lock().unwrap().sessions["s-0"].in_flight, 2);
+        drop(second);
+        drop(third);
+        assert_eq!(reserve(&policy, &workers, "s-0").0, 1);
+    }
+
+    #[test]
+    fn test_rebalance_budget_is_shared_across_policies() {
+        let first = rebalancing_policy();
+        let mut second = rebalancing_policy();
+        second.rebalance_budget = Arc::clone(&first.rebalance_budget);
+        let first = Arc::new(first);
+        let second = Arc::new(second);
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+        pin(&first, &workers[..1], "a", 12);
+        pin(&second, &workers[..1], "b", 12);
+        assert_eq!(reserve(&first, &workers, "a-0").0, 1);
+        assert_eq!(reserve(&first, &workers, "a-1").0, 0);
+        assert_eq!(reserve(&second, &workers, "b-0").0, 0);
+        *first.rebalance_budget.lock().unwrap() = Some(Instant::now() - REBALANCE_INTERVAL);
+        assert_eq!(reserve(&second, &workers, "b-0").0, 1);
+    }
+
+    #[test]
+    fn test_cooldown_prevents_return_move_when_load_reverses() {
+        let policy = Arc::new(rebalancing_policy());
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+        pin(&policy, &workers[..1], "s", 6);
+        assert_eq!(reserve(&policy, &workers, "s-0").0, 1);
+        pin(&policy, &workers[1..], "more", 20);
+        *policy.rebalance_budget.lock().unwrap() = None;
+        assert_eq!(reserve(&policy, &workers, "s-0").0, 1);
+        policy
+            .state
+            .lock()
+            .unwrap()
+            .sessions
+            .get_mut("s-0")
+            .unwrap()
+            .last_rebalanced = Some(Instant::now() - REBALANCE_COOLDOWN);
+        assert_eq!(reserve(&policy, &workers, "s-0").0, 0);
+    }
+
+    #[test]
+    fn test_failover_bypasses_budget_and_cooldown() {
+        let policy = Arc::new(rebalancing_policy());
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+        pin(&policy, &workers[..1], "s", 6);
+        let (_, first) = reserve(&policy, &workers, "s-0");
+        // The moved request is still in flight on w2 when w2 fails.
+        workers[1].set_healthy(false);
+        let (idx, retry) = reserve(&policy, &workers, "s-0");
+        assert_eq!(idx, 0);
+        drop(first);
+        assert_eq!(policy.state.lock().unwrap().sessions["s-0"].in_flight, 1);
+        drop(retry);
+        assert_eq!(policy.state.lock().unwrap().sessions["s-0"].in_flight, 0);
+    }
+
+    #[test]
+    fn test_old_completion_cannot_release_recreated_session() {
+        let policy = Arc::new(rebalancing_policy());
+        let workers = make_workers(&["http://w1:8000"]);
+        let (_, old) = reserve(&policy, &workers, "same");
+        policy.finish_session("same");
+        let (_, new) = reserve(&policy, &workers, "same");
+        drop(old);
+        assert_eq!(policy.state.lock().unwrap().sessions["same"].in_flight, 1);
+        drop(new);
+        assert_eq!(policy.state.lock().unwrap().sessions["same"].in_flight, 0);
+    }
+
+    #[test]
+    fn test_selection_without_reservation_never_rebalances() {
+        let policy = rebalancing_policy();
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+        pin(&policy, &workers[..1], "s", 6);
+        assert_eq!(route(&policy, &workers, "s-0"), 0);
+        assert!(policy.rebalance_budget.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn test_rebalance_thresholds_and_inactive_load() {
+        let policy = Arc::new(rebalancing_policy().with_active_window_secs(1));
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+        pin(&policy, &workers[..1], "s", 13);
+        pin(&policy, &workers[1..], "light", 8);
+        assert_eq!(reserve(&policy, &workers, "s-0").0, 0); // 12 == 1.5 * 8
+        pin(&policy, &workers[..1], "extra", 1);
+        assert_eq!(reserve(&policy, &workers, "s-0").0, 1);
+        for i in 1..13 {
+            backdate(&policy, &format!("s-{i}"));
+        }
+        sweep_now(&policy);
+        *policy.rebalance_budget.lock().unwrap() = None;
+        assert_eq!(reserve(&policy, &workers, "s-1").0, 0); // inactive pins aren't load
+    }
+
+    #[test]
+    fn test_minimum_gap_and_disabled_rebalance() {
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+        let policy = Arc::new(rebalancing_policy());
+        pin(&policy, &workers[..1], "s", 4);
+        assert_eq!(reserve(&policy, &workers, "s-0").0, 0);
+        let disabled = Arc::new(StickyLeastLoadedPolicy::with_expiration_secs(3600));
+        pin(&disabled, &workers[..1], "s", 20);
+        assert_eq!(reserve(&disabled, &workers, "s-0").0, 0);
+        for ratio in [-1.0, 0.5, f64::NAN, f64::INFINITY] {
+            assert_eq!(
+                StickyLeastLoadedPolicy::with_expiration_secs(3600)
+                    .with_rebalance_ratio(ratio)
+                    .rebalance_ratio,
+                0.0
+            );
+        }
     }
 }

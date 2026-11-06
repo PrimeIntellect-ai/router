@@ -100,6 +100,11 @@ pub fn init_metrics() {
         "Sticky least-loaded sessions pinned to each worker, active or not"
     );
 
+    describe_counter!(
+        "vllm_router_sll_rebalances_total",
+        "Voluntary sticky-session moves between healthy workers"
+    );
+
     // PD-specific metrics
     describe_counter!(
         "vllm_router_pd_requests_total",
@@ -416,6 +421,10 @@ impl RouterMetrics {
     pub fn set_load_range(max_load: usize, min_load: usize) {
         gauge!("vllm_router_max_load").set(max_load as f64);
         gauge!("vllm_router_min_load").set(min_load as f64);
+    }
+
+    pub fn record_sll_rebalance(from: &str, to: &str) {
+        counter!("vllm_router_sll_rebalances_total", "from" => from.to_string(), "to" => to.to_string()).increment(1);
     }
 
     pub fn set_sll_sessions(worker: &str, active: usize, pinned: usize) {

@@ -63,6 +63,34 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
         headers: Option<&RequestHeaders>,
     ) -> Option<usize>;
 
+    /// Select and reserve a request. Stateful policies override this to make
+    /// selection and reservation atomic. Use `SessionRequestGuard::select` to
+    /// ensure the reservation is released.
+    fn select_worker_for_request(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        request_text: Option<&str>,
+        headers: Option<&RequestHeaders>,
+    ) -> Option<(usize, Option<SessionReservation>)> {
+        let idx = self.select_worker_with_headers(workers, request_text, headers)?;
+        let reservation = if self.tracks_session_requests() {
+            hash_key::extract_session_id(request_text, headers).map(|session_id| {
+                self.on_session_request_start(&session_id);
+                SessionReservation {
+                    session_id,
+                    generation: None,
+                }
+            })
+        } else {
+            None
+        };
+        Some((idx, reservation))
+    }
+
+    fn complete_session_reservation(&self, reservation: &SessionReservation) {
+        self.on_session_request_complete(&reservation.session_id);
+    }
+
     /// Select a pair of workers (prefill and decode) for PD routing
     ///
     /// Returns indices of (prefill_worker, decode_worker) from their respective arrays.
@@ -193,16 +221,41 @@ impl Default for CacheAwareConfig {
     }
 }
 
+#[derive(Debug)]
+pub struct SessionReservation {
+    pub session_id: String,
+    pub generation: Option<u64>,
+}
+
 /// Keeps a routed session request in flight for its policy: reports the start
 /// when created and the completion when dropped, so the end of a response
 /// (including a streamed one, when the guard lives in its body) and every error
 /// path are reported exactly once.
 pub struct SessionRequestGuard {
     policy: Arc<dyn LoadBalancingPolicy>,
-    session_id: String,
+    reservation: SessionReservation,
 }
 
 impl SessionRequestGuard {
+    /// Own the reservation returned by selection. SLL reserves under the same
+    /// lock as selection, before this method can return a worker.
+    pub fn select(
+        policy: Arc<dyn LoadBalancingPolicy>,
+        workers: &[Arc<dyn Worker>],
+        request_text: Option<&str>,
+        headers: Option<&RequestHeaders>,
+    ) -> Option<(usize, Option<Self>)> {
+        let (idx, reservation) =
+            policy.select_worker_for_request(workers, request_text, headers)?;
+        Some((
+            idx,
+            reservation.map(|reservation| Self {
+                policy,
+                reservation,
+            }),
+        ))
+    }
+
     /// Returns `None` when the policy does not track session requests or the
     /// request carries no session identifier.
     pub fn new(
@@ -215,13 +268,19 @@ impl SessionRequestGuard {
         }
         let session_id = hash_key::extract_session_id(request_text, headers)?;
         policy.on_session_request_start(&session_id);
-        Some(Self { policy, session_id })
+        Some(Self {
+            policy,
+            reservation: SessionReservation {
+                session_id,
+                generation: None,
+            },
+        })
     }
 }
 
 impl Drop for SessionRequestGuard {
     fn drop(&mut self) {
-        self.policy.on_session_request_complete(&self.session_id);
+        self.policy.complete_session_reservation(&self.reservation);
     }
 }
 
