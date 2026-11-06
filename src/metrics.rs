@@ -91,6 +91,18 @@ pub fn init_metrics() {
     );
     describe_gauge!("vllm_router_max_load", "Maximum worker load");
     describe_gauge!("vllm_router_min_load", "Minimum worker load");
+    describe_gauge!(
+        "vllm_router_sll_active_sessions",
+        "Sticky least-loaded sessions counted as load on each worker"
+    );
+    describe_gauge!(
+        "vllm_router_sll_pinned_sessions",
+        "Sticky least-loaded sessions pinned to each worker, active or not"
+    );
+    describe_counter!(
+        "vllm_router_sll_rebalances_total",
+        "Idle sticky least-loaded sessions moved between workers by rebalancing"
+    );
 
     // PD-specific metrics
     describe_counter!(
@@ -408,6 +420,25 @@ impl RouterMetrics {
     pub fn set_load_range(max_load: usize, min_load: usize) {
         gauge!("vllm_router_max_load").set(max_load as f64);
         gauge!("vllm_router_min_load").set(min_load as f64);
+    }
+
+    pub fn set_sll_sessions(worker: &str, active: usize, pinned: usize) {
+        gauge!("vllm_router_sll_active_sessions",
+            "worker" => worker.to_string()
+        )
+        .set(active as f64);
+        gauge!("vllm_router_sll_pinned_sessions",
+            "worker" => worker.to_string()
+        )
+        .set(pinned as f64);
+    }
+
+    pub fn record_sll_rebalance(from: &str, to: &str) {
+        counter!("vllm_router_sll_rebalances_total",
+            "from" => from.to_string(),
+            "to" => to.to_string()
+        )
+        .increment(1);
     }
 
     // PD-specific metrics
@@ -930,6 +961,8 @@ mod tests {
         RouterMetrics::set_tree_size("http://worker1", 1000);
         RouterMetrics::record_load_balancing_event();
         RouterMetrics::set_load_range(20, 5);
+        RouterMetrics::set_sll_sessions("http://worker1", 3, 7);
+        RouterMetrics::record_sll_rebalance("http://worker1", "http://worker2");
 
         RouterMetrics::record_pd_request("/v1/chat/completions");
         RouterMetrics::record_pd_request_duration("/v1/chat/completions", Duration::from_secs(1));

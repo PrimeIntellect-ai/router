@@ -225,8 +225,9 @@ For detailed configuration options, hash key priorities, and usage examples, see
 Use `--policy sticky_least_loaded` to balance **active sessions**, not concurrent
 requests, token counts, or GPU utilization. New sessions reserve a worker
 atomically; ties use rendezvous hashing. Existing sessions keep their healthy
-worker, even if session counts later become uneven. Unavailable workers cause
-reassignment on the next request. Prefill and decode pools track sessions separately.
+worker, even if session counts later become uneven, unless rebalancing is enabled
+(see below). Unavailable workers cause reassignment on the next request. Prefill
+and decode pools track sessions separately.
 
 Session IDs prefer stable headers (`x-session-id`, `x-user-id`, `x-tenant-id`,
 and `x-correlation-id`), then the JSON fields `session_params.session_id`, `user`,
@@ -263,6 +264,39 @@ to 256 bytes. Override these limits with `VLLM_ROUTER_SLL_MAX_SESSIONS` and
 `VLLM_ROUTER_SLL_MAX_SESSION_ID_BYTES`. Requests that introduce a session beyond
 either limit continue to route least-loaded without affinity; existing tracked
 sessions remain sticky.
+
+By default every pinned session counts toward its worker's load until it is
+finished or expires. Clients that never call `/finish_session` therefore leave
+finished sessions counting as load for the whole TTL, and new sessions are placed
+by a stale picture. Two optional settings address this:
+
+- `VLLM_ROUTER_SLL_ACTIVE_WINDOW_IN_S` (default: the session expiration, which
+  keeps the behavior above): a session counts toward its worker's load only while
+  it has a request in flight or its last request started or finished within this
+  window. Sessions idle for longer stay pinned to their worker until they expire,
+  so a returning session still reuses its KV cache, but they no longer steer new
+  sessions away from it. Idle sessions are uncounted by the same once-per-minute
+  sweep that expires them.
+- `VLLM_ROUTER_SLL_REBALANCE_RATIO` (default `0`, off): when a pinned session
+  sends its next request with none of its requests in flight, it moves to the
+  least-loaded healthy worker if its own worker has more than `ratio` times as
+  many active sessions, and at least 4 more (not counting the moving session).
+  This drains workers that took over sessions while another worker was down or
+  restarting, instead of leaving the returned worker idle until those sessions
+  expire. A moved session prefills its context once on the new worker.
+
+For long agent sessions (100k+ token contexts, turns minutes to hours apart)
+whose clients do not finish sessions, a starting point is:
+
+```bash
+VLLM_ROUTER_SLL_SESSION_EXPIRATION_IN_S=14400  # keep affinity for 4 h of idle time
+VLLM_ROUTER_SLL_ACTIVE_WINDOW_IN_S=1800        # count as load for 30 min (15 min is also reasonable)
+VLLM_ROUTER_SLL_REBALANCE_RATIO=1.5
+```
+
+The router exports `vllm_router_sll_active_sessions{worker}` (sessions counted as
+load), `vllm_router_sll_pinned_sessions{worker}` (all pinned sessions), and
+`vllm_router_sll_rebalances_total{from,to}`.
 
 ## Advanced Features
 
