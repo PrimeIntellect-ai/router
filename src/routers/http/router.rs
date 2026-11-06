@@ -1975,6 +1975,11 @@ impl RouterTrait for Router {
             }
         };
 
+        let session_request = SessionRequestGuard::new(
+            Arc::clone(&policy),
+            request_text.as_deref(),
+            request_headers.as_ref(),
+        );
         let worker: &dyn Worker = workers[worker_idx].as_ref();
         let url = worker.endpoint_url(path);
 
@@ -2011,7 +2016,7 @@ impl RouterTrait for Router {
         }
 
         // Send request
-        match otel_http::send_client_request(
+        let response = match otel_http::send_client_request(
             request_builder,
             headers,
             ClientRequestOptions {
@@ -2136,6 +2141,10 @@ impl RouterTrait for Router {
                 format!("Backend request failed: {}", e),
             )
                 .into_response(),
+        };
+        match session_request {
+            Some(guard) => hold_until_body_ends(response, guard),
+            None => response,
         }
     }
 }

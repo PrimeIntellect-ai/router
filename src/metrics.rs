@@ -99,10 +99,6 @@ pub fn init_metrics() {
         "vllm_router_sll_pinned_sessions",
         "Sticky least-loaded sessions pinned to each worker, active or not"
     );
-    describe_counter!(
-        "vllm_router_sll_rebalances_total",
-        "Idle sticky least-loaded sessions moved between workers by rebalancing"
-    );
 
     // PD-specific metrics
     describe_counter!(
@@ -431,14 +427,6 @@ impl RouterMetrics {
             "worker" => worker.to_string()
         )
         .set(pinned as f64);
-    }
-
-    pub fn record_sll_rebalance(from: &str, to: &str) {
-        counter!("vllm_router_sll_rebalances_total",
-            "from" => from.to_string(),
-            "to" => to.to_string()
-        )
-        .increment(1);
     }
 
     // PD-specific metrics
@@ -962,7 +950,6 @@ mod tests {
         RouterMetrics::record_load_balancing_event();
         RouterMetrics::set_load_range(20, 5);
         RouterMetrics::set_sll_sessions("http://worker1", 3, 7);
-        RouterMetrics::record_sll_rebalance("http://worker1", "http://worker2");
 
         RouterMetrics::record_pd_request("/v1/chat/completions");
         RouterMetrics::record_pd_request_duration("/v1/chat/completions", Duration::from_secs(1));

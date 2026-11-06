@@ -32,11 +32,6 @@
 //!   session stays pinned until it expires but no longer steers new sessions
 //!   away from its replica, so sessions that clients never finish stop counting
 //!   as load long before they expire.
-//! - Optionally (`VLLM_ROUTER_SLL_REBALANCE_RATIO`, default 0 = off), a pinned
-//!   session with no request in flight moves to the least-loaded healthy replica
-//!   when its own replica has more than `ratio` times as many active sessions,
-//!   and at least [`REBALANCE_MIN_GAP`] more. This drains replicas that took
-//!   over sessions while another replica was unavailable.
 //! - Sessions can be released explicitly via [`finish_session`].
 //!
 //! Requests without any session identifier are still load-balanced to the
@@ -78,14 +73,6 @@ pub const MAX_SESSION_ID_BYTES_ENV: &str = "VLLM_ROUTER_SLL_MAX_SESSION_ID_BYTES
 /// after its last request starts or finishes a session still counts toward its
 /// replica's load. Defaults to the session expiration.
 pub const ACTIVE_WINDOW_ENV: &str = "VLLM_ROUTER_SLL_ACTIVE_WINDOW_IN_S";
-
-/// Environment variable for the rebalance ratio; 0 (the default) disables
-/// rebalancing.
-pub const REBALANCE_RATIO_ENV: &str = "VLLM_ROUTER_SLL_REBALANCE_RATIO";
-
-/// Minimum number of active sessions, not counting the moving session, by which
-/// its replica must exceed the least-loaded one before rebalancing moves it.
-pub const REBALANCE_MIN_GAP: usize = 4;
 
 /// Minimum interval between full expiration sweeps to bound per-request cost.
 const SWEEP_INTERVAL_SECS: u64 = 60;
@@ -207,7 +194,6 @@ pub struct StickyLeastLoadedPolicy {
     state: Mutex<SllState>,
     session_expiration: Duration,
     active_window: Duration,
-    rebalance_ratio: f64,
     max_sessions: usize,
     max_session_id_bytes: usize,
 }
@@ -215,7 +201,7 @@ pub struct StickyLeastLoadedPolicy {
 impl StickyLeastLoadedPolicy {
     /// Create a new policy, reading its settings from the environment (falling
     /// back to [`DEFAULT_SESSION_EXPIRATION_SECS`], an active window equal to the
-    /// expiration, and no rebalancing).
+    /// expiration).
     pub fn new() -> Self {
         let expiration_secs = Self::env_or(SESSION_EXPIRATION_ENV, DEFAULT_SESSION_EXPIRATION_SECS);
         let policy = Self::with_limits(
@@ -223,13 +209,11 @@ impl StickyLeastLoadedPolicy {
             Self::env_or(MAX_SESSIONS_ENV, DEFAULT_MAX_SESSIONS),
             Self::env_or(MAX_SESSION_ID_BYTES_ENV, DEFAULT_MAX_SESSION_ID_BYTES),
         )
-        .with_active_window_secs(Self::env_or(ACTIVE_WINDOW_ENV, expiration_secs))
-        .with_rebalance_ratio(Self::env_or(REBALANCE_RATIO_ENV, 0.0));
+        .with_active_window_secs(Self::env_or(ACTIVE_WINDOW_ENV, expiration_secs));
         info!(
-            "SLL: session expiration {}s, active window {}s, rebalance ratio {}",
+            "SLL: session expiration {}s, active window {}s",
             policy.session_expiration.as_secs(),
-            policy.active_window.as_secs(),
-            policy.rebalance_ratio
+            policy.active_window.as_secs()
         );
         policy
     }
@@ -246,21 +230,6 @@ impl StickyLeastLoadedPolicy {
         self
     }
 
-    /// Move idle pinned sessions off replicas with more than `ratio` times the
-    /// active sessions of the least-loaded healthy replica; 0 disables this.
-    pub fn with_rebalance_ratio(mut self, ratio: f64) -> Self {
-        self.rebalance_ratio = if ratio.is_finite() && ratio >= 0.0 {
-            ratio
-        } else {
-            warn!(
-                "Invalid {} value '{}', rebalancing disabled",
-                REBALANCE_RATIO_ENV, ratio
-            );
-            0.0
-        };
-        self
-    }
-
     fn with_limits(expiration_secs: u64, max_sessions: usize, max_session_id_bytes: usize) -> Self {
         Self {
             state: Mutex::new(SllState {
@@ -272,7 +241,6 @@ impl StickyLeastLoadedPolicy {
             }),
             session_expiration: Duration::from_secs(expiration_secs),
             active_window: Duration::from_secs(expiration_secs),
-            rebalance_ratio: 0.0,
             max_sessions,
             max_session_id_bytes,
         }
@@ -330,32 +298,6 @@ impl StickyLeastLoadedPolicy {
             return;
         }
         self.sweep(state, now);
-    }
-
-    /// Whether a pinned session should leave its healthy replica: rebalancing is
-    /// on, none of its requests is in flight, and its replica has more than
-    /// `rebalance_ratio` times, and at least [`REBALANCE_MIN_GAP`] more, active
-    /// sessions than the least-loaded other healthy replica. Loads exclude the
-    /// session itself.
-    fn should_rebalance(
-        &self,
-        state: &SllState,
-        entry: &SessionEntry,
-        candidates: &[(usize, String)],
-    ) -> bool {
-        if self.rebalance_ratio <= 0.0 || entry.in_flight > 0 {
-            return false;
-        }
-        let own = count(&state.active_counts, &entry.worker_url)
-            .saturating_sub(usize::from(entry.active));
-        candidates
-            .iter()
-            .filter(|(_, url)| *url != entry.worker_url)
-            .map(|(_, url)| count(&state.active_counts, url))
-            .min()
-            .is_some_and(|least| {
-                own >= least + REBALANCE_MIN_GAP && own as f64 > self.rebalance_ratio * least as f64
-            })
     }
 
     /// Pick the least-loaded replica among `candidates`, breaking ties with
@@ -433,7 +375,8 @@ impl StickyLeastLoadedPolicy {
         RouterMetrics::record_policy_decision(self.name(), worker.url());
     }
 
-    /// Number of currently active (tracked) sessions. Exposed for tests/metrics.
+    /// Number of retained sessions, including inactive pins. Exposed for tests.
+    /// Per-worker placement load is reported by `active_count_for`.
     pub fn active_session_count(&self) -> usize {
         self.state.lock().unwrap().sessions.len()
     }
@@ -495,7 +438,6 @@ impl LoadBalancingPolicy for StickyLeastLoadedPolicy {
 
         // Requests still running on a previous assignment complete against the new one.
         let mut in_flight = 0;
-        let mut rebalanced_from = None;
 
         // Existing session: route to the same replica if it's still healthy.
         if let Some((worker_url, expired)) = state.sessions.get(&session_id).map(|e| {
@@ -504,40 +446,30 @@ impl LoadBalancingPolicy for StickyLeastLoadedPolicy {
                 e.is_idle(self.session_expiration, now),
             )
         }) {
-            let mut rebalance = false;
             if let Some((idx, _)) = candidates
                 .iter()
                 .find(|(_, url)| *url == worker_url && !expired)
             {
-                rebalance =
-                    self.should_rebalance(&state, &state.sessions[&session_id], &candidates);
-                if !rebalance {
-                    let idx = *idx;
-                    if let Some(entry) = state.sessions.get_mut(&session_id) {
-                        entry.last_access = now;
-                    }
-                    state.mark_active(&session_id);
-                    drop(state);
-                    self.record_selection(&workers[idx]);
-                    debug!(
-                        "SLL: session '{}' -> existing replica '{}'",
-                        session_id, worker_url
-                    );
-                    return Some(idx);
+                let idx = *idx;
+                if let Some(entry) = state.sessions.get_mut(&session_id) {
+                    entry.last_access = now;
                 }
-            }
-
-            // Expired session, unavailable or overloaded replica: release the
-            // old assignment.
-            in_flight = state.remove_session(&session_id).map_or(0, |e| e.in_flight);
-            if rebalance {
-                rebalanced_from = Some(worker_url);
-            } else {
+                state.mark_active(&session_id);
+                drop(state);
+                self.record_selection(&workers[idx]);
                 debug!(
-                    "SLL: session '{}' replica '{}' unavailable, reassigning",
+                    "SLL: session '{}' -> existing replica '{}'",
                     session_id, worker_url
                 );
+                return Some(idx);
             }
+
+            // Expired session or unavailable replica: release the old assignment.
+            in_flight = state.remove_session(&session_id).map_or(0, |e| e.in_flight);
+            debug!(
+                "SLL: session '{}' replica '{}' unavailable or expired, reassigning",
+                session_id, worker_url
+            );
         }
 
         // New session: assign to least-loaded replica (tie-broken by hashing).
@@ -563,19 +495,10 @@ impl LoadBalancingPolicy for StickyLeastLoadedPolicy {
         drop(state);
 
         self.record_selection(&workers[idx]);
-        match rebalanced_from {
-            Some(from) => {
-                RouterMetrics::record_sll_rebalance(&from, &worker_url);
-                info!(
-                    "SLL: rebalanced session '{}' from replica '{}' to '{}' (active sessions on replica: {})",
-                    session_id, from, worker_url, new_count
-                );
-            }
-            None => info!(
-                "SLL: new session '{}' -> replica '{}' (active sessions on replica: {})",
-                session_id, worker_url, new_count
-            ),
-        }
+        info!(
+            "SLL: new session '{}' -> replica '{}' (active sessions on replica: {})",
+            session_id, worker_url, new_count
+        );
         Some(idx)
     }
 
@@ -1087,7 +1010,6 @@ mod tests {
     fn test_active_window_defaults_to_expiration() {
         let policy = StickyLeastLoadedPolicy::new();
         assert_eq!(policy.active_window, policy.session_expiration);
-        assert_eq!(policy.rebalance_ratio, 0.0);
 
         // Sessions idle for less than the expiration keep counting as load, so
         // placement is unchanged.
@@ -1169,84 +1091,5 @@ mod tests {
         assert_eq!(policy.active_session_count(), 0);
         assert_eq!(policy.active_count_for(workers[0].url()), 0);
         assert_eq!(policy.pinned_count_for(workers[0].url()), 0);
-    }
-
-    #[test]
-    fn test_rebalance_off_by_default() {
-        let policy = StickyLeastLoadedPolicy::with_expiration_secs(3600);
-        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
-        pin(&policy, &workers[..1], "s", 10);
-        assert_eq!(route(&policy, &workers, "s-0"), 0);
-        assert_eq!(policy.active_count_for(workers[0].url()), 10);
-    }
-
-    #[test]
-    fn test_rebalance_moves_idle_session_off_overloaded_replica() {
-        let policy = StickyLeastLoadedPolicy::with_expiration_secs(3600).with_rebalance_ratio(1.5);
-        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
-        pin(&policy, &workers[..1], "s", 6);
-
-        // 5 other sessions vs 0: moved.
-        assert_eq!(route(&policy, &workers, "s-0"), 1);
-        assert_eq!(policy.active_count_for(workers[0].url()), 5);
-        assert_eq!(policy.active_count_for(workers[1].url()), 1);
-        assert_eq!(route(&policy, &workers, "s-0"), 1, "moved session sticks");
-
-        // 4 other sessions vs 1: below the minimum gap, stays.
-        assert_eq!(route(&policy, &workers, "s-1"), 0);
-        assert_eq!(policy.pinned_count_for(workers[0].url()), 5);
-    }
-
-    #[test]
-    fn test_rebalance_ratio_threshold() {
-        let policy = StickyLeastLoadedPolicy::with_expiration_secs(3600).with_rebalance_ratio(1.5);
-        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
-        pin(&policy, &workers[1..], "light", 8);
-        pin(&policy, &workers[..1], "heavy", 13);
-
-        // 12 other sessions vs 8 is not more than 1.5x: stays.
-        assert_eq!(route(&policy, &workers, "heavy-0"), 0);
-
-        // 13 vs 8 is: moves.
-        pin(&policy, &workers[..1], "extra", 1);
-        assert_eq!(route(&policy, &workers, "heavy-0"), 1);
-        assert_eq!(policy.active_count_for(workers[0].url()), 13);
-        assert_eq!(policy.active_count_for(workers[1].url()), 9);
-    }
-
-    #[test]
-    fn test_rebalance_counts_only_active_sessions() {
-        let policy = StickyLeastLoadedPolicy::with_expiration_secs(3600)
-            .with_active_window_secs(1)
-            .with_rebalance_ratio(1.5);
-        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
-        pin(&policy, &workers[..1], "s", 6);
-        for i in 1..6 {
-            backdate(&policy, &format!("s-{i}"));
-        }
-        sweep_now(&policy);
-        assert_eq!(route(&policy, &workers, "s-0"), 0);
-    }
-
-    #[test]
-    fn test_no_rebalance_while_in_flight() {
-        let policy =
-            Arc::new(StickyLeastLoadedPolicy::with_expiration_secs(3600).with_rebalance_ratio(1.5));
-        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
-        pin(&policy, &workers[..1], "s", 6);
-
-        let request = start_request(&policy, "s-0");
-        assert_eq!(route(&policy, &workers, "s-0"), 0);
-        drop(request);
-        assert_eq!(route(&policy, &workers, "s-0"), 1);
-    }
-
-    #[test]
-    fn test_invalid_rebalance_ratio_disables_rebalancing() {
-        for ratio in [-1.0, f64::NAN, f64::INFINITY] {
-            let policy =
-                StickyLeastLoadedPolicy::with_expiration_secs(3600).with_rebalance_ratio(ratio);
-            assert_eq!(policy.rebalance_ratio, 0.0);
-        }
     }
 }
