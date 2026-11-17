@@ -512,4 +512,35 @@ mod transparent_proxy_routing_tests {
         assert!(available_prefill[prefill_idx].is_healthy());
         assert!(available_decode[decode_idx].is_healthy());
     }
+
+    // =====================================================================
+    // Test 6: Forwarded JSON bodies keep the client's key order
+    // =====================================================================
+    // transparent_proxy_handler parses the body into a serde_json::Value and
+    // route_transparent re-serializes it with reqwest's `.json(&body)`, i.e.
+    // serde_json::to_vec. Without serde_json's `preserve_order` feature the
+    // Value's objects are BTreeMaps, so every object reaches the worker with
+    // its keys sorted. Some endpoints give key order meaning: vLLM's
+    // /v1/systemone reads the order of `questions`, of a choice question's
+    // `criteria` (its options) and of `state` from the request.
+
+    #[test]
+    fn test_transparent_proxy_body_preserves_key_order() {
+        let input = r#"{"state":{"zeta":1,"alpha":2},"questions":{"q2":{"type":"choice","criteria":{"C":"c","A":"a","B":"b"}},"q1":{"type":"noul"}}}"#;
+
+        fn keys(v: &serde_json::Value) -> Vec<&str> {
+            v.as_object().unwrap().keys().map(String::as_str).collect()
+        }
+
+        // Same parse as transparent_proxy_handler.
+        let body: serde_json::Value = serde_json::from_slice(input.as_bytes()).unwrap();
+        assert_eq!(keys(&body), vec!["state", "questions"]);
+        assert_eq!(keys(&body["state"]), vec!["zeta", "alpha"]);
+        assert_eq!(keys(&body["questions"]), vec!["q2", "q1"]);
+        assert_eq!(keys(&body["questions"]["q2"]["criteria"]), vec!["C", "A", "B"]);
+
+        // Same serialization as route_transparent's `request_builder.json(&body)`:
+        // the worker must receive the client's bytes unchanged.
+        assert_eq!(serde_json::to_vec(&body).unwrap(), input.as_bytes());
+    }
 }
