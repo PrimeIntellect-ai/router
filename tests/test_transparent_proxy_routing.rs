@@ -537,7 +537,10 @@ mod transparent_proxy_routing_tests {
         assert_eq!(keys(&body), vec!["state", "questions"]);
         assert_eq!(keys(&body["state"]), vec!["zeta", "alpha"]);
         assert_eq!(keys(&body["questions"]), vec!["q2", "q1"]);
-        assert_eq!(keys(&body["questions"]["q2"]["criteria"]), vec!["C", "A", "B"]);
+        assert_eq!(
+            keys(&body["questions"]["q2"]["criteria"]),
+            vec!["C", "A", "B"]
+        );
 
         // Same serialization as route_transparent's `request_builder.json(&body)`:
         // the worker must receive the client's bytes unchanged.
