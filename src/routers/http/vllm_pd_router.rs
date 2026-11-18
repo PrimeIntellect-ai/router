@@ -72,42 +72,96 @@ pub struct VllmPDRouter {
     pd_turn_retries: u32,
 }
 
-/// Failure of one prefill+decode attempt. `retryable` marks connection-level
-/// failures (request not sent, body not received) that a whole-turn retry with a
-/// fresh prefill can recover from; other failures are returned as they are.
-#[derive(Debug)]
+/// What a failed prefill+decode attempt hands back.
+enum TurnFailure {
+    /// Router-side failure (connection error, unusable body), returned as a 500.
+    Error(PDRouterError),
+    /// A non-2xx response from prefill or decode, returned to the client as-is.
+    Upstream(Response),
+}
+
+/// Failure of one prefill+decode attempt. `retryable` marks failures that a
+/// whole-turn retry with a fresh prefill can recover from: connection-level
+/// errors (request not sent, body not received) and 5xx responses. 4xx responses
+/// and bodies that arrived but cannot be used are returned as they are.
 struct TurnError {
-    error: PDRouterError,
+    failure: TurnFailure,
     retryable: bool,
 }
 
 impl TurnError {
     fn retryable(error: PDRouterError) -> Self {
         Self {
-            error,
+            failure: TurnFailure::Error(error),
             retryable: true,
         }
     }
 
     fn fatal(error: PDRouterError) -> Self {
         Self {
-            error,
+            failure: TurnFailure::Error(error),
             retryable: false,
         }
     }
+
+    /// A non-2xx upstream response: retryable if it is a 5xx.
+    fn upstream(response: Response) -> Self {
+        let retryable = response.status().is_server_error();
+        Self {
+            failure: TurnFailure::Upstream(response),
+            retryable,
+        }
+    }
+
+    fn describe(&self) -> String {
+        match &self.failure {
+            TurnFailure::Error(e) => e.to_string(),
+            TurnFailure::Upstream(r) => format!("upstream returned {}", r.status()),
+        }
+    }
+}
+
+/// Rebuild an upstream response (status, headers, body) for the client. Framing
+/// headers are dropped; axum recomputes them for the buffered body.
+fn upstream_response(
+    status: StatusCode,
+    headers: &reqwest::header::HeaderMap,
+    body: bytes::Bytes,
+) -> Response {
+    let mut builder = axum::http::Response::builder().status(status);
+    for (name, value) in headers.iter() {
+        if name != axum::http::header::CONTENT_LENGTH
+            && name != axum::http::header::TRANSFER_ENCODING
+        {
+            builder = builder.header(name, value);
+        }
+    }
+    builder
+        .body(axum::body::Body::from(body))
+        .unwrap_or_else(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to build upstream error response: {}", e),
+            )
+                .into_response()
+        })
 }
 
 /// Path of the token-in endpoint, the only one whose turns use bidirectional
 /// transfer: the router can verify the exact token prefix a handle covers.
 const TOKEN_IN_GENERATE_PATH: &str = "/inference/v1/generate";
 
-/// Bidirectional-transfer state of one token-in turn.
+/// Bidirectional-transfer state of one token-in session turn.
 #[derive(Debug)]
 struct BidirectionalTurn {
     /// Session key (same lookup as `/finish_session`)
     session: String,
+    /// Whether the turn may capture or use a handle (false for multimodal requests)
+    eligible: bool,
     /// The turn's prompt token ids, to fingerprint what decode keeps for the next turn
     prompt: Vec<i64>,
+    /// Fingerprint of the other inputs that change the KV (model, cache salt)
+    request_key: u64,
 }
 
 /// Reads only `kv_transfer_params` and the choices' token ids from a decode
@@ -1616,11 +1670,10 @@ impl VllmPDRouter {
             }
         };
 
-        debug!("📥 Prefill response status: {}", prefill_response.status());
-        debug!(
-            "📥 Prefill response headers: {:?}",
-            prefill_response.headers()
-        );
+        let prefill_status = prefill_response.status();
+        let prefill_headers = prefill_response.headers().clone();
+        debug!("📥 Prefill response status: {}", prefill_status);
+        debug!("📥 Prefill response headers: {:?}", prefill_headers);
 
         // Extract prefill response body to get kv_transfer_params
         let prefill_bytes = match prefill_response.bytes().await {
@@ -1652,7 +1705,27 @@ impl VllmPDRouter {
             );
         }
 
-        // Parse prefill response to extract kv_transfer_params
+        // A failed prefill never proceeds to decode: its error goes back to the
+        // client (5xx may be retried with a fresh prefill, 4xx is final).
+        if !prefill_status.is_success() {
+            prefill_worker.decrement_load();
+            let duration = start_time.elapsed();
+            RouterMetrics::record_pd_prefill_error(&prefill_base_url);
+            RouterMetrics::record_pd_request(path);
+            RouterMetrics::record_pd_request_duration(path, duration);
+            warn!(
+                "Prefill {} returned {}; not sending the turn to decode",
+                prefill_url, prefill_status
+            );
+            return Err(TurnError::upstream(upstream_response(
+                prefill_status,
+                &prefill_headers,
+                prefill_bytes,
+            )));
+        }
+
+        // Parse prefill response to extract kv_transfer_params. A complete body
+        // that is not JSON would fail the same way again: not retried.
         let prefill_response_json: Value = match serde_json::from_slice(&prefill_bytes) {
             Ok(json) => json,
             Err(e) => {
@@ -1661,7 +1734,7 @@ impl VllmPDRouter {
                 RouterMetrics::record_pd_prefill_error(&prefill_base_url);
                 RouterMetrics::record_pd_request(path);
                 RouterMetrics::record_pd_request_duration(path, duration);
-                return Err(TurnError::retryable(PDRouterError::NetworkError {
+                return Err(TurnError::fatal(PDRouterError::NetworkError {
                     message: format!("Failed to parse prefill response as JSON: {}", e),
                 }));
             }
@@ -1801,6 +1874,36 @@ impl VllmPDRouter {
         // Decode phase complete: decrement decode load
         decode_worker.decrement_load();
 
+        // A 5xx from decode is handed back for a possible whole-turn retry (fresh
+        // prefill, no decode handle) instead of being streamed to the client; 4xx
+        // and success responses go through the normal response handling.
+        let decode_status = decode_response.status();
+        if decode_status.is_server_error() {
+            let decode_headers = decode_response.headers().clone();
+            self.stop_profiling(&decode_base_url).await;
+            let duration = start_time.elapsed();
+            RouterMetrics::record_pd_request(path);
+            RouterMetrics::record_pd_request_duration(path, duration);
+            RouterMetrics::record_pd_prefill_request(&prefill_base_url);
+            RouterMetrics::record_pd_decode_request(&decode_base_url);
+            RouterMetrics::record_pd_decode_error(&decode_base_url);
+            let body = decode_response.bytes().await.map_err(|e| {
+                TurnError::retryable(PDRouterError::NetworkError {
+                    message: format!(
+                        "Failed to read decode response from {}: {}",
+                        decode_url,
+                        error_chain(&e)
+                    ),
+                })
+            })?;
+            warn!("Decode {} returned {}", decode_url, decode_status);
+            return Err(TurnError::upstream(upstream_response(
+                decode_status,
+                &decode_headers,
+                body,
+            )));
+        }
+
         // Check if logprobs merging is needed
         let needs_logprobs = original_request.get("logprobs").is_some()
             || original_request
@@ -1830,20 +1933,24 @@ impl VllmPDRouter {
         )
         .await
         .map_err(|message| {
-            let retryable = is_retryable_decode_error(&message);
-            TurnError {
-                error: PDRouterError::NetworkError { message },
-                retryable,
+            let error = PDRouterError::NetworkError {
+                message: message.clone(),
+            };
+            if is_retryable_decode_error(&message) {
+                TurnError::retryable(error)
+            } else {
+                TurnError::fatal(error)
             }
         })
     }
 
     /// Bidirectional-transfer state for a turn, if the mode is on and the turn
-    /// can use it: a token-in request (the router must verify the exact token
-    /// prefix a handle covers; text requests are re-tokenized and chat templates
-    /// often re-render history) that belongs to a session (same lookup as
+    /// is a token-in request (the router must verify the exact token prefix a
+    /// handle covers; text requests are re-tokenized and chat templates often
+    /// re-render history) that belongs to a session (same lookup as
     /// `/finish_session`: x-session-id and the other session headers first, then
-    /// session fields in the body).
+    /// session fields in the body). Multimodal turns are returned as ineligible:
+    /// they neither capture nor use a handle, and drop the session's handle.
     fn bidirectional_turn(
         &self,
         path: &str,
@@ -1856,8 +1963,21 @@ impl VllmPDRouter {
             return None;
         }
         let session = crate::policies::extract_session_id(request_text, request_headers)?;
+        if pd_bidirectional::has_multimodal_inputs(request) {
+            return Some(BidirectionalTurn {
+                session,
+                eligible: false,
+                prompt: Vec::new(),
+                request_key: 0,
+            });
+        }
         let prompt = pd_bidirectional::request_token_ids(request)?;
-        Some(BidirectionalTurn { session, prompt })
+        Some(BidirectionalTurn {
+            session,
+            eligible: true,
+            prompt,
+            request_key: pd_bidirectional::request_key(request),
+        })
     }
 
     /// Cache the handle decode returned for the session's next turn.
@@ -1882,7 +2002,7 @@ impl VllmPDRouter {
         ) else {
             return;
         };
-        if cache.put(&turn.session, handle, prefix) {
+        if cache.put(&turn.session, handle, prefix, turn.request_key) {
             RouterMetrics::record_pd_bidirectional_handle_cached();
         } else {
             RouterMetrics::record_pd_bidirectional_handle_dropped("cache_full", 1);
@@ -1915,19 +2035,27 @@ impl VllmPDRouter {
     ) -> Result<Response, PDRouterError> {
         let mut decode_handle = None;
         if let (Some(cache), Some(turn)) = (&self.bidirectional_kv, bidirectional.as_ref()) {
-            let (handle, lookup) = cache.take(&turn.session, &turn.prompt);
-            RouterMetrics::record_pd_bidirectional_turn(lookup.as_str());
-            match lookup {
-                HandleLookup::Expired => {
-                    RouterMetrics::record_pd_bidirectional_handle_dropped("expired", 1)
+            if turn.eligible {
+                let (handle, lookup) = cache.take(&turn.session, turn.request_key, &turn.prompt);
+                RouterMetrics::record_pd_bidirectional_turn(lookup.as_str());
+                match lookup {
+                    HandleLookup::Expired
+                    | HandleLookup::PrefixMismatch
+                    | HandleLookup::RequestMismatch => {
+                        RouterMetrics::record_pd_bidirectional_handle_dropped(lookup.as_str(), 1)
+                    }
+                    HandleLookup::Hit | HandleLookup::Miss => {}
                 }
-                HandleLookup::PrefixMismatch => {
-                    RouterMetrics::record_pd_bidirectional_handle_dropped("prefix_mismatch", 1)
+                decode_handle = handle;
+            } else {
+                RouterMetrics::record_pd_bidirectional_turn("ineligible_request");
+                if cache.remove(&turn.session) {
+                    RouterMetrics::record_pd_bidirectional_handle_dropped("ineligible_request", 1);
                 }
-                HandleLookup::Hit | HandleLookup::Miss => {}
             }
-            decode_handle = handle;
         }
+        // Ineligible turns neither use nor capture a handle.
+        let bidirectional = bidirectional.filter(|turn| turn.eligible);
 
         let mut attempt: u32 = 0;
         loop {
@@ -1961,7 +2089,7 @@ impl VllmPDRouter {
                     warn!(
                         "P/D turn attempt {} failed ({}), retrying with a fresh prefill{}",
                         attempt,
-                        e.error,
+                        e.describe(),
                         if had_handle {
                             " and without the previous turn's decode KV"
                         } else {
@@ -1971,7 +2099,12 @@ impl VllmPDRouter {
                     tokio::time::sleep(std::time::Duration::from_millis(100 * attempt as u64))
                         .await;
                 }
-                Err(e) => return Err(e.error),
+                Err(e) => {
+                    return match e.failure {
+                        TurnFailure::Error(error) => Err(error),
+                        TurnFailure::Upstream(response) => Ok(response),
+                    }
+                }
             }
         }
     }
@@ -3269,19 +3402,40 @@ mod tests {
         assert_eq!(params["remote_dp_rank"], 2);
     }
 
-    // --- Bidirectional KV transfer (direct URL mode) ---
+    // --- Bidirectional KV transfer and turn retries (direct URL mode) ---
+
+    /// Injected upstream failure for the mock servers.
+    #[derive(Clone, Copy)]
+    enum MockFailure {
+        Status(u16),
+        NonJson,
+    }
+
+    type FailureQueue = Arc<std::sync::Mutex<std::collections::VecDeque<MockFailure>>>;
+
+    fn mock_failure_response(failure: MockFailure) -> Response {
+        match failure {
+            MockFailure::Status(code) => (
+                StatusCode::from_u16(code).unwrap(),
+                axum::Json(json!({"error": {"message": format!("mock {}", code)}})),
+            )
+                .into_response(),
+            MockFailure::NonJson => "upstream connect error".into_response(),
+        }
+    }
 
     /// Mock prefill/decode pair for /inference/v1/generate and /v1/completions.
     /// Records the kv_transfer_params each side receives. Decode generates two
     /// tokens per call and returns a retained-blocks handle (remote_request_id
     /// "d-<n>", host "localhost") covering prompt + completion - 1 tokens, like
-    /// vLLM. Prefill answers with a non-JSON body while `fail_prefill` > 0.
+    /// vLLM. Queued failures are returned by the next requests.
     struct BidirMock {
         prefill_url: String,
         decode_url: String,
         prefill_params: Arc<std::sync::Mutex<Vec<Value>>>,
         decode_params: Arc<std::sync::Mutex<Vec<Value>>>,
-        fail_prefill: Arc<AtomicUsize>,
+        prefill_failures: FailureQueue,
+        decode_failures: FailureQueue,
         servers: Vec<tokio::task::JoinHandle<()>>,
     }
 
@@ -3289,19 +3443,17 @@ mod tests {
         async fn start() -> Self {
             let prefill_params = Arc::new(std::sync::Mutex::new(Vec::new()));
             let decode_params = Arc::new(std::sync::Mutex::new(Vec::new()));
-            let fail_prefill = Arc::new(AtomicUsize::new(0));
+            let prefill_failures: FailureQueue = Default::default();
+            let decode_failures: FailureQueue = Default::default();
             let decode_calls = Arc::new(AtomicUsize::new(0));
 
-            let (pp, fp) = (prefill_params.clone(), fail_prefill.clone());
+            let (pp, pf) = (prefill_params.clone(), prefill_failures.clone());
             let prefill = move |axum::Json(body): axum::Json<Value>| {
-                let (pp, fp) = (pp.clone(), fp.clone());
+                let (pp, pf) = (pp.clone(), pf.clone());
                 async move {
                     pp.lock().unwrap().push(body["kv_transfer_params"].clone());
-                    if fp
-                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-                        .is_ok()
-                    {
-                        return "upstream connect error".into_response();
+                    if let Some(failure) = pf.lock().unwrap().pop_front() {
+                        return mock_failure_response(failure);
                     }
                     axum::Json(json!({
                         "choices": [{"token_ids": [1]}],
@@ -3315,11 +3467,18 @@ mod tests {
                     .into_response()
                 }
             };
-            let (dp, dc) = (decode_params.clone(), decode_calls.clone());
+            let (dp, df, dc) = (
+                decode_params.clone(),
+                decode_failures.clone(),
+                decode_calls.clone(),
+            );
             let decode = move |axum::Json(body): axum::Json<Value>| {
-                let (dp, dc) = (dp.clone(), dc.clone());
+                let (dp, df, dc) = (dp.clone(), df.clone(), dc.clone());
                 async move {
                     dp.lock().unwrap().push(body["kv_transfer_params"].clone());
+                    if let Some(failure) = df.lock().unwrap().pop_front() {
+                        return mock_failure_response(failure);
+                    }
                     let n = dc.fetch_add(1, Ordering::SeqCst) + 1;
                     let prompt_len = body["token_ids"].as_array().map_or(0, Vec::len);
                     axum::Json(json!({
@@ -3332,6 +3491,7 @@ mod tests {
                             "remote_num_tokens": prompt_len + 1
                         }
                     }))
+                    .into_response()
                 }
             };
 
@@ -3364,7 +3524,8 @@ mod tests {
                 decode_url: urls[1].clone(),
                 prefill_params,
                 decode_params,
-                fail_prefill,
+                prefill_failures,
+                decode_failures,
                 servers,
             }
         }
@@ -3400,6 +3561,14 @@ mod tests {
             .unwrap()
         }
 
+        fn fail_prefill(&self, failures: &[MockFailure]) {
+            self.prefill_failures.lock().unwrap().extend(failures);
+        }
+
+        fn fail_decode(&self, failures: &[MockFailure]) {
+            self.decode_failures.lock().unwrap().extend(failures);
+        }
+
         fn prefill_params(&self) -> Vec<Value> {
             self.prefill_params.lock().unwrap().clone()
         }
@@ -3419,9 +3588,11 @@ mod tests {
 
     /// A token-in session as an agent or RL client drives it: each turn's prompt
     /// is the previous prompt + the sampled tokens + new (tool/user) tokens.
+    /// `extra` holds other request fields (model, cache_salt, features, ...).
     struct TokenSession {
         id: &'static str,
         tokens: Vec<i64>,
+        extra: Value,
     }
 
     impl TokenSession {
@@ -3429,13 +3600,18 @@ mod tests {
             Self {
                 id,
                 tokens: vec![1, 2, 3],
+                extra: json!({"model": "m"}),
             }
         }
 
-        async fn turn(&mut self, router: &VllmPDRouter) -> StatusCode {
+        /// Send one turn; returns the status and the body text.
+        async fn send(&mut self, router: &VllmPDRouter) -> (StatusCode, String) {
             let mut headers = HeaderMap::new();
             headers.insert("x-session-id", self.id.parse().unwrap());
-            let body = json!({"model": "m", "token_ids": self.tokens, "sampling_params": {"max_tokens": 8}});
+            let mut body = json!({"token_ids": self.tokens, "sampling_params": {"max_tokens": 8}});
+            for (k, v) in self.extra.as_object().unwrap() {
+                body[k] = v.clone();
+            }
             let response = router
                 .route_transparent(
                     Some(&headers),
@@ -3446,17 +3622,21 @@ mod tests {
                 )
                 .await;
             let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
             if status == StatusCode::OK {
-                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-                    .await
-                    .unwrap();
                 let json: Value = serde_json::from_slice(&bytes).unwrap();
                 for t in json["choices"][0]["token_ids"].as_array().unwrap() {
                     self.tokens.push(t.as_i64().unwrap());
                 }
                 self.tokens.extend([7, 8, 9]); // tool output for the next turn
             }
-            status
+            (status, String::from_utf8_lossy(&bytes).into_owned())
+        }
+
+        async fn turn(&mut self, router: &VllmPDRouter) -> StatusCode {
+            self.send(router).await.0
         }
     }
 
@@ -3520,6 +3700,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_bidirectional_kv_requires_same_model_and_cache_salt() {
+        // The same tokens have different KV under another LoRA adapter (model)
+        // or prefix-cache salt.
+        let mock = BidirMock::start().await;
+        let router = mock.router(true, 0).await;
+        let mut s1 = TokenSession::new("s1");
+        s1.extra = json!({"model": "m", "cache_salt": "v1"});
+        assert_eq!(s1.turn(&router).await, StatusCode::OK); // d-1
+        s1.extra = json!({"model": "m", "cache_salt": "v2"});
+        assert_eq!(s1.turn(&router).await, StatusCode::OK); // d-2, salt changed
+        assert_eq!(s1.turn(&router).await, StatusCode::OK); // d-3
+        s1.extra = json!({"model": "lora-a", "cache_salt": "v2"});
+        assert_eq!(s1.turn(&router).await, StatusCode::OK); // d-4, model changed
+        s1.extra = json!({"model": "lora-a", "cache_salt": null});
+        assert_eq!(s1.turn(&router).await, StatusCode::OK); // d-5, salt removed
+        s1.extra = json!({"model": "lora-a"});
+        assert_eq!(s1.turn(&router).await, StatusCode::OK); // absent == null
+        let p = mock.prefill_params();
+        assert_cold(&p[1]);
+        assert_reads(&p[2], "d-2");
+        assert_cold(&p[3]);
+        assert_cold(&p[4]);
+        assert_reads(&p[5], "d-5");
+    }
+
+    #[tokio::test]
+    async fn test_bidirectional_kv_skips_multimodal_requests() {
+        // With features/content_parts, identical placeholder tokens can carry
+        // different images: such turns neither use nor capture a handle.
+        let mock = BidirMock::start().await;
+        let router = mock.router(true, 0).await;
+        let mut s1 = TokenSession::new("s1");
+        assert_eq!(s1.turn(&router).await, StatusCode::OK); // d-1, captured
+        s1.extra = json!({"model": "m", "features": {"mm_hashes": ["img-a"]}});
+        assert_eq!(s1.turn(&router).await, StatusCode::OK); // d-2, not captured
+        s1.extra = json!({"model": "m"});
+        assert_eq!(s1.turn(&router).await, StatusCode::OK); // d-3, captured
+        s1.extra = json!({"model": "m", "content_parts": [{"type": "image_url"}]});
+        assert_eq!(s1.turn(&router).await, StatusCode::OK); // drops d-3's handle
+        s1.extra = json!({"model": "m", "features": null, "content_parts": []});
+        assert_eq!(s1.turn(&router).await, StatusCode::OK); // empty: eligible again
+        assert_eq!(s1.turn(&router).await, StatusCode::OK);
+        let p = mock.prefill_params();
+        assert_cold(&p[1]); // multimodal turn does not read d-1
+        assert_cold(&p[2]); // and did not leave a handle behind
+        assert_cold(&p[3]); // multimodal turn does not read d-3
+        assert_cold(&p[4]); // d-3's handle was dropped, not kept for later
+        assert_reads(&p[5], "d-5");
+    }
+
+    #[tokio::test]
     async fn test_bidirectional_kv_only_for_token_in_session_turns() {
         let mock = BidirMock::start().await;
         let router = mock.router(true, 0).await;
@@ -3570,13 +3801,21 @@ mod tests {
         let router = mock.router(true, 0).await;
         let mut s1 = TokenSession::new("s1");
         assert_eq!(s1.turn(&router).await, StatusCode::OK);
-        mock.fail_prefill.store(1, Ordering::SeqCst);
-        assert_ne!(s1.turn(&router).await, StatusCode::OK);
+        mock.fail_prefill(&[MockFailure::Status(500)]);
+        let (status, body) = s1.send(&router).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            body.contains("mock 500"),
+            "prefill's error is returned: {}",
+            body
+        );
         assert_eq!(s1.turn(&router).await, StatusCode::OK);
         let p = mock.prefill_params();
         assert_eq!(p.len(), 3);
         assert_reads(&p[1], "d-1");
         assert_cold(&p[2]);
+        // the failed prefill never reached decode
+        assert_eq!(mock.decode_params().len(), 2);
     }
 
     #[tokio::test]
@@ -3585,7 +3824,7 @@ mod tests {
         let router = mock.router(true, 2).await;
         let mut s1 = TokenSession::new("s1");
         assert_eq!(s1.turn(&router).await, StatusCode::OK);
-        mock.fail_prefill.store(1, Ordering::SeqCst);
+        mock.fail_prefill(&[MockFailure::Status(503)]);
         assert_eq!(s1.turn(&router).await, StatusCode::OK);
         let p = mock.prefill_params();
         assert_eq!(p.len(), 3);
@@ -3602,10 +3841,82 @@ mod tests {
     async fn test_turn_retries_are_bounded() {
         let mock = BidirMock::start().await;
         let router = mock.router(false, 1).await;
-        mock.fail_prefill.store(5, Ordering::SeqCst);
-        assert_ne!(TokenSession::new("s1").turn(&router).await, StatusCode::OK);
+        mock.fail_prefill(&[MockFailure::Status(503); 5]);
+        let (status, _) = TokenSession::new("s1").send(&router).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(mock.prefill_params().len(), 2);
         assert!(mock.decode_params().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_prefill_client_error_is_returned_not_retried_or_decoded() {
+        for bidirectional in [false, true] {
+            let mock = BidirMock::start().await;
+            let router = mock.router(bidirectional, 2).await;
+            mock.fail_prefill(&[MockFailure::Status(400)]);
+            let (status, body) = TokenSession::new("s1").send(&router).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert!(body.contains("mock 400"), "{}", body);
+            assert_eq!(mock.prefill_params().len(), 1);
+            assert!(mock.decode_params().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_prefill_server_error_without_retries_skips_decode() {
+        // Before: decode ran without kv_transfer_params and redid the full prefill.
+        let mock = BidirMock::start().await;
+        let router = mock.router(false, 0).await;
+        mock.fail_prefill(&[MockFailure::Status(503)]);
+        let (status, body) = TokenSession::new("s1").send(&router).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(body.contains("mock 503"), "{}", body);
+        assert!(mock.decode_params().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_prefill_non_json_body_is_fatal() {
+        let mock = BidirMock::start().await;
+        let router = mock.router(true, 2).await;
+        mock.fail_prefill(&[MockFailure::NonJson]);
+        let (status, _) = TokenSession::new("s1").send(&router).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(mock.prefill_params().len(), 1);
+        assert!(mock.decode_params().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_decode_server_error_retries_whole_turn() {
+        let mock = BidirMock::start().await;
+        let router = mock.router(true, 1).await;
+        let mut s1 = TokenSession::new("s1");
+        assert_eq!(s1.turn(&router).await, StatusCode::OK); // d-1
+        mock.fail_decode(&[MockFailure::Status(502)]);
+        assert_eq!(s1.turn(&router).await, StatusCode::OK);
+        let p = mock.prefill_params();
+        assert_eq!(p.len(), 3);
+        assert_reads(&p[1], "d-1");
+        assert_cold(&p[2]); // fresh prefill, no handle
+        assert_eq!(mock.decode_params().len(), 3);
+
+        // without retries, decode's 5xx goes back to the client as-is
+        let router = mock.router(true, 0).await;
+        mock.fail_decode(&[MockFailure::Status(502)]);
+        let (status, body) = TokenSession::new("s2").send(&router).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert!(body.contains("mock 502"), "{}", body);
+    }
+
+    #[tokio::test]
+    async fn test_decode_client_error_is_returned_not_retried() {
+        let mock = BidirMock::start().await;
+        let router = mock.router(true, 2).await;
+        mock.fail_decode(&[MockFailure::Status(422)]);
+        let (status, body) = TokenSession::new("s1").send(&router).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(body.contains("mock 422"), "{}", body);
+        assert_eq!(mock.prefill_params().len(), 1);
+        assert_eq!(mock.decode_params().len(), 1);
     }
 
     #[tokio::test]

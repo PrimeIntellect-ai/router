@@ -19,6 +19,11 @@
 //!   the router checks with a fingerprint of those token ids. This needs token-in
 //!   requests (`/inference/v1/generate`); text requests are re-tokenized and chat
 //!   templates often re-render history, so they never use handles.
+//! * **Same request context.** The KV also depends on inputs beyond the token
+//!   ids: the served model (which selects a LoRA adapter) and the prefix-cache
+//!   salt are part of the handle's fingerprint, and multimodal requests
+//!   (`features`, `content_parts`: identical placeholder tokens can carry
+//!   different images) never capture or use a handle.
 //! * **Single use.** The owner frees the blocks as soon as the reader reports the
 //!   read, so a second read of the same handle (a retried turn, a client retry
 //!   after an error, two in-flight requests of one session) returns freed memory
@@ -44,6 +49,8 @@ pub enum HandleLookup {
     Expired,
     /// A handle was cached but the prompt does not start with its tokens; dropped.
     PrefixMismatch,
+    /// A handle was cached for a different model or cache salt; dropped.
+    RequestMismatch,
 }
 
 impl HandleLookup {
@@ -53,6 +60,7 @@ impl HandleLookup {
             HandleLookup::Miss => "none",
             HandleLookup::Expired => "expired",
             HandleLookup::PrefixMismatch => "prefix_mismatch",
+            HandleLookup::RequestMismatch => "request_mismatch",
         }
     }
 }
@@ -87,6 +95,37 @@ impl TokenPrefix {
     }
 }
 
+/// Fingerprint of the request inputs besides the token ids that change the KV
+/// of the same tokens: `model` (selects a LoRA adapter) and `cache_salt`
+/// (prefix-cache isolation). Absent and `null` are the same.
+pub fn request_key(request: &Value) -> u64 {
+    let field = |name: &str| {
+        request
+            .get(name)
+            .filter(|v| !v.is_null())
+            .map(Value::to_string)
+    };
+    let mut h = DefaultHasher::new();
+    field("model").hash(&mut h);
+    field("cache_salt").hash(&mut h);
+    h.finish()
+}
+
+/// Whether the request carries multimodal inputs (`features` or
+/// `content_parts`). Identical placeholder tokens can then stand for different
+/// images, so the token ids do not determine the KV and handles are not used.
+pub fn has_multimodal_inputs(request: &Value) -> bool {
+    ["features", "content_parts"]
+        .iter()
+        .any(|name| match request.get(*name) {
+            None | Some(Value::Null) => false,
+            Some(Value::Array(a)) => !a.is_empty(),
+            Some(Value::Object(o)) => !o.is_empty(),
+            Some(Value::String(s)) => !s.is_empty(),
+            Some(_) => true,
+        })
+}
+
 fn hash_tokens(tokens: &[i64]) -> u64 {
     let mut h = DefaultHasher::new();
     tokens.hash(&mut h);
@@ -97,6 +136,7 @@ fn hash_tokens(tokens: &[i64]) -> u64 {
 struct Entry {
     params: Value,
     prefix: TokenPrefix,
+    request_key: u64,
     stored_at: Instant,
 }
 
@@ -120,16 +160,23 @@ impl BidirectionalKvCache {
         }
     }
 
-    /// Remove the session's handle and return it if it is within the TTL and
-    /// `prompt` starts with the tokens it covers. The entry is removed in every
-    /// case, so a handle is never handed out twice.
-    pub fn take(&self, session_id: &str, prompt: &[i64]) -> (Option<Value>, HandleLookup) {
-        self.take_at(session_id, prompt, Instant::now())
+    /// Remove the session's handle and return it if it is within the TTL, was
+    /// captured with the same [`request_key`], and `prompt` starts with the
+    /// tokens it covers. The entry is removed in every case, so a handle is never
+    /// handed out twice.
+    pub fn take(
+        &self,
+        session_id: &str,
+        request_key: u64,
+        prompt: &[i64],
+    ) -> (Option<Value>, HandleLookup) {
+        self.take_at(session_id, request_key, prompt, Instant::now())
     }
 
     fn take_at(
         &self,
         session_id: &str,
+        request_key: u64,
         prompt: &[i64],
         now: Instant,
     ) -> (Option<Value>, HandleLookup) {
@@ -138,6 +185,8 @@ impl BidirectionalKvCache {
         };
         if now.saturating_duration_since(e.stored_at) > self.ttl {
             (None, HandleLookup::Expired)
+        } else if e.request_key != request_key {
+            (None, HandleLookup::RequestMismatch)
         } else if !e.prefix.is_prefix_of(prompt) {
             (None, HandleLookup::PrefixMismatch)
         } else {
@@ -147,11 +196,24 @@ impl BidirectionalKvCache {
 
     /// Store the handle decode returned for the session's next turn, replacing
     /// any older one. Returns `false` when the cache is full of live entries.
-    pub fn put(&self, session_id: &str, params: Value, prefix: TokenPrefix) -> bool {
-        self.put_at(session_id, params, prefix, Instant::now())
+    pub fn put(
+        &self,
+        session_id: &str,
+        params: Value,
+        prefix: TokenPrefix,
+        request_key: u64,
+    ) -> bool {
+        self.put_at(session_id, params, prefix, request_key, Instant::now())
     }
 
-    fn put_at(&self, session_id: &str, params: Value, prefix: TokenPrefix, now: Instant) -> bool {
+    fn put_at(
+        &self,
+        session_id: &str,
+        params: Value,
+        prefix: TokenPrefix,
+        request_key: u64,
+        now: Instant,
+    ) -> bool {
         let mut entries = self.entries.lock();
         if entries.len() >= self.max_sessions && !entries.contains_key(session_id) {
             let ttl = self.ttl;
@@ -165,6 +227,7 @@ impl BidirectionalKvCache {
             Entry {
                 params,
                 prefix,
+                request_key,
                 stored_at: now,
             },
         );
@@ -324,6 +387,8 @@ mod tests {
     const PREV: [i64; 5] = [1, 2, 3, 4, 5];
     const NEXT: [i64; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
 
+    const KEY: u64 = 7;
+
     fn prefix() -> TokenPrefix {
         TokenPrefix::of(&PREV)
     }
@@ -331,13 +396,13 @@ mod tests {
     #[test]
     fn take_is_single_use() {
         let cache = BidirectionalKvCache::new(Duration::from_secs(450), 16);
-        assert!(cache.put("s", handle("10.0.0.2"), prefix()));
-        let (first, lookup) = cache.take("s", &NEXT);
+        assert!(cache.put("s", handle("10.0.0.2"), prefix(), KEY));
+        let (first, lookup) = cache.take("s", KEY, &NEXT);
         assert_eq!(lookup, HandleLookup::Hit);
         assert_eq!(first.unwrap()["remote_request_id"], "req-1");
         // A retry of the same turn, or a concurrent request of the session, must not
         // get the same handle again: decode already freed those blocks.
-        let (second, lookup) = cache.take("s", &NEXT);
+        let (second, lookup) = cache.take("s", KEY, &NEXT);
         assert!(second.is_none());
         assert_eq!(lookup, HandleLookup::Miss);
         assert!(cache.is_empty());
@@ -347,26 +412,84 @@ mod tests {
     fn handle_needs_exact_token_prefix() {
         let cache = BidirectionalKvCache::new(Duration::from_secs(450), 16);
         // history re-rendered differently: same length, different tokens
-        cache.put("s", handle("h"), prefix());
-        let (h, lookup) = cache.take("s", &[1, 2, 9, 4, 5, 6]);
+        cache.put("s", handle("h"), prefix(), KEY);
+        let (h, lookup) = cache.take("s", KEY, &[1, 2, 9, 4, 5, 6]);
         assert!(h.is_none());
         assert_eq!(lookup, HandleLookup::PrefixMismatch);
         assert!(cache.is_empty(), "a mismatched handle is dropped too");
         // prompt not longer than the covered tokens: prefill would have nothing to compute
-        cache.put("s", handle("h"), prefix());
-        assert_eq!(cache.take("s", &PREV).1, HandleLookup::PrefixMismatch);
-        cache.put("s", handle("h"), prefix());
-        assert_eq!(cache.take("s", &[1, 2, 3]).1, HandleLookup::PrefixMismatch);
-        cache.put("s", handle("h"), prefix());
-        assert_eq!(cache.take("s", &[1, 2, 3, 4, 5, 0]).1, HandleLookup::Hit);
+        cache.put("s", handle("h"), prefix(), KEY);
+        assert_eq!(cache.take("s", KEY, &PREV).1, HandleLookup::PrefixMismatch);
+        cache.put("s", handle("h"), prefix(), KEY);
+        assert_eq!(
+            cache.take("s", KEY, &[1, 2, 3]).1,
+            HandleLookup::PrefixMismatch
+        );
+        cache.put("s", handle("h"), prefix(), KEY);
+        assert_eq!(
+            cache.take("s", KEY, &[1, 2, 3, 4, 5, 0]).1,
+            HandleLookup::Hit
+        );
+    }
+
+    #[test]
+    fn handle_needs_same_request_key() {
+        let cache = BidirectionalKvCache::new(Duration::from_secs(450), 16);
+        cache.put("s", handle("h"), prefix(), KEY);
+        let (h, lookup) = cache.take("s", KEY + 1, &NEXT);
+        assert!(h.is_none());
+        assert_eq!(lookup, HandleLookup::RequestMismatch);
+        assert!(cache.is_empty(), "a mismatched handle is dropped too");
+    }
+
+    #[test]
+    fn request_key_covers_model_and_cache_salt() {
+        let key = |v: Value| request_key(&v);
+        let base = key(json!({"token_ids": [1], "model": "m", "cache_salt": "v1"}));
+        assert_eq!(
+            base,
+            key(json!({"model": "m", "cache_salt": "v1", "token_ids": [2]}))
+        );
+        assert_ne!(base, key(json!({"model": "m", "cache_salt": "v2"})));
+        assert_ne!(base, key(json!({"model": "lora-a", "cache_salt": "v1"})));
+        assert_ne!(base, key(json!({"model": "m"})));
+        // absent and null are the same
+        assert_eq!(
+            key(json!({})),
+            key(json!({"model": null, "cache_salt": null}))
+        );
+        assert_eq!(
+            key(json!({"model": "m"})),
+            key(json!({"model": "m", "cache_salt": null}))
+        );
+        // salt and model values do not collide across fields
+        assert_ne!(key(json!({"model": "x"})), key(json!({"cache_salt": "x"})));
+    }
+
+    #[test]
+    fn multimodal_inputs_detected() {
+        assert!(!has_multimodal_inputs(&json!({"token_ids": [1]})));
+        for empty in [json!(null), json!([]), json!({}), json!("")] {
+            assert!(!has_multimodal_inputs(&json!({"features": empty.clone()})));
+            assert!(!has_multimodal_inputs(&json!({"content_parts": empty})));
+        }
+        assert!(has_multimodal_inputs(
+            &json!({"features": {"mm_hashes": ["a"]}})
+        ));
+        assert!(has_multimodal_inputs(
+            &json!({"features": [{"kind": "image"}]})
+        ));
+        assert!(has_multimodal_inputs(
+            &json!({"content_parts": [{"type": "image_url"}]})
+        ));
     }
 
     #[test]
     fn expired_handles_are_dropped_not_returned() {
         let cache = BidirectionalKvCache::new(Duration::from_secs(10), 16);
         let t0 = Instant::now();
-        assert!(cache.put_at("s", handle("10.0.0.2"), prefix(), t0));
-        let (h, lookup) = cache.take_at("s", &NEXT, t0 + Duration::from_secs(11));
+        assert!(cache.put_at("s", handle("10.0.0.2"), prefix(), KEY, t0));
+        let (h, lookup) = cache.take_at("s", KEY, &NEXT, t0 + Duration::from_secs(11));
         assert!(h.is_none());
         assert_eq!(lookup, HandleLookup::Expired);
         assert!(cache.is_empty());
@@ -376,14 +499,14 @@ mod tests {
     fn put_replaces_and_sweep_expires() {
         let cache = BidirectionalKvCache::new(Duration::from_secs(10), 16);
         let t0 = Instant::now();
-        cache.put_at("a", handle("10.0.0.2"), prefix(), t0);
+        cache.put_at("a", handle("10.0.0.2"), prefix(), KEY, t0);
         let mut newer = handle("10.0.0.2");
         newer["remote_request_id"] = json!("req-2");
-        cache.put_at("a", newer, prefix(), t0 + Duration::from_secs(5));
-        cache.put_at("b", handle("10.0.0.3"), prefix(), t0);
+        cache.put_at("a", newer, prefix(), KEY, t0 + Duration::from_secs(5));
+        cache.put_at("b", handle("10.0.0.3"), prefix(), KEY, t0);
         assert_eq!(cache.len(), 2);
         assert_eq!(cache.sweep_at(t0 + Duration::from_secs(12)), 1);
-        let (h, _) = cache.take_at("a", &NEXT, t0 + Duration::from_secs(12));
+        let (h, _) = cache.take_at("a", KEY, &NEXT, t0 + Duration::from_secs(12));
         assert_eq!(h.unwrap()["remote_request_id"], "req-2");
     }
 
@@ -391,14 +514,32 @@ mod tests {
     fn full_cache_evicts_expired_then_refuses() {
         let cache = BidirectionalKvCache::new(Duration::from_secs(10), 2);
         let t0 = Instant::now();
-        assert!(cache.put_at("a", handle("h"), prefix(), t0));
-        assert!(cache.put_at("b", handle("h"), prefix(), t0 + Duration::from_secs(5)));
+        assert!(cache.put_at("a", handle("h"), prefix(), KEY, t0));
+        assert!(cache.put_at("b", handle("h"), prefix(), KEY, t0 + Duration::from_secs(5)));
         // "a" is expired at t0+11 and makes room.
-        assert!(cache.put_at("c", handle("h"), prefix(), t0 + Duration::from_secs(11)));
+        assert!(cache.put_at(
+            "c",
+            handle("h"),
+            prefix(),
+            KEY,
+            t0 + Duration::from_secs(11)
+        ));
         // Both remaining entries are live: refuse rather than evict a live handle.
-        assert!(!cache.put_at("d", handle("h"), prefix(), t0 + Duration::from_secs(12)));
+        assert!(!cache.put_at(
+            "d",
+            handle("h"),
+            prefix(),
+            KEY,
+            t0 + Duration::from_secs(12)
+        ));
         // Replacing an existing session's handle is always allowed.
-        assert!(cache.put_at("b", handle("h"), prefix(), t0 + Duration::from_secs(12)));
+        assert!(cache.put_at(
+            "b",
+            handle("h"),
+            prefix(),
+            KEY,
+            t0 + Duration::from_secs(12)
+        ));
         assert!(cache.remove("c"));
         assert!(!cache.remove("c"));
     }
