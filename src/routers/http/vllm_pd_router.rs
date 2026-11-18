@@ -1664,6 +1664,7 @@ impl VllmPDRouter {
                 RouterMetrics::record_pd_prefill_error(&prefill_base_url);
                 RouterMetrics::record_pd_request(path);
                 RouterMetrics::record_pd_request_duration(path, duration);
+                self.stop_profiling(&prefill_base_url).await;
                 return Err(TurnError::retryable(PDRouterError::NetworkError {
                     message: format!("Prefill request failed to {}: {}", prefill_url, full_error),
                 }));
@@ -1685,6 +1686,7 @@ impl VllmPDRouter {
                 RouterMetrics::record_pd_prefill_error(&prefill_base_url);
                 RouterMetrics::record_pd_request(path);
                 RouterMetrics::record_pd_request_duration(path, duration);
+                self.stop_profiling(&prefill_base_url).await;
                 return Err(TurnError::retryable(PDRouterError::NetworkError {
                     message: format!(
                         "Failed to read prefill response from {}: {}",
@@ -1717,6 +1719,7 @@ impl VllmPDRouter {
                 "Prefill {} returned {}; not sending the turn to decode",
                 prefill_url, prefill_status
             );
+            self.stop_profiling(&prefill_base_url).await;
             return Err(TurnError::upstream(upstream_response(
                 prefill_status,
                 &prefill_headers,
@@ -1734,6 +1737,7 @@ impl VllmPDRouter {
                 RouterMetrics::record_pd_prefill_error(&prefill_base_url);
                 RouterMetrics::record_pd_request(path);
                 RouterMetrics::record_pd_request_duration(path, duration);
+                self.stop_profiling(&prefill_base_url).await;
                 return Err(TurnError::fatal(PDRouterError::NetworkError {
                     message: format!("Failed to parse prefill response as JSON: {}", e),
                 }));
@@ -1865,6 +1869,7 @@ impl VllmPDRouter {
                 RouterMetrics::record_pd_request(path);
                 RouterMetrics::record_pd_request_duration(path, duration);
                 RouterMetrics::record_pd_prefill_request(&prefill_base_url);
+                self.stop_profiling(&decode_base_url).await;
                 return Err(TurnError::retryable(PDRouterError::NetworkError {
                     message: format!("Decode request failed to {}: {}", decode_url, full_error),
                 }));
@@ -3436,6 +3441,8 @@ mod tests {
         decode_params: Arc<std::sync::Mutex<Vec<Value>>>,
         prefill_failures: FailureQueue,
         decode_failures: FailureQueue,
+        /// "<role>:start" / "<role>:stop" for each profiling call the router makes.
+        profile_calls: Arc<std::sync::Mutex<Vec<String>>>,
         servers: Vec<tokio::task::JoinHandle<()>>,
     }
 
@@ -3446,6 +3453,18 @@ mod tests {
             let prefill_failures: FailureQueue = Default::default();
             let decode_failures: FailureQueue = Default::default();
             let decode_calls = Arc::new(AtomicUsize::new(0));
+            let profile_calls: Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+            let profile_route = |calls: &Arc<std::sync::Mutex<Vec<String>>>,
+                                 event: &'static str| {
+                let calls = calls.clone();
+                axum::routing::post(move || {
+                    let calls = calls.clone();
+                    async move {
+                        calls.lock().unwrap().push(event.to_string());
+                        "ok"
+                    }
+                })
+            };
 
             let (pp, pf) = (prefill_params.clone(), prefill_failures.clone());
             let prefill = move |axum::Json(body): axum::Json<Value>| {
@@ -3501,12 +3520,28 @@ mod tests {
                 axum::Router::new()
                     .route("/health", axum::routing::get(|| async { "ok" }))
                     .route(
+                        "/start_profile",
+                        profile_route(&profile_calls, "prefill:start"),
+                    )
+                    .route(
+                        "/stop_profile",
+                        profile_route(&profile_calls, "prefill:stop"),
+                    )
+                    .route(
                         "/inference/v1/generate",
                         axum::routing::post(prefill.clone()),
                     )
                     .route("/v1/completions", axum::routing::post(prefill)),
                 axum::Router::new()
                     .route("/health", axum::routing::get(|| async { "ok" }))
+                    .route(
+                        "/start_profile",
+                        profile_route(&profile_calls, "decode:start"),
+                    )
+                    .route(
+                        "/stop_profile",
+                        profile_route(&profile_calls, "decode:stop"),
+                    )
                     .route(
                         "/inference/v1/generate",
                         axum::routing::post(decode.clone()),
@@ -3526,11 +3561,21 @@ mod tests {
                 decode_params,
                 prefill_failures,
                 decode_failures,
+                profile_calls,
                 servers,
             }
         }
 
         async fn router(&self, bidirectional: bool, turn_retries: u32) -> VllmPDRouter {
+            self.router_with(bidirectional, turn_retries, false).await
+        }
+
+        async fn router_with(
+            &self,
+            bidirectional: bool,
+            turn_retries: u32,
+            profiling: bool,
+        ) -> VllmPDRouter {
             use crate::config::{PdBidirectionalKvConfig, RouterConfig};
             use crate::policies::ConsistentHashPolicy;
             use crate::server::AppContext;
@@ -3540,6 +3585,7 @@ mod tests {
                     ..Default::default()
                 },
                 pd_turn_retries: turn_retries,
+                enable_profiling: profiling,
                 ..Default::default()
             };
             let context = Arc::new(
@@ -3575,6 +3621,10 @@ mod tests {
 
         fn decode_params(&self) -> Vec<Value> {
             self.decode_params.lock().unwrap().clone()
+        }
+
+        fn profile_calls(&self) -> Vec<String> {
+            self.profile_calls.lock().unwrap().clone()
         }
     }
 
@@ -3859,6 +3909,24 @@ mod tests {
             assert!(body.contains("mock 400"), "{}", body);
             assert_eq!(mock.prefill_params().len(), 1);
             assert!(mock.decode_params().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_failed_prefill_stops_profiling() {
+        // Profiling must not keep running until its timeout and capture the retry delay
+        // and the next attempt.
+        for failure in [
+            MockFailure::Status(400),
+            MockFailure::Status(503),
+            MockFailure::NonJson,
+        ] {
+            let mock = BidirMock::start().await;
+            let router = mock.router_with(true, 0, true).await;
+            mock.fail_prefill(&[failure]);
+            let (status, _) = TokenSession::new("s1").send(&router).await;
+            assert!(!status.is_success());
+            assert_eq!(mock.profile_calls(), vec!["prefill:start", "prefill:stop"]);
         }
     }
 
