@@ -160,6 +160,10 @@ pub trait RouterTrait: Send + Sync + Debug + WorkerManagement {
     /// Get router type name
     fn router_type(&self) -> &'static str;
 
+    /// A session (e.g. an RL trajectory) finished: drop per-session router state.
+    /// Policies are notified separately through the policy registry.
+    fn finish_session(&self, _session_id: &str) {}
+
     /// Check if this is a PD router
     fn is_pd_mode(&self) -> bool {
         self.router_type() == "pd"
