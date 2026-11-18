@@ -344,6 +344,26 @@ struct CliArgs {
     /// KV connector type for PD disaggregation (nixl or mooncake)
     #[arg(long, value_enum, default_value_t = KvConnector::Nixl)]
     kv_connector: KvConnector,
+
+    /// Bidirectional KV transfer in vLLM PD mode (NIXL): on a session's next
+    /// token-in turn (/inference/v1/generate), give prefill the decode blocks of the
+    /// previous turn instead of recomputing them. Each handle is used once, and only
+    /// when the new prompt starts with exactly the tokens it covers. Decode engines
+    /// need NIXL kv_connector_extra_config.bidirectional_kv_xfer=true.
+    #[arg(long, default_value_t = false)]
+    pd_bidirectional_kv: bool,
+
+    /// Seconds a decode handle stays usable; keep below the decode engines' decoder_kv_blocks_ttl
+    #[arg(long, default_value_t = 450)]
+    pd_bidirectional_ttl_secs: u64,
+
+    /// Maximum number of sessions with a cached decode handle
+    #[arg(long, default_value_t = 1_000_000)]
+    pd_bidirectional_max_sessions: usize,
+
+    /// Whole-turn retries (fresh prefill, then decode) after a connection error in vLLM PD mode
+    #[arg(long, default_value_t = 0)]
+    pd_turn_retries: u32,
 }
 
 impl CliArgs {
@@ -585,6 +605,12 @@ impl CliArgs {
             enable_profiling: self.profile,
             profile_timeout_secs: 10, // Default profiling timeout
             kv_connector: self.kv_connector,
+            pd_bidirectional_kv: vllm_router_rs::config::PdBidirectionalKvConfig {
+                enabled: self.pd_bidirectional_kv,
+                ttl_secs: self.pd_bidirectional_ttl_secs,
+                max_sessions: self.pd_bidirectional_max_sessions,
+            },
+            pd_turn_retries: self.pd_turn_retries,
         })
     }
 

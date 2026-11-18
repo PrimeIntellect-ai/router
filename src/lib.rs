@@ -99,6 +99,11 @@ struct Router {
     otlp_traces_endpoint: Option<String>,
     // KV connector for PD disaggregation ("nixl" or "mooncake")
     kv_connector: String,
+    // Bidirectional KV transfer between turns (vLLM PD, NIXL)
+    pd_bidirectional_kv: bool,
+    pd_bidirectional_ttl_secs: u64,
+    pd_bidirectional_max_sessions: usize,
+    pd_turn_retries: u32,
 }
 
 impl Router {
@@ -241,6 +246,12 @@ impl Router {
                     });
                 }
             },
+            pd_bidirectional_kv: config::PdBidirectionalKvConfig {
+                enabled: self.pd_bidirectional_kv,
+                ttl_secs: self.pd_bidirectional_ttl_secs,
+                max_sessions: self.pd_bidirectional_max_sessions,
+            },
+            pd_turn_retries: self.pd_turn_retries,
         })
     }
 }
@@ -314,6 +325,11 @@ impl Router {
         otlp_traces_endpoint = None,
         // KV connector default (PD disaggregation)
         kv_connector = String::from("nixl"),
+        // Bidirectional KV transfer defaults (vLLM PD, NIXL)
+        pd_bidirectional_kv = false,
+        pd_bidirectional_ttl_secs = 450,
+        pd_bidirectional_max_sessions = 1_000_000,
+        pd_turn_retries = 0,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -376,6 +392,10 @@ impl Router {
         enable_trace: bool,
         otlp_traces_endpoint: Option<String>,
         kv_connector: String,
+        pd_bidirectional_kv: bool,
+        pd_bidirectional_ttl_secs: u64,
+        pd_bidirectional_max_sessions: usize,
+        pd_turn_retries: u32,
     ) -> PyResult<Self> {
         Ok(Router {
             host,
@@ -437,6 +457,10 @@ impl Router {
             enable_trace,
             otlp_traces_endpoint,
             kv_connector,
+            pd_bidirectional_kv,
+            pd_bidirectional_ttl_secs,
+            pd_bidirectional_max_sessions,
+            pd_turn_retries,
         })
     }
 

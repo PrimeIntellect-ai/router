@@ -83,10 +83,56 @@ pub struct RouterConfig {
     /// KV connector type for PD disaggregation
     #[serde(default)]
     pub kv_connector: KvConnector,
+    /// Bidirectional KV transfer between turns of a session (vLLM PD, NIXL)
+    #[serde(default)]
+    pub pd_bidirectional_kv: PdBidirectionalKvConfig,
+    /// Whole-turn retries (prefill and decode) after a connection error in vLLM PD mode
+    #[serde(default)]
+    pub pd_turn_retries: u32,
 }
 
 fn default_profile_timeout_secs() -> u64 {
     10
+}
+
+/// Bidirectional KV transfer for multi-turn sessions in vLLM PD mode (NIXL).
+///
+/// Decode engines started with NIXL `bidirectional_kv_xfer=true` keep a finished
+/// turn's blocks and return a handle to them. The router keeps that handle per
+/// session (keyed like `/finish_session`: x-session-id and the other session
+/// headers or body fields) and gives it to prefill on the session's next token-in
+/// turn (`/inference/v1/generate`), so prefill reads the previous turn's KV from
+/// decode instead of recomputing it. Each handle is used at most once, and only
+/// when the new prompt starts with exactly the tokens it covers.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PdBidirectionalKvConfig {
+    /// Enable the per-session decode-handle cache
+    #[serde(default)]
+    pub enabled: bool,
+    /// Seconds a handle stays usable; keep below the decode engines' `decoder_kv_blocks_ttl`
+    #[serde(default = "default_pd_bidirectional_ttl_secs")]
+    pub ttl_secs: u64,
+    /// Maximum number of cached sessions
+    #[serde(default = "default_pd_bidirectional_max_sessions")]
+    pub max_sessions: usize,
+}
+
+fn default_pd_bidirectional_ttl_secs() -> u64 {
+    450
+}
+
+fn default_pd_bidirectional_max_sessions() -> usize {
+    1_000_000
+}
+
+impl Default for PdBidirectionalKvConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            ttl_secs: default_pd_bidirectional_ttl_secs(),
+            max_sessions: default_pd_bidirectional_max_sessions(),
+        }
+    }
 }
 
 fn default_history_backend() -> HistoryBackend {
@@ -492,6 +538,8 @@ impl Default for RouterConfig {
             enable_profiling: false,
             profile_timeout_secs: default_profile_timeout_secs(),
             kv_connector: KvConnector::default(),
+            pd_bidirectional_kv: Default::default(),
+            pd_turn_retries: 0,
         }
     }
 }
@@ -1067,6 +1115,8 @@ mod tests {
             enable_profiling: false,
             profile_timeout_secs: default_profile_timeout_secs(),
             kv_connector: KvConnector::default(),
+            pd_bidirectional_kv: Default::default(),
+            pd_turn_retries: 0,
         };
 
         assert!(config.mode.is_pd_mode());
@@ -1134,6 +1184,8 @@ mod tests {
             enable_profiling: false,
             profile_timeout_secs: default_profile_timeout_secs(),
             kv_connector: KvConnector::default(),
+            pd_bidirectional_kv: Default::default(),
+            pd_turn_retries: 0,
         };
 
         assert!(!config.mode.is_pd_mode());
@@ -1197,6 +1249,8 @@ mod tests {
             enable_profiling: false,
             profile_timeout_secs: default_profile_timeout_secs(),
             kv_connector: KvConnector::default(),
+            pd_bidirectional_kv: Default::default(),
+            pd_turn_retries: 0,
         };
 
         assert!(config.has_service_discovery());
