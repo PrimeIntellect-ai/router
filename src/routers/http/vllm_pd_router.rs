@@ -2,7 +2,7 @@
 // This module extends PdRouterBase to handle vLLM-specific two-stage processing
 use super::dp_utils;
 use super::logprobs_merge;
-use super::pd_bidirectional::{self, BidirectionalKvCache, HandleLookup};
+use super::pd_bidirectional::{self, BidirectionalKvCache, HandleLookup, TokenIds};
 use super::pd_router::PdRouterBase;
 use super::pd_types::{error_chain, PDRouterError};
 use super::routed_experts_merge;
@@ -158,10 +158,90 @@ struct BidirectionalTurn {
     session: String,
     /// Whether the turn may capture or use a handle (false for multimodal requests)
     eligible: bool,
-    /// The turn's prompt token ids, to fingerprint what decode keeps for the next turn
-    prompt: Vec<i64>,
+    /// The turn's prompt token ids, to fingerprint what decode keeps for the next
+    /// turn (shared with the turn's [`TurnRequest`]; empty for ineligible turns)
+    prompt: Arc<TokenIds>,
     /// Fingerprint of the other inputs that change the KV (model, cache salt)
     request_key: u64,
+}
+
+/// Top-level request field holding the prompt of a token-in request.
+const TOKEN_IDS_FIELD: &str = "token_ids";
+
+/// A client request as one P/D turn holds it, for all of its attempts.
+///
+/// A 100k-token prompt takes ~3.2 MB as a JSON `Value` (32 bytes per token), and
+/// a turn used to keep several copies of it alive while decode was generating.
+/// Here the token ids are taken out of the request once and kept as plain
+/// integers; `request` is what is left (the same object with `null` in place of
+/// `token_ids`, so the key keeps its position). The bodies for prefill and
+/// decode are serialized from both and are byte-identical to serializing the
+/// original `Value`.
+struct TurnRequest {
+    /// The request, without its token ids when `token_ids` is set.
+    request: Value,
+    /// Top-level `token_ids`, if it was an array of integers.
+    token_ids: Option<Arc<TokenIds>>,
+}
+
+impl TurnRequest {
+    fn new(mut request: Value) -> Self {
+        let token_ids = request
+            .as_object_mut()
+            .and_then(|object| object.get_mut(TOKEN_IDS_FIELD))
+            .and_then(|slot| {
+                let ids = TokenIds::from_json_array(slot.as_array()?)?;
+                *slot = Value::Null;
+                Some(Arc::new(ids))
+            });
+        Self { request, token_ids }
+    }
+
+    /// `request` (this turn's request, or a prefill/decode variant of it) with
+    /// the token ids back in place, for serialization.
+    fn with_token_ids<'a>(&'a self, request: &'a Value) -> RequestWithTokenIds<'a> {
+        RequestWithTokenIds {
+            request,
+            token_ids: self.token_ids.as_deref(),
+        }
+    }
+
+    /// The JSON body to send for `request`: the bytes `serde_json::to_vec` gives
+    /// for the request with its token ids in place.
+    fn body(&self, request: &Value) -> Result<bytes::Bytes, serde_json::Error> {
+        let mut body = serde_json::to_vec(&self.with_token_ids(request))?;
+        // The buffer grew by doubling; the body is held for the whole engine
+        // call, so give the unused tail back.
+        body.shrink_to_fit();
+        Ok(bytes::Bytes::from(body))
+    }
+}
+
+/// Serializes like the request `Value` with `token_ids` holding the ids.
+struct RequestWithTokenIds<'a> {
+    request: &'a Value,
+    token_ids: Option<&'a TokenIds>,
+}
+
+impl serde::Serialize for RequestWithTokenIds<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        match (self.request, self.token_ids) {
+            // Same calls as `Value::Object` makes, entry by entry in map order.
+            (Value::Object(object), Some(token_ids)) => {
+                let mut map = serializer.serialize_map(Some(object.len()))?;
+                for (key, value) in object {
+                    if key == TOKEN_IDS_FIELD {
+                        map.serialize_entry(key, token_ids)?;
+                    } else {
+                        map.serialize_entry(key, value)?;
+                    }
+                }
+                map.end()
+            }
+            _ => self.request.serialize(serializer),
+        }
+    }
 }
 
 /// Reads only `kv_transfer_params` and the choices' token ids from a decode
@@ -665,7 +745,8 @@ impl VllmPDRouter {
     }
 
     /// Copy prefill-only response metadata (prompt_token_ids, routed_experts)
-    /// into the buffered decode body.
+    /// into the buffered decode body. Returns the rewritten body, or `None` when
+    /// the decode body goes to the client as it is.
     ///
     /// Decode workers re-emit rows for prompt positions they never really
     /// computed, so routed_experts payloads are stitched: the decode payload's
@@ -679,7 +760,7 @@ impl VllmPDRouter {
         prefill_response_json: &Value,
         decode_body: &[u8],
         is_streaming: bool,
-    ) -> Result<Vec<u8>, String> {
+    ) -> Result<Option<Vec<u8>>, String> {
         let prefill_prompt_token_ids = prefill_response_json
             .get("prompt_token_ids")
             .filter(|value| !value.is_null());
@@ -705,19 +786,18 @@ impl VllmPDRouter {
             Self::merge_routed_experts_for_pd(prefill_response_json, &mut decode_json)
                 .map_err(|e| format!("Failed to merge routed experts: {}", e))?;
             return serde_json::to_vec(&decode_json)
+                .map(Some)
                 .map_err(|e| format!("Failed to serialize decode response: {}", e));
         }
 
         if let Some(prefill_prompt_token_ids) = prefill_prompt_token_ids {
             if let Ok(mut decode_json) = serde_json::from_slice::<Value>(decode_body) {
                 Self::insert_prefill_prompt_token_ids(&mut decode_json, prefill_prompt_token_ids);
-                return Ok(
-                    serde_json::to_vec(&decode_json).unwrap_or_else(|_| decode_body.to_vec())
-                );
+                return Ok(serde_json::to_vec(&decode_json).ok());
             }
         }
 
-        Ok(decode_body.to_vec())
+        Ok(None)
     }
 
     /// Convert service discovery instances to Worker objects for policy selection
@@ -1111,13 +1191,15 @@ impl VllmPDRouter {
         }
         // Copy prefill-only metadata (prompt_token_ids, routed_experts) into
         // the decode body; a plain passthrough when neither is present.
-        let body = if status.is_success() {
+        let merged = if status.is_success() {
             let empty_json = Value::Null;
             let prefill_json_ref = prefill_response_json.unwrap_or(&empty_json);
             Self::merge_prefill_response_metadata(prefill_json_ref, &body, is_streaming)?
         } else {
-            body.to_vec()
+            None
         };
+        // Unchanged bodies are forwarded as received, without a copy.
+        let body = merged.map(bytes::Bytes::from).unwrap_or(body);
         let mut response_builder = axum::http::Response::builder().status(status);
         for (name, value) in decode_headers.iter() {
             if name != axum::http::header::CONTENT_LENGTH
@@ -1530,7 +1612,7 @@ impl VllmPDRouter {
     #[allow(clippy::too_many_arguments)]
     async fn process_vllm_two_stage_request(
         &self,
-        original_request: Value,
+        turn_request: &TurnRequest,
         prefill_worker: Arc<dyn Worker>,
         decode_worker: Arc<dyn Worker>,
         path: &str,
@@ -1563,6 +1645,10 @@ impl VllmPDRouter {
         debug!(
             "  📋 Our headers: Authorization: Bearer $OPENAI_API_KEY, X-Request-Id: {{request_id}}"
         );
+
+        // The request without its token ids (see `TurnRequest`): small to clone,
+        // and nothing below reads `token_ids`.
+        let original_request = &turn_request.request;
 
         // Stage 1: Prepare prefill request with max_tokens=1 and kv_transfer_params
         let mut prefill_request = Self::prepare_prefill_request(original_request.clone(), path);
@@ -1620,8 +1706,22 @@ impl VllmPDRouter {
         }
         debug!(
             "📤 Prefill request payload: {}",
-            serde_json::to_string_pretty(&prefill_request).unwrap_or_default()
+            serde_json::to_string_pretty(&turn_request.with_token_ids(&prefill_request))
+                .unwrap_or_default()
         );
+
+        // Serialize the body once (the bytes `.json()` would send) and let go of
+        // the request `Value`: only the bytes are needed from here on.
+        let prefill_body = match turn_request.body(&prefill_request) {
+            Ok(body) => body,
+            Err(e) => {
+                prefill_worker.decrement_load();
+                return Err(TurnError::fatal(PDRouterError::NetworkError {
+                    message: format!("Failed to serialize prefill request: {}", e),
+                }));
+            }
+        };
+        drop(prefill_request);
 
         // Start profiling on prefill server
         self.start_profiling(&prefill_base_url).await;
@@ -1645,7 +1745,7 @@ impl VllmPDRouter {
             dp_utils::add_dp_rank_header(prefill_request_builder, prefill_dp_rank);
 
         let prefill_response = match otel_http::send_client_request(
-            prefill_request_builder.json(&prefill_request),
+            prefill_request_builder.body(prefill_body),
             headers,
             ClientRequestOptions {
                 method: "POST",
@@ -1744,8 +1844,16 @@ impl VllmPDRouter {
             }
         };
 
-        // Extract kv_transfer_params from prefill response if present
-        let kv_transfer_params = prefill_response_json.get("kv_transfer_params").cloned();
+        let mut prefill_response_json = prefill_response_json;
+        // The parsed response is all that is needed from here on.
+        drop(prefill_bytes);
+
+        // Extract kv_transfer_params from prefill response if present. They are
+        // moved out (not cloned): the block-id list grows with the prompt, and
+        // nothing after decode reads them from the prefill response.
+        let kv_transfer_params = prefill_response_json
+            .as_object_mut()
+            .and_then(|response| response.remove("kv_transfer_params"));
 
         if let Some(ref params) = kv_transfer_params {
             debug!(
@@ -1824,8 +1932,38 @@ impl VllmPDRouter {
         }
         debug!(
             "📤 Decode request payload: {}",
-            serde_json::to_string_pretty(&decode_request).unwrap_or_default()
+            serde_json::to_string_pretty(&turn_request.with_token_ids(&decode_request))
+                .unwrap_or_default()
         );
+
+        // As for prefill: serialize once, then drop the `Value` so that only the
+        // body bytes are alive while decode generates.
+        let decode_body = match turn_request.body(&decode_request) {
+            Ok(body) => body,
+            Err(e) => {
+                decode_worker.decrement_load();
+                RouterMetrics::record_pd_decode_error(&decode_base_url);
+                RouterMetrics::record_pd_request(path);
+                RouterMetrics::record_pd_request_duration(path, start_time.elapsed());
+                RouterMetrics::record_pd_prefill_request(&prefill_base_url);
+                return Err(TurnError::fatal(PDRouterError::NetworkError {
+                    message: format!("Failed to serialize decode request: {}", e),
+                }));
+            }
+        };
+        drop(decode_request);
+
+        // Read what response handling needs from the request before the decode
+        // call, so nothing else is looked up afterwards.
+        let needs_logprobs = original_request.get("logprobs").is_some()
+            || original_request
+                .get("echo")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+        let is_streaming = original_request
+            .get("stream")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
         // Start profiling on decode server
         self.start_profiling(&decode_base_url).await;
@@ -1849,7 +1987,7 @@ impl VllmPDRouter {
             dp_utils::add_dp_rank_header(decode_request_builder, decode_dp_rank);
 
         let decode_response = match otel_http::send_client_request(
-            decode_request_builder.json(&decode_request),
+            decode_request_builder.body(decode_body),
             headers,
             ClientRequestOptions {
                 method: "POST",
@@ -1909,17 +2047,6 @@ impl VllmPDRouter {
             )));
         }
 
-        // Check if logprobs merging is needed
-        let needs_logprobs = original_request.get("logprobs").is_some()
-            || original_request
-                .get("echo")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-        let is_streaming = original_request
-            .get("stream")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-
         // Response handling (profiling stop, PD metrics, logprobs merge,
         // streaming/buffered forwarding) is shared with the discovered paths.
         let capture = bidirectional_turn.map(|turn| (turn, decode_base_url.as_str()));
@@ -1959,7 +2086,7 @@ impl VllmPDRouter {
     fn bidirectional_turn(
         &self,
         path: &str,
-        request: &Value,
+        turn_request: &TurnRequest,
         request_text: Option<&str>,
         request_headers: Option<&HashMap<String, String>>,
     ) -> Option<BidirectionalTurn> {
@@ -1968,21 +2095,31 @@ impl VllmPDRouter {
             return None;
         }
         let session = crate::policies::extract_session_id(request_text, request_headers)?;
+        // Neither check reads `token_ids`, which the turn request holds apart.
+        let request = &turn_request.request;
         if pd_bidirectional::has_multimodal_inputs(request) {
             return Some(BidirectionalTurn {
                 session,
                 eligible: false,
-                prompt: Vec::new(),
+                prompt: Arc::new(TokenIds::I32(Vec::new())),
                 request_key: 0,
             });
         }
-        let prompt = pd_bidirectional::request_token_ids(request)?;
+        // Absent or malformed `token_ids` (same rule as `request_token_ids`).
+        let prompt = turn_request.token_ids.clone()?;
         Some(BidirectionalTurn {
             session,
             eligible: true,
             prompt,
             request_key: pd_bidirectional::request_key(request),
         })
+    }
+
+    /// Whether worker selection by `policy` reads the serialized request itself,
+    /// beyond looking up a session or hash key that a session header would
+    /// already settle. Only policies known not to are exempt.
+    fn policy_reads_request_text(policy: &dyn crate::policies::LoadBalancingPolicy) -> bool {
+        policy.needs_request_text() && !is_session_affine_policy(policy.name())
     }
 
     /// Cache the handle decode returned for the session's next turn.
@@ -1999,7 +2136,7 @@ impl VllmPDRouter {
         let (Some(params), Some(completion)) = (params, completion) else {
             return;
         };
-        let Some((handle, prefix)) = pd_bidirectional::decode_handle_from_response(
+        let Some((handle, prefix)) = pd_bidirectional::decode_handle_from_response_tokens(
             params,
             decode_url,
             &turn.prompt,
@@ -2030,7 +2167,7 @@ impl VllmPDRouter {
     #[allow(clippy::too_many_arguments)]
     async fn run_direct_turn(
         &self,
-        mut request_json: Value,
+        request: TurnRequest,
         prefill_worker: Arc<dyn Worker>,
         decode_worker: Arc<dyn Worker>,
         path: &str,
@@ -2041,7 +2178,8 @@ impl VllmPDRouter {
         let mut decode_handle = None;
         if let (Some(cache), Some(turn)) = (&self.bidirectional_kv, bidirectional.as_ref()) {
             if turn.eligible {
-                let (handle, lookup) = cache.take(&turn.session, turn.request_key, &turn.prompt);
+                let (handle, lookup) =
+                    cache.take_tokens(&turn.session, turn.request_key, &turn.prompt);
                 RouterMetrics::record_pd_bidirectional_turn(lookup.as_str());
                 match lookup {
                     HandleLookup::Expired
@@ -2065,14 +2203,11 @@ impl VllmPDRouter {
         let mut attempt: u32 = 0;
         loop {
             let had_handle = decode_handle.is_some();
-            let request = if attempt < self.pd_turn_retries {
-                request_json.clone()
-            } else {
-                std::mem::take(&mut request_json)
-            };
+            // Every attempt builds its prefill and decode bodies from the same
+            // turn request, so a retry needs no copy of it kept aside.
             match self
                 .process_vllm_two_stage_request(
-                    request,
+                    &request,
                     prefill_worker.clone(),
                     decode_worker.clone(),
                     path,
@@ -2597,7 +2732,7 @@ impl RouterTrait for VllmPDRouter {
             // Execute dual dispatch with vLLM two-stage processing
             let resp = match self
                 .run_direct_turn(
-                    request_json,
+                    TurnRequest::new(request_json),
                     prefill_worker.clone(),
                     decode_worker.clone(),
                     "/v1/chat/completions",
@@ -2771,7 +2906,7 @@ impl RouterTrait for VllmPDRouter {
             // Execute dual dispatch with vLLM two-stage processing
             let resp = match self
                 .run_direct_turn(
-                    request_json,
+                    TurnRequest::new(request_json),
                     prefill_worker.clone(),
                     decode_worker.clone(),
                     "/v1/completions",
@@ -2950,8 +3085,6 @@ impl RouterTrait for VllmPDRouter {
             }
 
             // Select workers using policy with headers for consistent hash
-            let request_text = serde_json::to_string(&request_json).ok();
-            let request_str = request_text.as_deref();
             let request_headers: Option<HashMap<String, String>> = headers.map(|h| {
                 h.iter()
                     .filter_map(|(name, value)| {
@@ -2966,11 +3099,52 @@ impl RouterTrait for VllmPDRouter {
             let prefill_policy = self.policy_registry.get_prefill_policy();
             let decode_policy = self.policy_registry.get_decode_policy();
 
-            let prefill_idx = match prefill_policy.select_worker_with_headers(
-                &prefill_workers,
-                request_str,
-                request_headers.as_ref(),
-            ) {
+            // The serialized request is only an input to worker selection and the
+            // session lookup. When a session header settles both (the header is
+            // looked up before the body) and neither policy reads the text
+            // itself, it is not built at all; otherwise it lives in this block
+            // only, not for the whole turn.
+            let (prefill_idx, decode_idx, turn_request, bidirectional) = {
+                let text_unused = request_headers
+                    .as_ref()
+                    .is_some_and(crate::policies::has_session_header)
+                    && !Self::policy_reads_request_text(prefill_policy.as_ref())
+                    && !Self::policy_reads_request_text(decode_policy.as_ref());
+                let request_text = if text_unused {
+                    None
+                } else {
+                    serde_json::to_string(&request_json).ok()
+                };
+                let request_str = request_text.as_deref();
+
+                let prefill_idx = prefill_policy.select_worker_with_headers(
+                    &prefill_workers,
+                    request_str,
+                    request_headers.as_ref(),
+                );
+                let decode_idx = match prefill_idx {
+                    Some(_) => decode_policy.select_worker_with_headers(
+                        &decode_workers,
+                        request_str,
+                        request_headers.as_ref(),
+                    ),
+                    None => None,
+                };
+                // From here on the request is held without its token ids.
+                let turn_request = TurnRequest::new(request_json);
+                let bidirectional = match (prefill_idx, decode_idx) {
+                    (Some(_), Some(_)) => self.bidirectional_turn(
+                        path,
+                        &turn_request,
+                        request_str,
+                        request_headers.as_ref(),
+                    ),
+                    _ => None,
+                };
+                (prefill_idx, decode_idx, turn_request, bidirectional)
+            };
+
+            let prefill_idx = match prefill_idx {
                 Some(idx) => idx,
                 None => {
                     RouterMetrics::record_pd_error("server_selection");
@@ -2982,11 +3156,7 @@ impl RouterTrait for VllmPDRouter {
                 }
             };
 
-            let decode_idx = match decode_policy.select_worker_with_headers(
-                &decode_workers,
-                request_str,
-                request_headers.as_ref(),
-            ) {
+            let decode_idx = match decode_idx {
                 Some(idx) => idx,
                 None => {
                     RouterMetrics::record_pd_error("server_selection");
@@ -3000,8 +3170,6 @@ impl RouterTrait for VllmPDRouter {
 
             let prefill_worker = &prefill_workers[prefill_idx];
             let decode_worker = &decode_workers[decode_idx];
-            let bidirectional =
-                self.bidirectional_turn(path, &request_json, request_str, request_headers.as_ref());
 
             debug!(
                 "Transparent proxy: prefill={}, decode={}",
@@ -3012,7 +3180,7 @@ impl RouterTrait for VllmPDRouter {
             // Execute two-stage processing
             match self
                 .run_direct_turn(
-                    request_json,
+                    turn_request,
                     prefill_worker.clone(),
                     decode_worker.clone(),
                     path,
@@ -3996,5 +4164,520 @@ mod tests {
         router.finish_session("s1");
         assert_eq!(s1.turn(&router).await, StatusCode::OK);
         assert_cold(&mock.prefill_params()[1]);
+    }
+
+    // --- Per-turn memory: bytes on the wire, retries, RSS per in-flight turn ---
+
+    /// Mock prefill/decode pair that records the raw request bodies it receives.
+    /// Decode can be gated (holds every request until `release`) and both sides
+    /// can break a response body mid-way, which the router sees as a
+    /// connection-level error.
+    struct WireMock {
+        prefill_url: String,
+        decode_url: String,
+        prefill_bodies: Arc<std::sync::Mutex<Vec<bytes::Bytes>>>,
+        decode_bodies: Arc<std::sync::Mutex<Vec<bytes::Bytes>>>,
+        prefill_breaks: Arc<AtomicUsize>,
+        decode_breaks: Arc<AtomicUsize>,
+        decode_arrivals: Arc<AtomicUsize>,
+        gate: tokio::sync::watch::Sender<bool>,
+        servers: Vec<tokio::task::JoinHandle<()>>,
+    }
+
+    /// Only the prompt length is needed to answer like vLLM.
+    #[derive(serde::Deserialize)]
+    struct WireTokenCount {
+        #[serde(default)]
+        token_ids: Vec<i32>,
+    }
+
+    fn wire_prefill_params() -> Value {
+        json!({
+            "do_remote_prefill": true, "do_remote_decode": false,
+            "remote_block_ids": [[10, 11]], "remote_engine_id": "p0",
+            "remote_request_id": "p-req", "remote_host": "10.9.9.9",
+            "remote_port": 5600
+        })
+    }
+
+    /// The handle decode call `n` returns for a prompt of `prompt_len` tokens.
+    fn wire_decode_params(n: usize, prompt_len: usize) -> Value {
+        json!({
+            "do_remote_prefill": false, "do_remote_decode": true,
+            "remote_block_ids": [[n, n + 1], [n + 2]],
+            "remote_engine_id": "d0", "remote_request_id": format!("d-{}", n),
+            "remote_host": "localhost", "remote_port": 5700,
+            "remote_num_tokens": prompt_len + 1
+        })
+    }
+
+    /// A 200 response whose body fails after the first chunk.
+    fn broken_body_response() -> Response {
+        let chunks: Vec<Result<bytes::Bytes, std::io::Error>> = vec![
+            Ok(bytes::Bytes::from_static(b"{\"choices\": [")),
+            Err(std::io::Error::other("mock connection reset")),
+        ];
+        Response::new(Body::from_stream(futures_util::stream::iter(chunks)))
+    }
+
+    fn take_one(counter: &AtomicUsize) -> bool {
+        counter
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+    }
+
+    impl WireMock {
+        async fn start(record: bool, gated: bool) -> Self {
+            let prefill_bodies: Arc<std::sync::Mutex<Vec<bytes::Bytes>>> = Default::default();
+            let decode_bodies: Arc<std::sync::Mutex<Vec<bytes::Bytes>>> = Default::default();
+            let prefill_breaks = Arc::new(AtomicUsize::new(0));
+            let decode_breaks = Arc::new(AtomicUsize::new(0));
+            let decode_arrivals = Arc::new(AtomicUsize::new(0));
+            let decode_calls = Arc::new(AtomicUsize::new(0));
+            let (gate, _) = tokio::sync::watch::channel(!gated);
+
+            let (pb, pk) = (prefill_bodies.clone(), prefill_breaks.clone());
+            let prefill = move |body: bytes::Bytes| {
+                let (pb, pk) = (pb.clone(), pk.clone());
+                async move {
+                    if record {
+                        pb.lock().unwrap().push(body.clone());
+                    }
+                    drop(body);
+                    if take_one(&pk) {
+                        return broken_body_response();
+                    }
+                    axum::Json(json!({
+                        "choices": [{"token_ids": [1]}],
+                        "kv_transfer_params": wire_prefill_params()
+                    }))
+                    .into_response()
+                }
+            };
+            let (db, dk, da, dc, gate_tx) = (
+                decode_bodies.clone(),
+                decode_breaks.clone(),
+                decode_arrivals.clone(),
+                decode_calls.clone(),
+                gate.clone(),
+            );
+            let decode = move |body: bytes::Bytes| {
+                let (db, dk, da, dc) = (db.clone(), dk.clone(), da.clone(), dc.clone());
+                let mut gate_rx = gate_tx.subscribe();
+                async move {
+                    if record {
+                        db.lock().unwrap().push(body.clone());
+                    }
+                    let prompt_len = serde_json::from_slice::<WireTokenCount>(&body)
+                        .map(|b| b.token_ids.len())
+                        .unwrap_or(0);
+                    drop(body);
+                    da.fetch_add(1, Ordering::SeqCst);
+                    while !*gate_rx.borrow_and_update() {
+                        if gate_rx.changed().await.is_err() {
+                            break;
+                        }
+                    }
+                    if take_one(&dk) {
+                        return broken_body_response();
+                    }
+                    let n = dc.fetch_add(1, Ordering::SeqCst) + 1;
+                    axum::Json(json!({
+                        "choices": [{"token_ids": [1000 + n, 2000 + n]}],
+                        "kv_transfer_params": wire_decode_params(n, prompt_len)
+                    }))
+                    .into_response()
+                }
+            };
+
+            let mut servers = Vec::new();
+            let mut urls = Vec::new();
+            let limit = axum::extract::DefaultBodyLimit::disable();
+            for app in [
+                axum::Router::new()
+                    .route("/health", axum::routing::get(|| async { "ok" }))
+                    .route("/inference/v1/generate", axum::routing::post(prefill))
+                    .layer(limit.clone()),
+                axum::Router::new()
+                    .route("/health", axum::routing::get(|| async { "ok" }))
+                    .route("/inference/v1/generate", axum::routing::post(decode))
+                    .layer(limit),
+            ] {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                urls.push(format!("http://{}", listener.local_addr().unwrap()));
+                servers.push(tokio::spawn(async move {
+                    axum::serve(listener, app).await.unwrap();
+                }));
+            }
+            Self {
+                prefill_url: urls[0].clone(),
+                decode_url: urls[1].clone(),
+                prefill_bodies,
+                decode_bodies,
+                prefill_breaks,
+                decode_breaks,
+                decode_arrivals,
+                gate,
+                servers,
+            }
+        }
+
+        /// Router with bidirectional KV on and whole-turn retries.
+        async fn router(&self, turn_retries: u32) -> VllmPDRouter {
+            use crate::config::{PdBidirectionalKvConfig, RouterConfig};
+            use crate::policies::StickyLeastLoadedPolicy;
+            use crate::server::AppContext;
+            let config = RouterConfig {
+                pd_bidirectional_kv: PdBidirectionalKvConfig {
+                    enabled: true,
+                    ..Default::default()
+                },
+                pd_turn_retries: turn_retries,
+                ..Default::default()
+            };
+            let context = Arc::new(
+                AppContext::new(config, reqwest::Client::new(), 10, None, vec![]).unwrap(),
+            );
+            context
+                .policy_registry
+                .set_prefill_policy(Arc::new(StickyLeastLoadedPolicy::new()));
+            context
+                .policy_registry
+                .set_decode_policy(Arc::new(StickyLeastLoadedPolicy::new()));
+            VllmPDRouter::new(
+                vec![(self.prefill_url.clone(), None)],
+                vec![self.decode_url.clone()],
+                None,
+                &context,
+            )
+            .await
+            .unwrap()
+        }
+
+        fn prefill_bodies(&self) -> Vec<bytes::Bytes> {
+            self.prefill_bodies.lock().unwrap().clone()
+        }
+
+        fn decode_bodies(&self) -> Vec<bytes::Bytes> {
+            self.decode_bodies.lock().unwrap().clone()
+        }
+
+        fn release(&self) {
+            self.gate.send_replace(true);
+        }
+    }
+
+    impl Drop for WireMock {
+        fn drop(&mut self) {
+            for server in &self.servers {
+                server.abort();
+            }
+        }
+    }
+
+    const WIRE_PATH: &str = "/inference/v1/generate";
+
+    /// A token-in request as the HTTP handler hands it over: parsed from the
+    /// client's JSON (keys deliberately out of order) into the typed body.
+    fn wire_request(token_ids: &[i32]) -> crate::protocols::spec::InferenceGenerateRequest {
+        let text = format!(
+            r#"{{"zeta": [1.5, -2, {{"b": null, "a": "x"}}], "token_ids": {}, "stream_options": {{"include_usage": true}}, "sampling_params": {{"temperature": 0.7, "min_tokens": 4, "max_tokens": 64, "top_p": 0.95, "seed": 1234567890123, "stop_token_ids": [2, 0]}}, "model": "m", "cache_salt": "salt-1", "alpha": "é\n\"q\"", "priority": -3}}"#,
+            serde_json::to_string(token_ids).unwrap()
+        );
+        serde_json::from_str(&text).unwrap()
+    }
+
+    /// The request `Value` v0.2.6 worked on (`serde_json::to_value` of the typed body).
+    fn v026_request(body: &crate::protocols::spec::InferenceGenerateRequest) -> Value {
+        serde_json::to_value(body).unwrap()
+    }
+
+    /// Prefill body as v0.2.6 built it: the prepared request `Value` with
+    /// `kv_transfer_params` set, serialized by reqwest's `.json()` (`to_vec`).
+    fn v026_prefill_body(request: &Value, kv_transfer_params: Value) -> Vec<u8> {
+        let mut prefill = VllmPDRouter::prepare_prefill_request(request.clone(), WIRE_PATH);
+        prefill["kv_transfer_params"] = kv_transfer_params;
+        serde_json::to_vec(&prefill).unwrap()
+    }
+
+    /// Decode body as v0.2.6 built it: the request `Value` with prefill's
+    /// `kv_transfer_params`, serialized by `.json()`.
+    fn v026_decode_body(request: &Value) -> Vec<u8> {
+        let mut decode = request.clone();
+        decode["kv_transfer_params"] = wire_prefill_params();
+        serde_json::to_vec(&decode).unwrap()
+    }
+
+    fn cold_prefill_params(router: &VllmPDRouter) -> Value {
+        router
+            .build_prefill_kv_transfer_params(None, None, None)
+            .unwrap()
+    }
+
+    /// Prefill params that read decode call `n`'s handle (host rewritten to the
+    /// address the router reached decode on).
+    fn handle_prefill_params(n: usize, prompt_len: usize) -> Value {
+        let mut handle = wire_decode_params(n, prompt_len);
+        handle["remote_host"] = json!("127.0.0.1");
+        pd_bidirectional::prefill_params_from_decode_handle(&handle)
+    }
+
+    fn session_headers(session: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-session-id", session.parse().unwrap());
+        headers
+    }
+
+    fn assert_same_bytes(got: &[u8], want: &[u8], what: &str) {
+        assert!(
+            got == want,
+            "{} differs from v0.2.6:\n got: {}\nwant: {}",
+            what,
+            String::from_utf8_lossy(got),
+            String::from_utf8_lossy(want)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_engine_request_bodies_are_byte_identical_to_v026() {
+        let mock = WireMock::start(true, false).await;
+        let router = mock.router(2).await;
+        let headers = session_headers("s1");
+
+        // Turn 1 through the typed route (as the HTTP handler calls it).
+        let turn1 = wire_request(&[5, 0, 151643, 77, 2147483647, 9]);
+        let response = router
+            .route_inference_generate(Some(&headers), &turn1, None, None)
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        // Turn 2 extends turn 1 with its completion (decode call 1) and new tokens,
+        // so prefill reads the handle; sent through the transparent route.
+        let turn2 = wire_request(&[5, 0, 151643, 77, 2147483647, 9, 1001, 2001, 7, 8]);
+        let response = router
+            .route_transparent(
+                Some(&headers),
+                WIRE_PATH,
+                &Method::POST,
+                v026_request(&turn2),
+                None,
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        // A request without sampling_params, and one whose token_ids cannot be
+        // taken as integers, go through unchanged as well.
+        let bare = json!({"token_ids": [3, 2, 1], "stream": true, "model": "m"});
+        let odd = json!({"token_ids": [1, 2.5, "x"], "prompt": "p", "a": 18446744073709551615u64});
+        for body in [&bare, &odd] {
+            let response = router
+                .route_transparent(
+                    Some(&session_headers("s2")),
+                    WIRE_PATH,
+                    &Method::POST,
+                    body.clone(),
+                    None,
+                )
+                .await;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        let (p, d) = (mock.prefill_bodies(), mock.decode_bodies());
+        assert_eq!((p.len(), d.len()), (4, 4));
+        let cold = cold_prefill_params(&router);
+        let (r1, r2) = (v026_request(&turn1), v026_request(&turn2));
+        assert_same_bytes(&p[0], &v026_prefill_body(&r1, cold.clone()), "prefill 1");
+        assert_same_bytes(&d[0], &v026_decode_body(&r1), "decode 1");
+        assert_same_bytes(
+            &p[1],
+            &v026_prefill_body(&r2, handle_prefill_params(1, 6)),
+            "prefill 2",
+        );
+        assert_same_bytes(&d[1], &v026_decode_body(&r2), "decode 2");
+        assert_same_bytes(&p[2], &v026_prefill_body(&bare, cold.clone()), "prefill 3");
+        assert_same_bytes(&d[2], &v026_decode_body(&bare), "decode 3");
+        assert_same_bytes(&p[3], &v026_prefill_body(&odd, cold), "prefill 4");
+        assert_same_bytes(&d[3], &v026_decode_body(&odd), "decode 4");
+        // Keys are sorted and the token ids are the client's, in order.
+        let text = String::from_utf8_lossy(&d[0]).into_owned();
+        assert!(text.contains(r#""token_ids":[5,0,151643,77,2147483647,9],"zeta""#));
+    }
+
+    #[tokio::test]
+    async fn test_turn_retry_after_connection_error_resends_full_request() {
+        let mock = WireMock::start(true, false).await;
+        let router = mock.router(2).await;
+        let headers = session_headers("s1");
+        let turn1 = wire_request(&[11, 12, 13]);
+        let response = router
+            .route_inference_generate(Some(&headers), &turn1, None, None)
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Turn 2: the prefill response breaks mid-body (attempt 1, which read the
+        // handle), then the decode response does (attempt 2), then all is well.
+        mock.prefill_breaks.store(1, Ordering::SeqCst);
+        mock.decode_breaks.store(1, Ordering::SeqCst);
+        let turn2 = wire_request(&[11, 12, 13, 1001, 2001, 14]);
+        let response = router
+            .route_inference_generate(Some(&headers), &turn2, None, None)
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["choices"][0]["token_ids"], json!([1002, 2002]));
+
+        let (p, d) = (mock.prefill_bodies(), mock.decode_bodies());
+        assert_eq!((p.len(), d.len()), (4, 3));
+        let cold = cold_prefill_params(&router);
+        let r2 = v026_request(&turn2);
+        assert_same_bytes(
+            &p[1],
+            &v026_prefill_body(&r2, handle_prefill_params(1, 3)),
+            "prefill attempt 1",
+        );
+        // Retries send the whole request again, with a fresh (cold) prefill.
+        assert_same_bytes(
+            &p[2],
+            &v026_prefill_body(&r2, cold.clone()),
+            "prefill attempt 2",
+        );
+        assert_same_bytes(&p[3], &v026_prefill_body(&r2, cold), "prefill attempt 3");
+        assert_same_bytes(&d[1], &v026_decode_body(&r2), "decode attempt 2");
+        assert_same_bytes(&d[2], &v026_decode_body(&r2), "decode attempt 3");
+
+        // The handle of the successful attempt serves the next turn.
+        let turn3 = wire_request(&[11, 12, 13, 1001, 2001, 14, 1002, 2002, 15]);
+        let response = router
+            .route_inference_generate(Some(&headers), &turn3, None, None)
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_same_bytes(
+            &mock.prefill_bodies()[4],
+            &v026_prefill_body(&v026_request(&turn3), handle_prefill_params(2, 6)),
+            "prefill of the next turn",
+        );
+    }
+
+    /// Resident set size in bytes, after handing freed heap pages back to the OS.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    fn trimmed_rss_bytes() -> usize {
+        extern "C" {
+            fn malloc_trim(pad: usize) -> i32;
+        }
+        // SAFETY: glibc's malloc_trim only releases free heap memory.
+        unsafe { malloc_trim(0) };
+        let statm = std::fs::read_to_string("/proc/self/statm").unwrap();
+        let pages: usize = statm.split_whitespace().nth(1).unwrap().parse().unwrap();
+        pages * 4096
+    }
+
+    /// Measures the router's resident memory per in-flight P/D turn while decode
+    /// is generating. Not a pass/fail test:
+    /// `cargo test --release --lib measure_pd_turn_rss -- --ignored --nocapture`
+    /// (`PD_MEM_TURNS`, `PD_MEM_TOKENS` override the 200 turns of 100k tokens).
+    /// The mock engines run in the same process, so their per-connection buffers
+    /// are included in the figure.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    #[ignore]
+    async fn measure_pd_turn_rss() {
+        let env = |name: &str, default: usize| {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(default)
+        };
+        let (turns, tokens) = (env("PD_MEM_TURNS", 200), env("PD_MEM_TOKENS", 100_000));
+        let mock = WireMock::start(false, true).await;
+        let router = Arc::new(mock.router(2).await);
+        let request = |turn: usize| {
+            let token_ids: Vec<i32> = (0..tokens)
+                .map(|i| ((i * 7919 + turn) % 150_000) as i32)
+                .collect();
+            let mut body = wire_request(&[]);
+            body.token_ids = token_ids;
+            body
+        };
+
+        // Warm up connections, pools and lazy statics before the baseline.
+        mock.release();
+        for turn in 0..8 {
+            let headers = session_headers(&format!("warmup-{}", turn));
+            let response = router
+                .route_inference_generate(Some(&headers), &request(turn), None, None)
+                .await;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        mock.gate.send_replace(false);
+        let arrived = mock.decode_arrivals.load(Ordering::SeqCst);
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let before = trimmed_rss_bytes();
+
+        let mut tasks = Vec::new();
+        for turn in 0..turns {
+            let router = router.clone();
+            let body = request(turn);
+            tasks.push(tokio::spawn(async move {
+                let headers = session_headers(&format!("session-{}", turn));
+                // The HTTP handler owns the typed body for the whole turn.
+                router
+                    .route_inference_generate(Some(&headers), &body, None, None)
+                    .await
+                    .status()
+            }));
+        }
+        while mock.decode_arrivals.load(Ordering::SeqCst) < arrived + turns {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let in_flight = trimmed_rss_bytes();
+
+        mock.release();
+        for task in tasks {
+            assert_eq!(task.await.unwrap(), StatusCode::OK);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let after = trimmed_rss_bytes();
+
+        // Control: the same number of requests of the same size posted straight
+        // to the mock decode from one shared buffer. What they cost is the HTTP
+        // client and the in-process mock server, not the router's turn state.
+        let body = bytes::Bytes::from(serde_json::to_vec(&request(0)).unwrap());
+        let client = reqwest::Client::new();
+        mock.gate.send_replace(false);
+        let arrived = mock.decode_arrivals.load(Ordering::SeqCst);
+        let mut tasks = Vec::new();
+        for _ in 0..turns {
+            let request = client
+                .post(format!("{}{}", mock.decode_url, WIRE_PATH))
+                .header("Content-Type", "application/json")
+                .body(body.clone());
+            tasks.push(tokio::spawn(async move {
+                request.send().await.unwrap().bytes().await.unwrap().len()
+            }));
+        }
+        while mock.decode_arrivals.load(Ordering::SeqCst) < arrived + turns {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let control = trimmed_rss_bytes();
+        mock.release();
+        for task in tasks {
+            assert!(task.await.unwrap() > 0);
+        }
+
+        let mb = |bytes: usize| bytes as f64 / (1024.0 * 1024.0);
+        println!(
+            "PD_TURN_RSS turns={} tokens={} body={:.2}MB before={:.1}MB in_flight={:.1}MB after={:.1}MB per_turn={:.2}MB control_per_request={:.2}MB",
+            turns,
+            tokens,
+            mb(body.len()),
+            mb(before),
+            mb(in_flight),
+            mb(after),
+            mb(in_flight.saturating_sub(before)) / turns as f64,
+            mb(control.saturating_sub(after)) / turns as f64
+        );
     }
 }
