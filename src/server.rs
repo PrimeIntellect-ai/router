@@ -657,7 +657,7 @@ async fn inference_generate(
 
     state
         .router
-        .route_inference_generate(Some(&headers), &body, None, run_id.as_deref())
+        .route_inference_generate_owned(Some(&headers), body, None, run_id.as_deref())
         .await
 }
 
