@@ -595,6 +595,28 @@ impl RouterTrait for RouterManager {
         }
     }
 
+    async fn route_inference_generate_owned(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: InferenceGenerateRequest,
+        _model_id: Option<&str>,
+        run_id: Option<&str>,
+    ) -> Response {
+        let router = self.select_router_for_request(headers, None);
+
+        if let Some(router) = router {
+            router
+                .route_inference_generate_owned(headers, body, None, run_id)
+                .await
+        } else {
+            (
+                StatusCode::NOT_FOUND,
+                "No router available for this request",
+            )
+                .into_response()
+        }
+    }
+
     /// Route a chat completion request
     async fn route_chat(
         &self,
