@@ -1008,6 +1008,21 @@ impl VllmPDRouter {
 
         if !decode_response.status().is_success() {
             RouterMetrics::record_pd_decode_error(decode_http);
+            // Only the router has the transfer metadata for this internal POST.
+            // Handle the redirect here so the caller cannot replay a partial turn.
+            if !self.use_discovery
+                && path == TOKEN_IN_GENERATE_PATH
+                && matches!(
+                    decode_response.status(),
+                    StatusCode::TEMPORARY_REDIRECT | StatusCode::PERMANENT_REDIRECT
+                )
+            {
+                return Ok((
+                    StatusCode::BAD_GATEWAY,
+                    "Decode worker redirected the token request; configure its final URL",
+                )
+                    .into_response());
+            }
         }
 
         // Routed-experts merging requires buffering both responses; refuse
@@ -1986,6 +2001,14 @@ impl VllmPDRouter {
         decode_request_builder =
             dp_utils::add_dp_rank_header(decode_request_builder, decode_dp_rank);
 
+        // A token-in turn can rebuild its body for a whole-turn retry. Give HTTP
+        // a one-shot body with the same exact length so it can release the JSON
+        // after upload instead of retaining it for 307/308 replay during decode.
+        let decode_body = if path == TOKEN_IN_GENERATE_PATH {
+            reqwest::Body::wrap(reqwest::Body::from(decode_body))
+        } else {
+            reqwest::Body::from(decode_body)
+        };
         let decode_response = match otel_http::send_client_request(
             decode_request_builder.body(decode_body),
             headers,
@@ -3618,6 +3641,7 @@ mod tests {
     /// Injected upstream failure for the mock servers.
     #[derive(Clone, Copy)]
     enum MockFailure {
+        Redirect(StatusCode),
         Status(u16),
         NonJson,
     }
@@ -3626,6 +3650,9 @@ mod tests {
 
     fn mock_failure_response(failure: MockFailure) -> Response {
         match failure {
+            MockFailure::Redirect(status) => {
+                (status, [(http::header::LOCATION, TOKEN_IN_GENERATE_PATH)]).into_response()
+            }
             MockFailure::Status(code) => (
                 StatusCode::from_u16(code).unwrap(),
                 axum::Json(json!({"error": {"message": format!("mock {}", code)}})),
@@ -4071,6 +4098,25 @@ mod tests {
         assert_reads(&p[1], "d-1");
         assert_cold(&p[2]);
         // the failed prefill never reached decode
+        assert_eq!(mock.decode_params().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn token_decode_does_not_replay_or_forward_worker_redirects() {
+        let mock = BidirMock::start().await;
+        let router = mock.router(true, 2).await;
+        for status in [
+            StatusCode::TEMPORARY_REDIRECT,
+            StatusCode::PERMANENT_REDIRECT,
+        ] {
+            mock.fail_decode(&[MockFailure::Redirect(status)]);
+            let response = router
+                .route_inference_generate_owned(None, wire_request(&[42]), None, None)
+                .await;
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+            assert!(!response.headers().contains_key(http::header::LOCATION));
+        }
+        assert_eq!(mock.prefill_params().len(), 2);
         assert_eq!(mock.decode_params().len(), 2);
     }
 
