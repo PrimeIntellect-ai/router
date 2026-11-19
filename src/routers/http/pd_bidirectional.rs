@@ -86,6 +86,20 @@ impl TokenPrefix {
         prompt.len() > self.len && hash_tokens(&prompt[..self.len]) == self.hash
     }
 
+    /// [`TokenPrefix::of`] for the first `len` tokens of `prompt` followed by
+    /// `completion`, without building the joined list.
+    fn of_prompt_and_completion(prompt: &TokenIds, len: usize, completion: &[i64]) -> Self {
+        Self {
+            len: len + completion.len(),
+            hash: prompt.hash_prefix_then(len, completion),
+        }
+    }
+
+    /// [`TokenPrefix::is_prefix_of`] for a prompt held as [`TokenIds`].
+    pub fn is_prefix_of_tokens(&self, prompt: &TokenIds) -> bool {
+        prompt.len() > self.len && prompt.hash_prefix_then(self.len, &[]) == self.hash
+    }
+
     pub fn len(&self) -> usize {
         self.len
     }
@@ -132,6 +146,100 @@ fn hash_tokens(tokens: &[i64]) -> u64 {
     h.finish()
 }
 
+/// The prompt token ids of a token-in request, held once per turn in the
+/// narrowest integer type that fits (4 bytes per token for any real vocabulary,
+/// against 32 as a JSON `Value`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TokenIds {
+    I32(Vec<i32>),
+    I64(Vec<i64>),
+}
+
+impl TokenIds {
+    /// The ids of a JSON array of integers, or `None` if any element is not an
+    /// integer that fits `i64` (same rule as [`request_token_ids`]).
+    pub fn from_json_array(items: &[Value]) -> Option<Self> {
+        let mut narrow: Vec<i32> = Vec::with_capacity(items.len());
+        for (i, item) in items.iter().enumerate() {
+            let id = item.as_i64()?;
+            match i32::try_from(id) {
+                Ok(id) => narrow.push(id),
+                Err(_) => {
+                    let mut wide: Vec<i64> = Vec::with_capacity(items.len());
+                    wide.extend(narrow.iter().map(|&t| i64::from(t)));
+                    wide.push(id);
+                    for item in &items[i + 1..] {
+                        wide.push(item.as_i64()?);
+                    }
+                    return Some(TokenIds::I64(wide));
+                }
+            }
+        }
+        Some(TokenIds::I32(narrow))
+    }
+
+    pub fn len(&self) -> usize {
+        match self {
+            TokenIds::I32(ids) => ids.len(),
+            TokenIds::I64(ids) => ids.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The ids as `i64`, as [`request_token_ids`] returns them.
+    pub fn to_i64_vec(&self) -> Vec<i64> {
+        match self {
+            TokenIds::I32(ids) => ids.iter().map(|&t| i64::from(t)).collect(),
+            TokenIds::I64(ids) => ids.clone(),
+        }
+    }
+
+    /// `hash_tokens` of the first `len` ids followed by `tail`, without building
+    /// that list: a `[i64]` hashes as its length followed by the ids' native
+    /// bytes, and the hasher gives the same result however those bytes are
+    /// split across writes (asserted against `hash_tokens` in the tests).
+    fn hash_prefix_then(&self, len: usize, tail: &[i64]) -> u64 {
+        let mut h = DefaultHasher::new();
+        h.write_usize(len + tail.len());
+        match self {
+            TokenIds::I32(ids) => {
+                // Widen in blocks on the stack so the hasher sees few, large writes.
+                const BLOCK: usize = 512;
+                let mut bytes = [0u8; BLOCK * 8];
+                for block in ids[..len].chunks(BLOCK) {
+                    for (out, &id) in bytes.chunks_exact_mut(8).zip(block) {
+                        out.copy_from_slice(&i64::from(id).to_ne_bytes());
+                    }
+                    h.write(&bytes[..block.len() * 8]);
+                }
+            }
+            TokenIds::I64(ids) => {
+                for &id in &ids[..len] {
+                    h.write(&id.to_ne_bytes());
+                }
+            }
+        }
+        for &id in tail {
+            h.write(&id.to_ne_bytes());
+        }
+        h.finish()
+    }
+}
+
+impl serde::Serialize for TokenIds {
+    /// A JSON array of integers: the same bytes as the `Value` array the ids
+    /// were taken from.
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            TokenIds::I32(ids) => ids.serialize(serializer),
+            TokenIds::I64(ids) => ids.serialize(serializer),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct Entry {
     params: Value,
@@ -173,11 +281,41 @@ impl BidirectionalKvCache {
         self.take_at(session_id, request_key, prompt, Instant::now())
     }
 
+    /// [`BidirectionalKvCache::take`] for a prompt held as [`TokenIds`].
+    pub fn take_tokens(
+        &self,
+        session_id: &str,
+        request_key: u64,
+        prompt: &TokenIds,
+    ) -> (Option<Value>, HandleLookup) {
+        self.take_checked(
+            session_id,
+            request_key,
+            |prefix| prefix.is_prefix_of_tokens(prompt),
+            Instant::now(),
+        )
+    }
+
     fn take_at(
         &self,
         session_id: &str,
         request_key: u64,
         prompt: &[i64],
+        now: Instant,
+    ) -> (Option<Value>, HandleLookup) {
+        self.take_checked(
+            session_id,
+            request_key,
+            |prefix| prefix.is_prefix_of(prompt),
+            now,
+        )
+    }
+
+    fn take_checked(
+        &self,
+        session_id: &str,
+        request_key: u64,
+        covers_prompt: impl FnOnce(&TokenPrefix) -> bool,
         now: Instant,
     ) -> (Option<Value>, HandleLookup) {
         let Some(e) = self.entries.lock().remove(session_id) else {
@@ -187,7 +325,7 @@ impl BidirectionalKvCache {
             (None, HandleLookup::Expired)
         } else if e.request_key != request_key {
             (None, HandleLookup::RequestMismatch)
-        } else if !e.prefix.is_prefix_of(prompt) {
+        } else if !covers_prompt(&e.prefix) {
             (None, HandleLookup::PrefixMismatch)
         } else {
             (Some(e.params), HandleLookup::Hit)
@@ -303,6 +441,60 @@ pub fn decode_handle_from_response(
     prompt: &[i64],
     completion: &[i64],
 ) -> Option<(Value, TokenPrefix)> {
+    decode_handle_with_prefix(
+        params,
+        decode_url,
+        prompt.len(),
+        completion.len(),
+        |covered| {
+            if covered <= prompt.len() {
+                TokenPrefix::of(&prompt[..covered])
+            } else {
+                let mut tokens = Vec::with_capacity(covered);
+                tokens.extend_from_slice(prompt);
+                tokens.extend_from_slice(&completion[..covered - prompt.len()]);
+                TokenPrefix::of(&tokens)
+            }
+        },
+    )
+}
+
+/// [`decode_handle_from_response`] for a prompt held as [`TokenIds`]; the
+/// fingerprint is the same.
+pub fn decode_handle_from_response_tokens(
+    params: &Value,
+    decode_url: &str,
+    prompt: &TokenIds,
+    completion: &[i64],
+) -> Option<(Value, TokenPrefix)> {
+    decode_handle_with_prefix(
+        params,
+        decode_url,
+        prompt.len(),
+        completion.len(),
+        |covered| {
+            if covered <= prompt.len() {
+                TokenPrefix::of_prompt_and_completion(prompt, covered, &[])
+            } else {
+                TokenPrefix::of_prompt_and_completion(
+                    prompt,
+                    prompt.len(),
+                    &completion[..covered - prompt.len()],
+                )
+            }
+        },
+    )
+}
+
+/// `fingerprint(covered)` is only called with
+/// `0 < covered <= prompt_len + completion_len`.
+fn decode_handle_with_prefix(
+    params: &Value,
+    decode_url: &str,
+    prompt_len: usize,
+    completion_len: usize,
+    fingerprint: impl FnOnce(usize) -> TokenPrefix,
+) -> Option<(Value, TokenPrefix)> {
     let obj = params.as_object()?;
     if !obj
         .get("do_remote_decode")
@@ -320,17 +512,10 @@ pub fn decode_handle_from_response(
         }
     }
     let covered = usize::try_from(obj.get("remote_num_tokens")?.as_u64()?).ok()?;
-    if covered == 0 || covered > prompt.len() + completion.len() {
+    if covered == 0 || covered > prompt_len + completion_len {
         return None;
     }
-    let prefix = if covered <= prompt.len() {
-        TokenPrefix::of(&prompt[..covered])
-    } else {
-        let mut tokens = Vec::with_capacity(covered);
-        tokens.extend_from_slice(prompt);
-        tokens.extend_from_slice(&completion[..covered - prompt.len()]);
-        TokenPrefix::of(&tokens)
-    };
+    let prefix = fingerprint(covered);
     let mut handle = params.clone();
     let reported = obj.get("remote_host").and_then(Value::as_str).unwrap_or("");
     if is_loopback_or_unset(reported) {
@@ -626,5 +811,139 @@ mod tests {
         );
         assert_eq!(request_token_ids(&json!({"prompt": "hi"})), None);
         assert_eq!(request_token_ids(&json!({"token_ids": [1, "x"]})), None);
+    }
+
+    /// Token lists that exercise both widths, signs, the block boundary of the
+    /// streaming hash, and a realistic prompt size.
+    fn token_lists() -> Vec<Vec<i64>> {
+        let wide = i64::from(i32::MAX) + 1;
+        let mut lists = vec![
+            vec![],
+            vec![0],
+            vec![1, 2, 3, 4, 5],
+            vec![-1, i64::from(i32::MIN), i64::from(i32::MAX), 0, 151_643],
+            vec![7, wide, 9],
+            vec![wide],
+            vec![3, -wide - 5, i64::MAX, i64::MIN, 4],
+        ];
+        for n in [511usize, 512, 513, 1024, 1500, 100_000] {
+            lists.push((0..n as i64).map(|i| (i * 7919 + 13) % 150_000).collect());
+        }
+        lists
+    }
+
+    fn to_token_ids(tokens: &[i64]) -> TokenIds {
+        let values: Vec<Value> = tokens.iter().map(|&t| json!(t)).collect();
+        TokenIds::from_json_array(&values).unwrap()
+    }
+
+    #[test]
+    fn token_ids_keep_the_ids_in_the_narrowest_width() {
+        for tokens in token_lists() {
+            let ids = to_token_ids(&tokens);
+            let fits = tokens.iter().all(|&t| i32::try_from(t).is_ok());
+            assert_eq!(matches!(ids, TokenIds::I32(_)), fits);
+            assert_eq!(ids.len(), tokens.len());
+            assert_eq!(ids.to_i64_vec(), tokens);
+            // Serialized exactly like the JSON array they came from.
+            assert_eq!(
+                serde_json::to_string(&ids).unwrap(),
+                serde_json::to_string(&json!(tokens)).unwrap()
+            );
+        }
+        // Same acceptance rule as `request_token_ids`.
+        for bad in [
+            json!([1, "x"]),
+            json!([1, 2.5]),
+            json!([1, null]),
+            json!([u64::MAX]),
+        ] {
+            assert!(TokenIds::from_json_array(bad.as_array().unwrap()).is_none());
+            assert!(request_token_ids(&json!({ "token_ids": bad })).is_none());
+        }
+    }
+
+    #[test]
+    fn token_ids_prefix_hash_equals_slice_hash() {
+        for tokens in token_lists() {
+            let ids = to_token_ids(&tokens);
+            let completion: [i64; 3] = [1001, i64::from(i32::MAX) + 7, -2];
+            let cuts = [
+                0,
+                1,
+                tokens.len() / 2,
+                tokens.len().saturating_sub(1),
+                tokens.len(),
+            ];
+            for len in cuts.into_iter().filter(|&len| len <= tokens.len()) {
+                // The old computation: `TokenPrefix::of` over a materialized `[i64]`.
+                let old = TokenPrefix::of(&tokens[..len]);
+                let new = TokenPrefix::of_prompt_and_completion(&ids, len, &[]);
+                assert_eq!(new, old, "prefix {} of {} tokens", len, tokens.len());
+                assert_eq!(new.hash, hash_tokens(&tokens[..len]));
+                assert_eq!(old.is_prefix_of(&tokens), old.is_prefix_of_tokens(&ids));
+                assert_eq!(old.is_prefix_of_tokens(&ids), len < tokens.len());
+            }
+            for take in 0..=completion.len() {
+                let mut joined = tokens.clone();
+                joined.extend_from_slice(&completion[..take]);
+                assert_eq!(
+                    TokenPrefix::of_prompt_and_completion(&ids, tokens.len(), &completion[..take]),
+                    TokenPrefix::of(&joined)
+                );
+            }
+        }
+        // A different token anywhere in the prefix is a mismatch, as before.
+        let prefix = TokenPrefix::of(&PREV);
+        assert!(prefix.is_prefix_of_tokens(&to_token_ids(&NEXT)));
+        assert!(!prefix.is_prefix_of_tokens(&to_token_ids(&[1, 2, 3, 4, 6, 6, 7, 8])));
+        assert!(!prefix.is_prefix_of_tokens(&to_token_ids(&PREV)));
+    }
+
+    #[test]
+    fn handles_and_lookups_agree_for_token_ids_and_slices() {
+        for prompt in token_lists() {
+            let ids = to_token_ids(&prompt);
+            let completion: [i64; 2] = [1001, 2001];
+            for covered in [
+                1,
+                prompt.len(),
+                prompt.len() + 1,
+                prompt.len() + 2,
+                prompt.len() + 3,
+            ] {
+                let mut params = handle("localhost");
+                params["remote_num_tokens"] = json!(covered);
+                let old = decode_handle_from_response(
+                    &params,
+                    "http://10.0.0.7:8000",
+                    &prompt,
+                    &completion,
+                );
+                let new = decode_handle_from_response_tokens(
+                    &params,
+                    "http://10.0.0.7:8000",
+                    &ids,
+                    &completion,
+                );
+                assert_eq!(new, old, "covered {} of {}", covered, prompt.len());
+            }
+            // A handle cached by a turn is found by the next turn either way.
+            let mut next = prompt.clone();
+            next.extend_from_slice(&[1001, 2001, 7]);
+            let covering = TokenPrefix::of(&next[..prompt.len() + 1]);
+            for (cached, expected) in [
+                (covering, HandleLookup::Hit),
+                (TokenPrefix::of(&[42, 43]), HandleLookup::PrefixMismatch),
+            ] {
+                let cache = BidirectionalKvCache::new(Duration::from_secs(450), 16);
+                cache.put("a", handle("10.0.0.2"), cached, KEY);
+                cache.put("b", handle("10.0.0.2"), cached, KEY);
+                let old = cache.take("a", KEY, &next);
+                let new = cache.take_tokens("b", KEY, &to_token_ids(&next));
+                assert_eq!(new, old);
+                assert_eq!(new.1, expected);
+            }
+        }
     }
 }

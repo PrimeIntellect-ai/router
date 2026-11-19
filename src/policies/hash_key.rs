@@ -104,6 +104,15 @@ pub(crate) fn extract_session_id(
     session_id
 }
 
+/// Whether a session header settles both [`extract_session_id`] and
+/// [`extract_hash_key`] without the request body: each looks the session
+/// headers up first, in this order, and only reads the body when none is set.
+pub(crate) fn has_session_header(headers: &RequestHeaders) -> bool {
+    SESSION_HEADER_NAMES
+        .iter()
+        .any(|name| headers.get(*name).is_some_and(|value| !value.is_empty()))
+}
+
 /// Extract hash key from HTTP headers
 pub(crate) fn extract_hash_key_from_headers(headers: &RequestHeaders) -> Option<String> {
     for header_name in HASH_HEADER_NAMES {
