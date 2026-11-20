@@ -2,6 +2,7 @@
 // This module extends PdRouterBase to handle vLLM-specific two-stage processing
 use super::dp_utils;
 use super::logprobs_merge;
+use super::pd_bidirectional::{self, BidirectionalKvCache, HandleLookup};
 use super::pd_router::PdRouterBase;
 use super::pd_types::{error_chain, PDRouterError};
 use super::routed_experts_merge;
@@ -65,6 +66,133 @@ pub struct VllmPDRouter {
     kv_connector: KvConnector,
     /// Mooncake bootstrap info: prefill base_url -> MooncakePrefillInfo
     mooncake_prefill_info: Arc<Mutex<HashMap<String, MooncakePrefillInfo>>>,
+    /// Per-session decode KV handles for bidirectional transfer (direct URL mode, NIXL)
+    bidirectional_kv: Option<Arc<BidirectionalKvCache>>,
+    /// Whole-turn retries after a connection error (direct URL mode)
+    pd_turn_retries: u32,
+}
+
+/// What a failed prefill+decode attempt hands back.
+enum TurnFailure {
+    /// Router-side failure (connection error, unusable body), returned as a 500.
+    Error(PDRouterError),
+    /// A non-2xx response from prefill or decode, returned to the client as-is.
+    Upstream(Response),
+}
+
+/// Failure of one prefill+decode attempt. `retryable` marks failures that a
+/// whole-turn retry with a fresh prefill can recover from: connection-level
+/// errors (request not sent, body not received) and 5xx responses. 4xx responses
+/// and bodies that arrived but cannot be used are returned as they are.
+struct TurnError {
+    failure: TurnFailure,
+    retryable: bool,
+}
+
+impl TurnError {
+    fn retryable(error: PDRouterError) -> Self {
+        Self {
+            failure: TurnFailure::Error(error),
+            retryable: true,
+        }
+    }
+
+    fn fatal(error: PDRouterError) -> Self {
+        Self {
+            failure: TurnFailure::Error(error),
+            retryable: false,
+        }
+    }
+
+    /// A non-2xx upstream response: retryable if it is a 5xx.
+    fn upstream(response: Response) -> Self {
+        let retryable = response.status().is_server_error();
+        Self {
+            failure: TurnFailure::Upstream(response),
+            retryable,
+        }
+    }
+
+    fn describe(&self) -> String {
+        match &self.failure {
+            TurnFailure::Error(e) => e.to_string(),
+            TurnFailure::Upstream(r) => format!("upstream returned {}", r.status()),
+        }
+    }
+}
+
+/// Rebuild an upstream response (status, headers, body) for the client. Framing
+/// headers are dropped; axum recomputes them for the buffered body.
+fn upstream_response(
+    status: StatusCode,
+    headers: &reqwest::header::HeaderMap,
+    body: bytes::Bytes,
+) -> Response {
+    let mut builder = axum::http::Response::builder().status(status);
+    for (name, value) in headers.iter() {
+        if name != axum::http::header::CONTENT_LENGTH
+            && name != axum::http::header::TRANSFER_ENCODING
+        {
+            builder = builder.header(name, value);
+        }
+    }
+    builder
+        .body(axum::body::Body::from(body))
+        .unwrap_or_else(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to build upstream error response: {}", e),
+            )
+                .into_response()
+        })
+}
+
+/// Path of the token-in endpoint, the only one whose turns use bidirectional
+/// transfer: the router can verify the exact token prefix a handle covers.
+const TOKEN_IN_GENERATE_PATH: &str = "/inference/v1/generate";
+
+/// Bidirectional-transfer state of one token-in session turn.
+#[derive(Debug)]
+struct BidirectionalTurn {
+    /// Session key (same lookup as `/finish_session`)
+    session: String,
+    /// Whether the turn may capture or use a handle (false for multimodal requests)
+    eligible: bool,
+    /// The turn's prompt token ids, to fingerprint what decode keeps for the next turn
+    prompt: Vec<i64>,
+    /// Fingerprint of the other inputs that change the KV (model, cache salt)
+    request_key: u64,
+}
+
+/// Reads only `kv_transfer_params` and the choices' token ids from a decode
+/// response body; other fields are skipped.
+#[derive(serde::Deserialize)]
+struct DecodeResponseView {
+    #[serde(default)]
+    kv_transfer_params: Option<Value>,
+    #[serde(default)]
+    choices: Vec<ChoiceTokenIds>,
+}
+
+#[derive(serde::Deserialize)]
+struct ChoiceTokenIds {
+    #[serde(default)]
+    token_ids: Option<Vec<i64>>,
+}
+
+/// Only non-streaming decode bodies that failed to arrive are worth a retry; merge
+/// and serialization failures would fail the same way again.
+fn is_retryable_decode_error(message: &str) -> bool {
+    message.starts_with("Failed to read decode response")
+}
+
+/// Session-affine policies keep a session on the same prefill and decode
+/// instance, so decode can also serve the old prefix from its local cache.
+fn is_session_affine_policy(name: &str) -> bool {
+    matches!(
+        name,
+        "consistent_hash" | "rendezvous_hash" | "sticky_least_loaded"
+    )
 }
 
 /// Transfer ID prefix used by MoRI-IO to correlate prefill and decode legs.
@@ -783,6 +911,7 @@ impl VllmPDRouter {
         is_streaming: bool,
         needs_logprobs: bool,
         run_id: Option<&str>,
+        bidirectional_capture: Option<(&BidirectionalTurn, &str)>,
     ) -> Result<Response, String> {
         debug!(
             "Decode server responded with status: {}",
@@ -836,6 +965,22 @@ impl VllmPDRouter {
 
             let mut decode_json: Value = serde_json::from_slice(&decode_body)
                 .map_err(|e| format!("Failed to parse decode response as JSON: {}", e))?;
+            if status.is_success() {
+                if let Some((turn, decode_url)) = bidirectional_capture {
+                    let completion = match decode_json.get("choices").and_then(Value::as_array) {
+                        Some(choices) if choices.len() == 1 => {
+                            pd_bidirectional::request_token_ids(&choices[0])
+                        }
+                        _ => None,
+                    };
+                    self.cache_decode_handle(
+                        turn,
+                        decode_url,
+                        decode_json.get("kv_transfer_params"),
+                        completion,
+                    );
+                }
+            }
 
             let empty_json = Value::Null;
             let prefill_json_ref = prefill_response_json.unwrap_or(&empty_json);
@@ -946,6 +1091,22 @@ impl VllmPDRouter {
             if status.is_success() {
                 usage_metrics::record_run_request(rid);
                 usage_metrics::extract_and_record_usage(rid, &body);
+            }
+        }
+        if status.is_success() {
+            if let Some((turn, decode_url)) = bidirectional_capture {
+                if let Ok(view) = serde_json::from_slice::<DecodeResponseView>(&body) {
+                    let completion = match view.choices.as_slice() {
+                        [only] => only.token_ids.clone(),
+                        _ => None,
+                    };
+                    self.cache_decode_handle(
+                        turn,
+                        decode_url,
+                        view.kv_transfer_params.as_ref(),
+                        completion,
+                    );
+                }
             }
         }
         // Copy prefill-only metadata (prompt_token_ids, routed_experts) into
@@ -1313,6 +1474,7 @@ impl VllmPDRouter {
                     is_streaming,
                     needs_logprobs,
                     run_id,
+                    None,
                 )
                 .await;
         }
@@ -1355,6 +1517,7 @@ impl VllmPDRouter {
             is_streaming,
             needs_logprobs,
             run_id,
+            None,
         )
         .await
     }
@@ -1364,6 +1527,7 @@ impl VllmPDRouter {
     /// This function handles fine-grained load tracking: the prefill worker's load is only
     /// incremented during the prefill phase, and the decode worker's load is only incremented
     /// during the decode phase. This accurately reflects the sequential nature of PD disaggregation.
+    #[allow(clippy::too_many_arguments)]
     async fn process_vllm_two_stage_request(
         &self,
         original_request: Value,
@@ -1372,7 +1536,8 @@ impl VllmPDRouter {
         path: &str,
         headers: Option<&HeaderMap>,
         run_id: Option<&str>,
-    ) -> Result<Response, PDRouterError> {
+        bidirectional: Option<(&BidirectionalTurn, Option<Value>)>,
+    ) -> Result<Response, TurnError> {
         debug!("ENTERED process_vllm_two_stage_request method");
         let start_time = Instant::now();
         debug!(
@@ -1413,7 +1578,22 @@ impl VllmPDRouter {
                 Some(&decode_base_url),
                 decode_worker.dp_rank(),
             )
-            .map_err(|reason| PDRouterError::InvalidConfiguration { reason })?;
+            .map_err(|reason| TurnError::fatal(PDRouterError::InvalidConfiguration { reason }))?;
+
+        // Bidirectional transfer: prefill reads the previous turn's KV (prompt and
+        // completion) from the decode instance that still holds it, then computes
+        // only the new tokens. The handle was taken out of the session cache, so it
+        // is used by this attempt only.
+        let (bidirectional_turn, decode_handle) = match bidirectional {
+            Some((turn, handle)) => (Some(turn), handle),
+            None => (None, None),
+        };
+        if let Some(handle) = decode_handle {
+            if matches!(self.kv_connector, KvConnector::Nixl) {
+                prefill_request["kv_transfer_params"] =
+                    pd_bidirectional::prefill_params_from_decode_handle(&handle);
+            }
+        }
 
         debug!(
             "Added kv_transfer_params to prefill request for {:?} connector",
@@ -1484,17 +1664,17 @@ impl VllmPDRouter {
                 RouterMetrics::record_pd_prefill_error(&prefill_base_url);
                 RouterMetrics::record_pd_request(path);
                 RouterMetrics::record_pd_request_duration(path, duration);
-                return Err(PDRouterError::NetworkError {
+                self.stop_profiling(&prefill_base_url).await;
+                return Err(TurnError::retryable(PDRouterError::NetworkError {
                     message: format!("Prefill request failed to {}: {}", prefill_url, full_error),
-                });
+                }));
             }
         };
 
-        debug!("📥 Prefill response status: {}", prefill_response.status());
-        debug!(
-            "📥 Prefill response headers: {:?}",
-            prefill_response.headers()
-        );
+        let prefill_status = prefill_response.status();
+        let prefill_headers = prefill_response.headers().clone();
+        debug!("📥 Prefill response status: {}", prefill_status);
+        debug!("📥 Prefill response headers: {:?}", prefill_headers);
 
         // Extract prefill response body to get kv_transfer_params
         let prefill_bytes = match prefill_response.bytes().await {
@@ -1506,12 +1686,13 @@ impl VllmPDRouter {
                 RouterMetrics::record_pd_prefill_error(&prefill_base_url);
                 RouterMetrics::record_pd_request(path);
                 RouterMetrics::record_pd_request_duration(path, duration);
-                return Err(PDRouterError::NetworkError {
+                self.stop_profiling(&prefill_base_url).await;
+                return Err(TurnError::retryable(PDRouterError::NetworkError {
                     message: format!(
                         "Failed to read prefill response from {}: {}",
                         prefill_url, full_error
                     ),
-                });
+                }));
             }
         };
 
@@ -1526,7 +1707,28 @@ impl VllmPDRouter {
             );
         }
 
-        // Parse prefill response to extract kv_transfer_params
+        // A failed prefill never proceeds to decode: its error goes back to the
+        // client (5xx may be retried with a fresh prefill, 4xx is final).
+        if !prefill_status.is_success() {
+            prefill_worker.decrement_load();
+            let duration = start_time.elapsed();
+            RouterMetrics::record_pd_prefill_error(&prefill_base_url);
+            RouterMetrics::record_pd_request(path);
+            RouterMetrics::record_pd_request_duration(path, duration);
+            warn!(
+                "Prefill {} returned {}; not sending the turn to decode",
+                prefill_url, prefill_status
+            );
+            self.stop_profiling(&prefill_base_url).await;
+            return Err(TurnError::upstream(upstream_response(
+                prefill_status,
+                &prefill_headers,
+                prefill_bytes,
+            )));
+        }
+
+        // Parse prefill response to extract kv_transfer_params. A complete body
+        // that is not JSON would fail the same way again: not retried.
         let prefill_response_json: Value = match serde_json::from_slice(&prefill_bytes) {
             Ok(json) => json,
             Err(e) => {
@@ -1535,9 +1737,10 @@ impl VllmPDRouter {
                 RouterMetrics::record_pd_prefill_error(&prefill_base_url);
                 RouterMetrics::record_pd_request(path);
                 RouterMetrics::record_pd_request_duration(path, duration);
-                return Err(PDRouterError::NetworkError {
+                self.stop_profiling(&prefill_base_url).await;
+                return Err(TurnError::fatal(PDRouterError::NetworkError {
                     message: format!("Failed to parse prefill response as JSON: {}", e),
-                });
+                }));
             }
         };
 
@@ -1666,14 +1869,45 @@ impl VllmPDRouter {
                 RouterMetrics::record_pd_request(path);
                 RouterMetrics::record_pd_request_duration(path, duration);
                 RouterMetrics::record_pd_prefill_request(&prefill_base_url);
-                return Err(PDRouterError::NetworkError {
+                self.stop_profiling(&decode_base_url).await;
+                return Err(TurnError::retryable(PDRouterError::NetworkError {
                     message: format!("Decode request failed to {}: {}", decode_url, full_error),
-                });
+                }));
             }
         };
 
         // Decode phase complete: decrement decode load
         decode_worker.decrement_load();
+
+        // A 5xx from decode is handed back for a possible whole-turn retry (fresh
+        // prefill, no decode handle) instead of being streamed to the client; 4xx
+        // and success responses go through the normal response handling.
+        let decode_status = decode_response.status();
+        if decode_status.is_server_error() {
+            let decode_headers = decode_response.headers().clone();
+            self.stop_profiling(&decode_base_url).await;
+            let duration = start_time.elapsed();
+            RouterMetrics::record_pd_request(path);
+            RouterMetrics::record_pd_request_duration(path, duration);
+            RouterMetrics::record_pd_prefill_request(&prefill_base_url);
+            RouterMetrics::record_pd_decode_request(&decode_base_url);
+            RouterMetrics::record_pd_decode_error(&decode_base_url);
+            let body = decode_response.bytes().await.map_err(|e| {
+                TurnError::retryable(PDRouterError::NetworkError {
+                    message: format!(
+                        "Failed to read decode response from {}: {}",
+                        decode_url,
+                        error_chain(&e)
+                    ),
+                })
+            })?;
+            warn!("Decode {} returned {}", decode_url, decode_status);
+            return Err(TurnError::upstream(upstream_response(
+                decode_status,
+                &decode_headers,
+                body,
+            )));
+        }
 
         // Check if logprobs merging is needed
         let needs_logprobs = original_request.get("logprobs").is_some()
@@ -1688,6 +1922,7 @@ impl VllmPDRouter {
 
         // Response handling (profiling stop, PD metrics, logprobs merge,
         // streaming/buffered forwarding) is shared with the discovered paths.
+        let capture = bidirectional_turn.map(|turn| (turn, decode_base_url.as_str()));
         self.handle_decode_response(
             decode_response,
             Some(&prefill_response_json),
@@ -1699,9 +1934,246 @@ impl VllmPDRouter {
             is_streaming,
             needs_logprobs,
             run_id,
+            capture,
         )
         .await
-        .map_err(|message| PDRouterError::NetworkError { message })
+        .map_err(|message| {
+            let error = PDRouterError::NetworkError {
+                message: message.clone(),
+            };
+            if is_retryable_decode_error(&message) {
+                TurnError::retryable(error)
+            } else {
+                TurnError::fatal(error)
+            }
+        })
+    }
+
+    /// Bidirectional-transfer state for a turn, if the mode is on and the turn
+    /// is a token-in request (the router must verify the exact token prefix a
+    /// handle covers; text requests are re-tokenized and chat templates often
+    /// re-render history) that belongs to a session (same lookup as
+    /// `/finish_session`: x-session-id and the other session headers first, then
+    /// session fields in the body). Multimodal turns are returned as ineligible:
+    /// they neither capture nor use a handle, and drop the session's handle.
+    fn bidirectional_turn(
+        &self,
+        path: &str,
+        request: &Value,
+        request_text: Option<&str>,
+        request_headers: Option<&HashMap<String, String>>,
+    ) -> Option<BidirectionalTurn> {
+        self.bidirectional_kv.as_ref()?;
+        if path != TOKEN_IN_GENERATE_PATH {
+            return None;
+        }
+        let session = crate::policies::extract_session_id(request_text, request_headers)?;
+        if pd_bidirectional::has_multimodal_inputs(request) {
+            return Some(BidirectionalTurn {
+                session,
+                eligible: false,
+                prompt: Vec::new(),
+                request_key: 0,
+            });
+        }
+        let prompt = pd_bidirectional::request_token_ids(request)?;
+        Some(BidirectionalTurn {
+            session,
+            eligible: true,
+            prompt,
+            request_key: pd_bidirectional::request_key(request),
+        })
+    }
+
+    /// Cache the handle decode returned for the session's next turn.
+    fn cache_decode_handle(
+        &self,
+        turn: &BidirectionalTurn,
+        decode_url: &str,
+        params: Option<&Value>,
+        completion: Option<Vec<i64>>,
+    ) {
+        let Some(cache) = self.bidirectional_kv.as_ref() else {
+            return;
+        };
+        let (Some(params), Some(completion)) = (params, completion) else {
+            return;
+        };
+        let Some((handle, prefix)) = pd_bidirectional::decode_handle_from_response(
+            params,
+            decode_url,
+            &turn.prompt,
+            &completion,
+        ) else {
+            return;
+        };
+        if cache.put(&turn.session, handle, prefix, turn.request_key) {
+            RouterMetrics::record_pd_bidirectional_handle_cached();
+        } else {
+            RouterMetrics::record_pd_bidirectional_handle_dropped("cache_full", 1);
+            warn!(
+                "Bidirectional KV cache is full ({} sessions); not caching session {}",
+                cache.len(),
+                turn.session
+            );
+        }
+    }
+
+    /// Run one P/D turn on the selected workers (direct URL mode).
+    ///
+    /// With bidirectional transfer on, the session's decode handle is taken out of
+    /// the cache before anything else, so it is used at most once whatever happens
+    /// to this turn. A retry after a connection error runs a fresh prefill without
+    /// the handle (the first attempt may already have read it, and decode frees the
+    /// blocks after one read) and never forwards the failed attempt's prefill
+    /// params to decode.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_direct_turn(
+        &self,
+        mut request_json: Value,
+        prefill_worker: Arc<dyn Worker>,
+        decode_worker: Arc<dyn Worker>,
+        path: &str,
+        headers: Option<&HeaderMap>,
+        run_id: Option<&str>,
+        bidirectional: Option<BidirectionalTurn>,
+    ) -> Result<Response, PDRouterError> {
+        let mut decode_handle = None;
+        if let (Some(cache), Some(turn)) = (&self.bidirectional_kv, bidirectional.as_ref()) {
+            if turn.eligible {
+                let (handle, lookup) = cache.take(&turn.session, turn.request_key, &turn.prompt);
+                RouterMetrics::record_pd_bidirectional_turn(lookup.as_str());
+                match lookup {
+                    HandleLookup::Expired
+                    | HandleLookup::PrefixMismatch
+                    | HandleLookup::RequestMismatch => {
+                        RouterMetrics::record_pd_bidirectional_handle_dropped(lookup.as_str(), 1)
+                    }
+                    HandleLookup::Hit | HandleLookup::Miss => {}
+                }
+                decode_handle = handle;
+            } else {
+                RouterMetrics::record_pd_bidirectional_turn("ineligible_request");
+                if cache.remove(&turn.session) {
+                    RouterMetrics::record_pd_bidirectional_handle_dropped("ineligible_request", 1);
+                }
+            }
+        }
+        // Ineligible turns neither use nor capture a handle.
+        let bidirectional = bidirectional.filter(|turn| turn.eligible);
+
+        let mut attempt: u32 = 0;
+        loop {
+            let had_handle = decode_handle.is_some();
+            let request = if attempt < self.pd_turn_retries {
+                request_json.clone()
+            } else {
+                std::mem::take(&mut request_json)
+            };
+            match self
+                .process_vllm_two_stage_request(
+                    request,
+                    prefill_worker.clone(),
+                    decode_worker.clone(),
+                    path,
+                    headers,
+                    run_id,
+                    bidirectional
+                        .as_ref()
+                        .map(|turn| (turn, decode_handle.take())),
+                )
+                .await
+            {
+                Ok(response) => return Ok(response),
+                Err(e) if e.retryable && attempt < self.pd_turn_retries => {
+                    attempt += 1;
+                    RouterMetrics::record_pd_turn_retry(had_handle);
+                    if had_handle {
+                        RouterMetrics::record_pd_bidirectional_handle_dropped("retry", 1);
+                    }
+                    warn!(
+                        "P/D turn attempt {} failed ({}), retrying with a fresh prefill{}",
+                        attempt,
+                        e.describe(),
+                        if had_handle {
+                            " and without the previous turn's decode KV"
+                        } else {
+                            ""
+                        }
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(100 * attempt as u64))
+                        .await;
+                }
+                Err(e) => {
+                    return match e.failure {
+                        TurnFailure::Error(error) => Err(error),
+                        TurnFailure::Upstream(response) => Ok(response),
+                    }
+                }
+            }
+        }
+    }
+
+    /// Build the bidirectional KV cache (direct URL mode with NIXL only) and start
+    /// its sweeper.
+    fn build_bidirectional_kv(
+        ctx: &Arc<crate::server::AppContext>,
+        use_discovery: bool,
+    ) -> Option<Arc<BidirectionalKvCache>> {
+        let cfg = &ctx.router_config.pd_bidirectional_kv;
+        if !cfg.enabled {
+            return None;
+        }
+        if use_discovery {
+            warn!("--pd-bidirectional-kv is only supported with direct --prefill/--decode URLs; ignoring it in service discovery mode");
+            return None;
+        }
+        if !matches!(ctx.router_config.kv_connector, KvConnector::Nixl) {
+            warn!(
+                "--pd-bidirectional-kv requires the NIXL connector (kv_connector={:?}); ignoring it",
+                ctx.router_config.kv_connector
+            );
+            return None;
+        }
+        for (role, policy) in [
+            ("prefill", ctx.policy_registry.get_prefill_policy()),
+            ("decode", ctx.policy_registry.get_decode_policy()),
+        ] {
+            if !is_session_affine_policy(policy.name()) {
+                warn!(
+                    "Bidirectional KV transfer with {} policy '{}': turns of a session can land on different instances, which still works but loses local prefix-cache reuse; prefer consistent_hash, rendezvous_hash or sticky_least_loaded",
+                    role,
+                    policy.name()
+                );
+            }
+        }
+        let ttl = std::time::Duration::from_secs(cfg.ttl_secs);
+        let cache = Arc::new(BidirectionalKvCache::new(ttl, cfg.max_sessions));
+        info!(
+            "Bidirectional KV transfer enabled: handle TTL {}s, up to {} sessions",
+            cfg.ttl_secs, cfg.max_sessions
+        );
+        let weak = Arc::downgrade(&cache);
+        let period = (ttl / 4).clamp(
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(30),
+        );
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(period);
+            loop {
+                tick.tick().await;
+                let Some(cache) = weak.upgrade() else { break };
+                let expired = cache.sweep();
+                if expired > 0 {
+                    RouterMetrics::record_pd_bidirectional_handle_dropped(
+                        "expired",
+                        expired as u64,
+                    );
+                }
+                RouterMetrics::set_pd_bidirectional_cached_sessions(cache.len());
+            }
+        });
+        Some(cache)
     }
 
     /// Create a new vLLM PD router
@@ -1754,6 +2226,8 @@ impl VllmPDRouter {
                 prefill_dp_round_robin: Arc::new(AtomicUsize::new(0)),
                 kv_connector,
                 mooncake_prefill_info: Arc::new(Mutex::new(HashMap::new())),
+                bidirectional_kv: Self::build_bidirectional_kv(ctx, true),
+                pd_turn_retries: ctx.router_config.pd_turn_retries,
             })
         } else {
             // Direct URL mode (same as PdRouterBase)
@@ -1843,6 +2317,8 @@ impl VllmPDRouter {
                 prefill_dp_round_robin: Arc::new(AtomicUsize::new(0)),
                 kv_connector,
                 mooncake_prefill_info,
+                bidirectional_kv: Self::build_bidirectional_kv(ctx, false),
+                pd_turn_retries: ctx.router_config.pd_turn_retries,
             })
         }
     }
@@ -2120,13 +2596,14 @@ impl RouterTrait for VllmPDRouter {
 
             // Execute dual dispatch with vLLM two-stage processing
             let resp = match self
-                .process_vllm_two_stage_request(
+                .run_direct_turn(
                     request_json,
                     prefill_worker.clone(),
                     decode_worker.clone(),
                     "/v1/chat/completions",
                     headers,
                     run_id,
+                    None,
                 )
                 .await
             {
@@ -2293,13 +2770,14 @@ impl RouterTrait for VllmPDRouter {
 
             // Execute dual dispatch with vLLM two-stage processing
             let resp = match self
-                .process_vllm_two_stage_request(
+                .run_direct_turn(
                     request_json,
                     prefill_worker.clone(),
                     decode_worker.clone(),
                     "/v1/completions",
                     headers,
                     run_id,
+                    None,
                 )
                 .await
             {
@@ -2396,6 +2874,16 @@ impl RouterTrait for VllmPDRouter {
 
     fn router_type(&self) -> &'static str {
         "vllm_pd"
+    }
+
+    fn finish_session(&self, session_id: &str) {
+        // The session will not send another turn: forget its decode handle. The
+        // blocks themselves are released by decode when its TTL runs out.
+        if let Some(cache) = self.bidirectional_kv.as_ref() {
+            if cache.remove(session_id) {
+                RouterMetrics::record_pd_bidirectional_handle_dropped("finish_session", 1);
+            }
+        }
     }
 
     fn readiness(&self) -> Response {
@@ -2512,6 +3000,8 @@ impl RouterTrait for VllmPDRouter {
 
             let prefill_worker = &prefill_workers[prefill_idx];
             let decode_worker = &decode_workers[decode_idx];
+            let bidirectional =
+                self.bidirectional_turn(path, &request_json, request_str, request_headers.as_ref());
 
             debug!(
                 "Transparent proxy: prefill={}, decode={}",
@@ -2521,13 +3011,14 @@ impl RouterTrait for VllmPDRouter {
 
             // Execute two-stage processing
             match self
-                .process_vllm_two_stage_request(
+                .run_direct_turn(
                     request_json,
                     prefill_worker.clone(),
                     decode_worker.clone(),
                     path,
                     headers,
                     run_id,
+                    bidirectional,
                 )
                 .await
             {
@@ -2914,5 +3405,596 @@ mod tests {
     fn test_moriio_write_decode_params_includes_remote_dp_rank_when_dp_size_gt_1() {
         let params = moriio_write_decode_params(Some("tx-abc"), 4, Some(2));
         assert_eq!(params["remote_dp_rank"], 2);
+    }
+
+    // --- Bidirectional KV transfer and turn retries (direct URL mode) ---
+
+    /// Injected upstream failure for the mock servers.
+    #[derive(Clone, Copy)]
+    enum MockFailure {
+        Status(u16),
+        NonJson,
+    }
+
+    type FailureQueue = Arc<std::sync::Mutex<std::collections::VecDeque<MockFailure>>>;
+
+    fn mock_failure_response(failure: MockFailure) -> Response {
+        match failure {
+            MockFailure::Status(code) => (
+                StatusCode::from_u16(code).unwrap(),
+                axum::Json(json!({"error": {"message": format!("mock {}", code)}})),
+            )
+                .into_response(),
+            MockFailure::NonJson => "upstream connect error".into_response(),
+        }
+    }
+
+    /// Mock prefill/decode pair for /inference/v1/generate and /v1/completions.
+    /// Records the kv_transfer_params each side receives. Decode generates two
+    /// tokens per call and returns a retained-blocks handle (remote_request_id
+    /// "d-<n>", host "localhost") covering prompt + completion - 1 tokens, like
+    /// vLLM. Queued failures are returned by the next requests.
+    struct BidirMock {
+        prefill_url: String,
+        decode_url: String,
+        prefill_params: Arc<std::sync::Mutex<Vec<Value>>>,
+        decode_params: Arc<std::sync::Mutex<Vec<Value>>>,
+        prefill_failures: FailureQueue,
+        decode_failures: FailureQueue,
+        /// "<role>:start" / "<role>:stop" for each profiling call the router makes.
+        profile_calls: Arc<std::sync::Mutex<Vec<String>>>,
+        servers: Vec<tokio::task::JoinHandle<()>>,
+    }
+
+    impl BidirMock {
+        async fn start() -> Self {
+            let prefill_params = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let decode_params = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let prefill_failures: FailureQueue = Default::default();
+            let decode_failures: FailureQueue = Default::default();
+            let decode_calls = Arc::new(AtomicUsize::new(0));
+            let profile_calls: Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+            let profile_route = |calls: &Arc<std::sync::Mutex<Vec<String>>>,
+                                 event: &'static str| {
+                let calls = calls.clone();
+                axum::routing::post(move || {
+                    let calls = calls.clone();
+                    async move {
+                        calls.lock().unwrap().push(event.to_string());
+                        "ok"
+                    }
+                })
+            };
+
+            let (pp, pf) = (prefill_params.clone(), prefill_failures.clone());
+            let prefill = move |axum::Json(body): axum::Json<Value>| {
+                let (pp, pf) = (pp.clone(), pf.clone());
+                async move {
+                    pp.lock().unwrap().push(body["kv_transfer_params"].clone());
+                    if let Some(failure) = pf.lock().unwrap().pop_front() {
+                        return mock_failure_response(failure);
+                    }
+                    axum::Json(json!({
+                        "choices": [{"token_ids": [1]}],
+                        "kv_transfer_params": {
+                            "do_remote_prefill": true, "do_remote_decode": false,
+                            "remote_block_ids": [[10, 11]], "remote_engine_id": "p0",
+                            "remote_request_id": "p-req", "remote_host": "10.9.9.9",
+                            "remote_port": 5600
+                        }
+                    }))
+                    .into_response()
+                }
+            };
+            let (dp, df, dc) = (
+                decode_params.clone(),
+                decode_failures.clone(),
+                decode_calls.clone(),
+            );
+            let decode = move |axum::Json(body): axum::Json<Value>| {
+                let (dp, df, dc) = (dp.clone(), df.clone(), dc.clone());
+                async move {
+                    dp.lock().unwrap().push(body["kv_transfer_params"].clone());
+                    if let Some(failure) = df.lock().unwrap().pop_front() {
+                        return mock_failure_response(failure);
+                    }
+                    let n = dc.fetch_add(1, Ordering::SeqCst) + 1;
+                    let prompt_len = body["token_ids"].as_array().map_or(0, Vec::len);
+                    axum::Json(json!({
+                        "choices": [{"token_ids": [1000 + n, 2000 + n]}],
+                        "kv_transfer_params": {
+                            "do_remote_prefill": false, "do_remote_decode": true,
+                            "remote_block_ids": [[n, n + 1], [n + 2]],
+                            "remote_engine_id": "d0", "remote_request_id": format!("d-{}", n),
+                            "remote_host": "localhost", "remote_port": 5700,
+                            "remote_num_tokens": prompt_len + 1
+                        }
+                    }))
+                    .into_response()
+                }
+            };
+
+            let mut servers = Vec::new();
+            let mut urls = Vec::new();
+            for app in [
+                axum::Router::new()
+                    .route("/health", axum::routing::get(|| async { "ok" }))
+                    .route(
+                        "/start_profile",
+                        profile_route(&profile_calls, "prefill:start"),
+                    )
+                    .route(
+                        "/stop_profile",
+                        profile_route(&profile_calls, "prefill:stop"),
+                    )
+                    .route(
+                        "/inference/v1/generate",
+                        axum::routing::post(prefill.clone()),
+                    )
+                    .route("/v1/completions", axum::routing::post(prefill)),
+                axum::Router::new()
+                    .route("/health", axum::routing::get(|| async { "ok" }))
+                    .route(
+                        "/start_profile",
+                        profile_route(&profile_calls, "decode:start"),
+                    )
+                    .route(
+                        "/stop_profile",
+                        profile_route(&profile_calls, "decode:stop"),
+                    )
+                    .route(
+                        "/inference/v1/generate",
+                        axum::routing::post(decode.clone()),
+                    )
+                    .route("/v1/completions", axum::routing::post(decode)),
+            ] {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                urls.push(format!("http://{}", listener.local_addr().unwrap()));
+                servers.push(tokio::spawn(async move {
+                    axum::serve(listener, app).await.unwrap();
+                }));
+            }
+            Self {
+                prefill_url: urls[0].clone(),
+                decode_url: urls[1].clone(),
+                prefill_params,
+                decode_params,
+                prefill_failures,
+                decode_failures,
+                profile_calls,
+                servers,
+            }
+        }
+
+        async fn router(&self, bidirectional: bool, turn_retries: u32) -> VllmPDRouter {
+            self.router_with(bidirectional, turn_retries, false).await
+        }
+
+        async fn router_with(
+            &self,
+            bidirectional: bool,
+            turn_retries: u32,
+            profiling: bool,
+        ) -> VllmPDRouter {
+            use crate::config::{PdBidirectionalKvConfig, RouterConfig};
+            use crate::policies::ConsistentHashPolicy;
+            use crate::server::AppContext;
+            let config = RouterConfig {
+                pd_bidirectional_kv: PdBidirectionalKvConfig {
+                    enabled: bidirectional,
+                    ..Default::default()
+                },
+                pd_turn_retries: turn_retries,
+                enable_profiling: profiling,
+                ..Default::default()
+            };
+            let context = Arc::new(
+                AppContext::new(config, reqwest::Client::new(), 10, None, vec![]).unwrap(),
+            );
+            context
+                .policy_registry
+                .set_prefill_policy(Arc::new(ConsistentHashPolicy::new()));
+            context
+                .policy_registry
+                .set_decode_policy(Arc::new(ConsistentHashPolicy::new()));
+            VllmPDRouter::new(
+                vec![(self.prefill_url.clone(), None)],
+                vec![self.decode_url.clone()],
+                None,
+                &context,
+            )
+            .await
+            .unwrap()
+        }
+
+        fn fail_prefill(&self, failures: &[MockFailure]) {
+            self.prefill_failures.lock().unwrap().extend(failures);
+        }
+
+        fn fail_decode(&self, failures: &[MockFailure]) {
+            self.decode_failures.lock().unwrap().extend(failures);
+        }
+
+        fn prefill_params(&self) -> Vec<Value> {
+            self.prefill_params.lock().unwrap().clone()
+        }
+
+        fn decode_params(&self) -> Vec<Value> {
+            self.decode_params.lock().unwrap().clone()
+        }
+
+        fn profile_calls(&self) -> Vec<String> {
+            self.profile_calls.lock().unwrap().clone()
+        }
+    }
+
+    impl Drop for BidirMock {
+        fn drop(&mut self) {
+            for server in &self.servers {
+                server.abort();
+            }
+        }
+    }
+
+    /// A token-in session as an agent or RL client drives it: each turn's prompt
+    /// is the previous prompt + the sampled tokens + new (tool/user) tokens.
+    /// `extra` holds other request fields (model, cache_salt, features, ...).
+    struct TokenSession {
+        id: &'static str,
+        tokens: Vec<i64>,
+        extra: Value,
+    }
+
+    impl TokenSession {
+        fn new(id: &'static str) -> Self {
+            Self {
+                id,
+                tokens: vec![1, 2, 3],
+                extra: json!({"model": "m"}),
+            }
+        }
+
+        /// Send one turn; returns the status and the body text.
+        async fn send(&mut self, router: &VllmPDRouter) -> (StatusCode, String) {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-session-id", self.id.parse().unwrap());
+            let mut body = json!({"token_ids": self.tokens, "sampling_params": {"max_tokens": 8}});
+            for (k, v) in self.extra.as_object().unwrap() {
+                body[k] = v.clone();
+            }
+            let response = router
+                .route_transparent(
+                    Some(&headers),
+                    "/inference/v1/generate",
+                    &Method::POST,
+                    body,
+                    None,
+                )
+                .await;
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            if status == StatusCode::OK {
+                let json: Value = serde_json::from_slice(&bytes).unwrap();
+                for t in json["choices"][0]["token_ids"].as_array().unwrap() {
+                    self.tokens.push(t.as_i64().unwrap());
+                }
+                self.tokens.extend([7, 8, 9]); // tool output for the next turn
+            }
+            (status, String::from_utf8_lossy(&bytes).into_owned())
+        }
+
+        async fn turn(&mut self, router: &VllmPDRouter) -> StatusCode {
+            self.send(router).await.0
+        }
+    }
+
+    fn assert_cold(params: &Value) {
+        assert_eq!(params["do_remote_decode"], true);
+        assert!(
+            params["remote_block_ids"].is_null(),
+            "unexpected handle: {}",
+            params
+        );
+    }
+
+    fn assert_reads(params: &Value, decode_request_id: &str) {
+        assert_eq!(params["do_remote_decode"], true);
+        assert_eq!(params["do_remote_prefill"], false);
+        assert_eq!(params["remote_request_id"], decode_request_id);
+        assert_eq!(params["remote_engine_id"], "d0");
+        // decode reported "localhost": replaced by the host the router reached decode on
+        assert_eq!(params["remote_host"], "127.0.0.1");
+        assert_eq!(params["remote_port"], 5700);
+    }
+
+    #[tokio::test]
+    async fn test_bidirectional_kv_hands_previous_turn_to_prefill_once() {
+        let mock = BidirMock::start().await;
+        let router = mock.router(true, 0).await;
+        let (mut s1, mut s2) = (TokenSession::new("s1"), TokenSession::new("s2"));
+        assert_eq!(s1.turn(&router).await, StatusCode::OK); // decode d-1
+        assert_eq!(s2.turn(&router).await, StatusCode::OK); // decode d-2
+        assert_eq!(s1.turn(&router).await, StatusCode::OK); // decode d-3
+        assert_eq!(s1.turn(&router).await, StatusCode::OK);
+        let p = mock.prefill_params();
+        assert_cold(&p[0]);
+        assert_cold(&p[1]); // other session: nothing to read
+        assert_reads(&p[2], "d-1");
+        assert_reads(&p[3], "d-3"); // the newest handle, never d-1 again
+                                    // decode still gets prefill's params for the current turn
+        for d in mock.decode_params() {
+            assert_eq!(d["remote_request_id"], "p-req");
+            assert_eq!(d["do_remote_prefill"], true);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_bidirectional_kv_requires_exact_token_prefix() {
+        // Prefill would use the pulled KV for the first remote_num_tokens positions
+        // without checking the tokens, so a prompt that does not extend the
+        // previous turn verbatim (e.g. re-rendered history) must not read it.
+        let mock = BidirMock::start().await;
+        let router = mock.router(true, 0).await;
+        let mut s1 = TokenSession::new("s1");
+        assert_eq!(s1.turn(&router).await, StatusCode::OK); // d-1
+                                                            // The first sampled token (covered by the handle) comes back changed; the
+                                                            // last sampled token is not covered (its KV was never computed).
+        s1.tokens[3] += 1;
+        assert_eq!(s1.turn(&router).await, StatusCode::OK); // d-2
+        assert_eq!(s1.turn(&router).await, StatusCode::OK);
+        let p = mock.prefill_params();
+        assert_cold(&p[1]);
+        assert_reads(&p[2], "d-2");
+    }
+
+    #[tokio::test]
+    async fn test_bidirectional_kv_requires_same_model_and_cache_salt() {
+        // The same tokens have different KV under another LoRA adapter (model)
+        // or prefix-cache salt.
+        let mock = BidirMock::start().await;
+        let router = mock.router(true, 0).await;
+        let mut s1 = TokenSession::new("s1");
+        s1.extra = json!({"model": "m", "cache_salt": "v1"});
+        assert_eq!(s1.turn(&router).await, StatusCode::OK); // d-1
+        s1.extra = json!({"model": "m", "cache_salt": "v2"});
+        assert_eq!(s1.turn(&router).await, StatusCode::OK); // d-2, salt changed
+        assert_eq!(s1.turn(&router).await, StatusCode::OK); // d-3
+        s1.extra = json!({"model": "lora-a", "cache_salt": "v2"});
+        assert_eq!(s1.turn(&router).await, StatusCode::OK); // d-4, model changed
+        s1.extra = json!({"model": "lora-a", "cache_salt": null});
+        assert_eq!(s1.turn(&router).await, StatusCode::OK); // d-5, salt removed
+        s1.extra = json!({"model": "lora-a"});
+        assert_eq!(s1.turn(&router).await, StatusCode::OK); // absent == null
+        let p = mock.prefill_params();
+        assert_cold(&p[1]);
+        assert_reads(&p[2], "d-2");
+        assert_cold(&p[3]);
+        assert_cold(&p[4]);
+        assert_reads(&p[5], "d-5");
+    }
+
+    #[tokio::test]
+    async fn test_bidirectional_kv_skips_multimodal_requests() {
+        // With features/content_parts, identical placeholder tokens can carry
+        // different images: such turns neither use nor capture a handle.
+        let mock = BidirMock::start().await;
+        let router = mock.router(true, 0).await;
+        let mut s1 = TokenSession::new("s1");
+        assert_eq!(s1.turn(&router).await, StatusCode::OK); // d-1, captured
+        s1.extra = json!({"model": "m", "features": {"mm_hashes": ["img-a"]}});
+        assert_eq!(s1.turn(&router).await, StatusCode::OK); // d-2, not captured
+        s1.extra = json!({"model": "m"});
+        assert_eq!(s1.turn(&router).await, StatusCode::OK); // d-3, captured
+        s1.extra = json!({"model": "m", "content_parts": [{"type": "image_url"}]});
+        assert_eq!(s1.turn(&router).await, StatusCode::OK); // drops d-3's handle
+        s1.extra = json!({"model": "m", "features": null, "content_parts": []});
+        assert_eq!(s1.turn(&router).await, StatusCode::OK); // empty: eligible again
+        assert_eq!(s1.turn(&router).await, StatusCode::OK);
+        let p = mock.prefill_params();
+        assert_cold(&p[1]); // multimodal turn does not read d-1
+        assert_cold(&p[2]); // and did not leave a handle behind
+        assert_cold(&p[3]); // multimodal turn does not read d-3
+        assert_cold(&p[4]); // d-3's handle was dropped, not kept for later
+        assert_reads(&p[5], "d-5");
+    }
+
+    #[tokio::test]
+    async fn test_bidirectional_kv_only_for_token_in_session_turns() {
+        let mock = BidirMock::start().await;
+        let router = mock.router(true, 0).await;
+        let mut headers = HeaderMap::new();
+        headers.insert("x-session-id", "s1".parse().unwrap());
+        // Text routes: the router cannot verify which tokens a handle covers.
+        for _ in 0..3 {
+            let body = json!({"model": "m", "prompt": "hi", "max_tokens": 8});
+            let response = router
+                .route_transparent(Some(&headers), "/v1/completions", &Method::POST, body, None)
+                .await;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        // Token-in requests without a session id.
+        let mut tokens = vec![1, 2, 3];
+        for _ in 0..3 {
+            let body = json!({"model": "m", "token_ids": tokens.clone()});
+            let response = router
+                .route_transparent(None, "/inference/v1/generate", &Method::POST, body, None)
+                .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            tokens.extend([4, 5, 6, 7]);
+        }
+        for p in mock.prefill_params() {
+            assert_cold(&p);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_bidirectional_kv_off_never_forwards_decode_handles() {
+        let mock = BidirMock::start().await;
+        let router = mock.router(false, 0).await;
+        let mut s1 = TokenSession::new("s1");
+        for _ in 0..3 {
+            assert_eq!(s1.turn(&router).await, StatusCode::OK);
+        }
+        for p in mock.prefill_params() {
+            assert_cold(&p);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_bidirectional_kv_failed_turn_consumes_handle() {
+        // Without router retries, a failed turn is retried by the client. The
+        // handle was taken when the failed turn started, so the client's retry
+        // must not read the same (possibly already freed) blocks again.
+        let mock = BidirMock::start().await;
+        let router = mock.router(true, 0).await;
+        let mut s1 = TokenSession::new("s1");
+        assert_eq!(s1.turn(&router).await, StatusCode::OK);
+        mock.fail_prefill(&[MockFailure::Status(500)]);
+        let (status, body) = s1.send(&router).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            body.contains("mock 500"),
+            "prefill's error is returned: {}",
+            body
+        );
+        assert_eq!(s1.turn(&router).await, StatusCode::OK);
+        let p = mock.prefill_params();
+        assert_eq!(p.len(), 3);
+        assert_reads(&p[1], "d-1");
+        assert_cold(&p[2]);
+        // the failed prefill never reached decode
+        assert_eq!(mock.decode_params().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_turn_retry_runs_fresh_prefill_without_handle() {
+        let mock = BidirMock::start().await;
+        let router = mock.router(true, 2).await;
+        let mut s1 = TokenSession::new("s1");
+        assert_eq!(s1.turn(&router).await, StatusCode::OK);
+        mock.fail_prefill(&[MockFailure::Status(503)]);
+        assert_eq!(s1.turn(&router).await, StatusCode::OK);
+        let p = mock.prefill_params();
+        assert_eq!(p.len(), 3);
+        assert_reads(&p[1], "d-1"); // first attempt read the handle, then failed
+        assert_cold(&p[2]); // the retry recomputes instead of reading it again
+                            // decode ran once per successful attempt, with the retry's own prefill params
+        assert_eq!(mock.decode_params().len(), 2);
+        // and its new handle serves the next turn
+        assert_eq!(s1.turn(&router).await, StatusCode::OK);
+        assert_reads(&mock.prefill_params()[3], "d-2");
+    }
+
+    #[tokio::test]
+    async fn test_turn_retries_are_bounded() {
+        let mock = BidirMock::start().await;
+        let router = mock.router(false, 1).await;
+        mock.fail_prefill(&[MockFailure::Status(503); 5]);
+        let (status, _) = TokenSession::new("s1").send(&router).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(mock.prefill_params().len(), 2);
+        assert!(mock.decode_params().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_prefill_client_error_is_returned_not_retried_or_decoded() {
+        for bidirectional in [false, true] {
+            let mock = BidirMock::start().await;
+            let router = mock.router(bidirectional, 2).await;
+            mock.fail_prefill(&[MockFailure::Status(400)]);
+            let (status, body) = TokenSession::new("s1").send(&router).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert!(body.contains("mock 400"), "{}", body);
+            assert_eq!(mock.prefill_params().len(), 1);
+            assert!(mock.decode_params().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_failed_prefill_stops_profiling() {
+        // Profiling must not keep running until its timeout and capture the retry delay
+        // and the next attempt.
+        for failure in [
+            MockFailure::Status(400),
+            MockFailure::Status(503),
+            MockFailure::NonJson,
+        ] {
+            let mock = BidirMock::start().await;
+            let router = mock.router_with(true, 0, true).await;
+            mock.fail_prefill(&[failure]);
+            let (status, _) = TokenSession::new("s1").send(&router).await;
+            assert!(!status.is_success());
+            assert_eq!(mock.profile_calls(), vec!["prefill:start", "prefill:stop"]);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_prefill_server_error_without_retries_skips_decode() {
+        // Before: decode ran without kv_transfer_params and redid the full prefill.
+        let mock = BidirMock::start().await;
+        let router = mock.router(false, 0).await;
+        mock.fail_prefill(&[MockFailure::Status(503)]);
+        let (status, body) = TokenSession::new("s1").send(&router).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(body.contains("mock 503"), "{}", body);
+        assert!(mock.decode_params().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_prefill_non_json_body_is_fatal() {
+        let mock = BidirMock::start().await;
+        let router = mock.router(true, 2).await;
+        mock.fail_prefill(&[MockFailure::NonJson]);
+        let (status, _) = TokenSession::new("s1").send(&router).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(mock.prefill_params().len(), 1);
+        assert!(mock.decode_params().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_decode_server_error_retries_whole_turn() {
+        let mock = BidirMock::start().await;
+        let router = mock.router(true, 1).await;
+        let mut s1 = TokenSession::new("s1");
+        assert_eq!(s1.turn(&router).await, StatusCode::OK); // d-1
+        mock.fail_decode(&[MockFailure::Status(502)]);
+        assert_eq!(s1.turn(&router).await, StatusCode::OK);
+        let p = mock.prefill_params();
+        assert_eq!(p.len(), 3);
+        assert_reads(&p[1], "d-1");
+        assert_cold(&p[2]); // fresh prefill, no handle
+        assert_eq!(mock.decode_params().len(), 3);
+
+        // without retries, decode's 5xx goes back to the client as-is
+        let router = mock.router(true, 0).await;
+        mock.fail_decode(&[MockFailure::Status(502)]);
+        let (status, body) = TokenSession::new("s2").send(&router).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert!(body.contains("mock 502"), "{}", body);
+    }
+
+    #[tokio::test]
+    async fn test_decode_client_error_is_returned_not_retried() {
+        let mock = BidirMock::start().await;
+        let router = mock.router(true, 2).await;
+        mock.fail_decode(&[MockFailure::Status(422)]);
+        let (status, body) = TokenSession::new("s1").send(&router).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(body.contains("mock 422"), "{}", body);
+        assert_eq!(mock.prefill_params().len(), 1);
+        assert_eq!(mock.decode_params().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_bidirectional_kv_finish_session_drops_handle() {
+        let mock = BidirMock::start().await;
+        let router = mock.router(true, 0).await;
+        let mut s1 = TokenSession::new("s1");
+        assert_eq!(s1.turn(&router).await, StatusCode::OK);
+        router.finish_session("s1");
+        assert_eq!(s1.turn(&router).await, StatusCode::OK);
+        assert_cold(&mock.prefill_params()[1]);
     }
 }

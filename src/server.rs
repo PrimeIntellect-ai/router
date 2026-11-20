@@ -1030,6 +1030,7 @@ async fn finish_session(
     }
 
     state.context.policy_registry.finish_session(&session_id);
+    state.router.finish_session(&session_id);
 
     Json(json!({ "status": "ok", "session_id": session_id })).into_response()
 }

@@ -53,6 +53,12 @@ class RouterArgs:
     vllm_discovery_address: Optional[str] = None
     # KV connector for PD disaggregation (nixl pull-based or mooncake push-based)
     kv_connector: str = "nixl"
+    # Bidirectional KV transfer between turns of a session (vLLM PD mode, NIXL)
+    pd_bidirectional_kv: bool = False
+    pd_bidirectional_ttl_secs: int = 450
+    pd_bidirectional_max_sessions: int = 1_000_000
+    # Whole-turn retries after a connection error (vLLM PD mode)
+    pd_turn_retries: int = 0
     # Prometheus configuration
     prometheus_port: Optional[int] = None
     prometheus_host: Optional[str] = None
@@ -330,6 +336,39 @@ class RouterArgs:
             "pull-based KV transfer; 'mooncake' uses Mooncake's push-based protocol "
             "(queries each prefill node's bootstrap server for engine_id per DP rank); "
             "'moriio' uses the MoRI-IO connector (either READ or WRITE modes).",
+        )
+        parser.add_argument(
+            f"--{prefix}pd-bidirectional-kv",
+            action="store_true",
+            default=RouterArgs.pd_bidirectional_kv,
+            help="vLLM PD mode with NIXL: on a session's next token-in turn "
+            "(/inference/v1/generate), give prefill the decode blocks the previous turn left "
+            "(kv_transfer_params returned by decode), so prefill reads the previous turn's KV "
+            "instead of recomputing it. A handle is used at most once, and only when the new "
+            "prompt starts with exactly the tokens it covers. Decode engines need "
+            "kv_connector_extra_config.bidirectional_kv_xfer=true. Sessions are identified like "
+            "/finish_session (x-session-id header first). Use a session-affine policy "
+            "(consistent_hash, rendezvous_hash, sticky_least_loaded).",
+        )
+        parser.add_argument(
+            f"--{prefix}pd-bidirectional-ttl-secs",
+            type=int,
+            default=RouterArgs.pd_bidirectional_ttl_secs,
+            help="Seconds a cached decode handle stays usable. Keep it below the decode "
+            "engines' decoder_kv_blocks_ttl (vLLM default 480).",
+        )
+        parser.add_argument(
+            f"--{prefix}pd-bidirectional-max-sessions",
+            type=int,
+            default=RouterArgs.pd_bidirectional_max_sessions,
+            help="Maximum number of sessions with a cached decode handle.",
+        )
+        parser.add_argument(
+            f"--{prefix}pd-turn-retries",
+            type=int,
+            default=RouterArgs.pd_turn_retries,
+            help="vLLM PD mode: retry a turn this many times after a connection error. A retry "
+            "runs a fresh prefill and never reuses KV handles of the failed attempt.",
         )
         # Prometheus configuration
         parser.add_argument(

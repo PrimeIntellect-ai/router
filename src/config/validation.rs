@@ -29,6 +29,7 @@ impl ConfigValidator {
         }
 
         Self::validate_compatibility(config)?;
+        Self::validate_pd_turn_options(config)?;
 
         // Validate effective retry/CB configs (respect disable flags)
         let retry_cfg = config.effective_retry_config();
@@ -471,6 +472,62 @@ impl ConfigValidator {
         Ok(())
     }
 
+    /// `--pd-turn-retries` and `--pd-bidirectional-kv` are implemented for vLLM PD
+    /// mode with direct `--prefill`/`--decode` URLs; reject them elsewhere instead
+    /// of silently ignoring them.
+    fn validate_pd_turn_options(config: &RouterConfig) -> ConfigResult<()> {
+        let direct_vllm_pd = matches!(
+            &config.mode,
+            RoutingMode::VllmPrefillDecode {
+                discovery_address: None,
+                ..
+            }
+        );
+        if config.pd_turn_retries > 0 && !direct_vllm_pd {
+            return Err(ConfigError::IncompatibleConfig {
+                reason: "--pd-turn-retries requires --vllm-pd-disaggregation with direct \
+                         --prefill/--decode URLs; it is not supported with \
+                         --vllm-discovery-address or outside vLLM PD mode"
+                    .to_string(),
+            });
+        }
+        let bidirectional = &config.pd_bidirectional_kv;
+        if bidirectional.enabled {
+            if !direct_vllm_pd {
+                return Err(ConfigError::IncompatibleConfig {
+                    reason: "--pd-bidirectional-kv requires --vllm-pd-disaggregation with \
+                             direct --prefill/--decode URLs; it is not supported with \
+                             --vllm-discovery-address or outside vLLM PD mode"
+                        .to_string(),
+                });
+            }
+            if config.kv_connector != KvConnector::Nixl {
+                return Err(ConfigError::IncompatibleConfig {
+                    reason: format!(
+                        "--pd-bidirectional-kv requires the NIXL KV connector (got {:?})",
+                        config.kv_connector
+                    ),
+                });
+            }
+            if bidirectional.ttl_secs == 0 {
+                return Err(ConfigError::InvalidValue {
+                    field: "pd_bidirectional_ttl_secs".to_string(),
+                    value: "0".to_string(),
+                    reason: "must be > 0 (and below the decode engines' decoder_kv_blocks_ttl)"
+                        .to_string(),
+                });
+            }
+            if bidirectional.max_sessions == 0 {
+                return Err(ConfigError::InvalidValue {
+                    field: "pd_bidirectional_max_sessions".to_string(),
+                    value: "0".to_string(),
+                    reason: "must be > 0".to_string(),
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Validate URL format
     fn validate_urls(urls: &[String]) -> ConfigResult<()> {
         for url in urls {
@@ -771,6 +828,71 @@ mod tests {
                 .to_string()
                 .contains("MoRI-IO KV connector requires service discovery"));
         }
+    }
+
+    fn vllm_pd_config(discovery_address: Option<&str>) -> RouterConfig {
+        RouterConfig::new(
+            RoutingMode::VllmPrefillDecode {
+                prefill_urls: if discovery_address.is_some() {
+                    vec![]
+                } else {
+                    vec![("http://prefill:8000".to_string(), None)]
+                },
+                decode_urls: if discovery_address.is_some() {
+                    vec![]
+                } else {
+                    vec!["http://decode:8000".to_string()]
+                },
+                prefill_policy: None,
+                decode_policy: None,
+                discovery_address: discovery_address.map(str::to_string),
+            },
+            PolicyConfig::Random,
+        )
+    }
+
+    #[test]
+    fn test_pd_turn_retries_require_direct_vllm_pd() {
+        let mut config = vllm_pd_config(None);
+        config.pd_turn_retries = 2;
+        assert!(ConfigValidator::validate(&config).is_ok());
+
+        let mut config = vllm_pd_config(Some("0.0.0.0:36367"));
+        config.pd_turn_retries = 2;
+        let err = ConfigValidator::validate(&config).unwrap_err().to_string();
+        assert!(err.contains("--pd-turn-retries"), "{}", err);
+
+        let mut config = RouterConfig::new(
+            RoutingMode::Regular {
+                worker_urls: vec!["http://worker:8000".to_string()],
+            },
+            PolicyConfig::Random,
+        );
+        config.pd_turn_retries = 1;
+        assert!(ConfigValidator::validate(&config).is_err());
+    }
+
+    #[test]
+    fn test_pd_bidirectional_kv_requires_direct_vllm_pd_with_nixl() {
+        let mut config = vllm_pd_config(None);
+        config.pd_bidirectional_kv.enabled = true;
+        assert!(ConfigValidator::validate(&config).is_ok());
+
+        let mut config = vllm_pd_config(Some("0.0.0.0:36367"));
+        config.pd_bidirectional_kv.enabled = true;
+        let err = ConfigValidator::validate(&config).unwrap_err().to_string();
+        assert!(err.contains("--pd-bidirectional-kv"), "{}", err);
+
+        let mut config = vllm_pd_config(None);
+        config.pd_bidirectional_kv.enabled = true;
+        config.kv_connector = KvConnector::Mooncake;
+        let err = ConfigValidator::validate(&config).unwrap_err().to_string();
+        assert!(err.contains("NIXL"), "{}", err);
+
+        let mut config = vllm_pd_config(None);
+        config.pd_bidirectional_kv.enabled = true;
+        config.pd_bidirectional_kv.ttl_secs = 0;
+        assert!(ConfigValidator::validate(&config).is_err());
     }
 
     #[test]

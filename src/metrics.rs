@@ -138,6 +138,26 @@ pub fn init_metrics() {
         "vllm_router_pd_request_duration_seconds",
         "PD request duration by route"
     );
+    describe_counter!(
+        "vllm_router_pd_bidirectional_turns_total",
+        "PD turns by previous-turn KV source: decode_blocks (handle given to prefill), none, expired"
+    );
+    describe_counter!(
+        "vllm_router_pd_bidirectional_handles_cached_total",
+        "Decode KV handles cached for a session's next turn"
+    );
+    describe_counter!(
+        "vllm_router_pd_bidirectional_handles_dropped_total",
+        "Decode KV handles dropped unused, by reason (retry, cache_full, finish_session, expired)"
+    );
+    describe_gauge!(
+        "vllm_router_pd_bidirectional_cached_sessions",
+        "Sessions with a cached decode KV handle"
+    );
+    describe_counter!(
+        "vllm_router_pd_turn_retries_total",
+        "PD turns retried after a connection error, by whether a decode KV handle was dropped"
+    );
 
     // Service discovery metrics
     describe_counter!(
@@ -484,6 +504,35 @@ impl RouterMetrics {
     pub fn record_pd_decode_error(worker: &str) {
         counter!("vllm_router_pd_decode_errors_total",
             "worker" => worker.to_string()
+        )
+        .increment(1);
+    }
+
+    pub fn record_pd_bidirectional_turn(source: &'static str) {
+        counter!("vllm_router_pd_bidirectional_turns_total",
+            "source" => source
+        )
+        .increment(1);
+    }
+
+    pub fn record_pd_bidirectional_handle_cached() {
+        counter!("vllm_router_pd_bidirectional_handles_cached_total").increment(1);
+    }
+
+    pub fn record_pd_bidirectional_handle_dropped(reason: &'static str, n: u64) {
+        counter!("vllm_router_pd_bidirectional_handles_dropped_total",
+            "reason" => reason
+        )
+        .increment(n);
+    }
+
+    pub fn set_pd_bidirectional_cached_sessions(n: usize) {
+        gauge!("vllm_router_pd_bidirectional_cached_sessions").set(n as f64);
+    }
+
+    pub fn record_pd_turn_retry(dropped_handle: bool) {
+        counter!("vllm_router_pd_turn_retries_total",
+            "dropped_handle" => if dropped_handle { "true" } else { "false" }
         )
         .increment(1);
     }

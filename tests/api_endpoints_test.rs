@@ -62,6 +62,8 @@ impl TestContext {
             enable_profiling: false,
             profile_timeout_secs: 30,
             kv_connector: vllm_router_rs::config::KvConnector::Nixl,
+            pd_bidirectional_kv: Default::default(),
+            pd_turn_retries: 0,
         };
 
         Self::new_with_config(config, worker_configs).await
@@ -1561,6 +1563,8 @@ mod error_tests {
             enable_profiling: false,
             profile_timeout_secs: 30,
             kv_connector: vllm_router_rs::config::KvConnector::Nixl,
+            pd_bidirectional_kv: Default::default(),
+            pd_turn_retries: 0,
         };
 
         let ctx = TestContext::new_with_config(
@@ -1924,6 +1928,8 @@ mod pd_mode_tests {
             enable_profiling: false,
             profile_timeout_secs: 30,
             kv_connector: vllm_router_rs::config::KvConnector::Nixl,
+            pd_bidirectional_kv: Default::default(),
+            pd_turn_retries: 0,
         };
 
         // Create app context
@@ -2090,6 +2096,8 @@ mod request_id_tests {
             enable_profiling: false,
             profile_timeout_secs: 30,
             kv_connector: vllm_router_rs::config::KvConnector::Nixl,
+            pd_bidirectional_kv: Default::default(),
+            pd_turn_retries: 0,
         };
 
         let ctx = TestContext::new_with_config(
