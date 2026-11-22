@@ -225,7 +225,7 @@ struct RequestWithTokenIds<'a> {
 
 impl serde::Serialize for RequestWithTokenIds<'_> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeMap;
+        use serde::ser::SerializeMap; // codespell:ignore ser
         match (self.request, self.token_ids) {
             // Same calls as `Value::Object` makes, entry by entry in map order.
             (Value::Object(object), Some(token_ids)) => {
@@ -4297,7 +4297,7 @@ mod tests {
                 axum::Router::new()
                     .route("/health", axum::routing::get(|| async { "ok" }))
                     .route("/inference/v1/generate", axum::routing::post(prefill))
-                    .layer(limit.clone()),
+                    .layer(limit),
                 axum::Router::new()
                     .route("/health", axum::routing::get(|| async { "ok" }))
                     .route("/inference/v1/generate", axum::routing::post(decode))
@@ -4600,7 +4600,7 @@ mod tests {
             body
         };
 
-        // Warm up connections, pools and lazy statics before the baseline.
+        // Warm up connections, pools, and lazily initialized state before the baseline.
         mock.release();
         for turn in 0..8 {
             let headers = session_headers(&format!("warmup-{}", turn));
