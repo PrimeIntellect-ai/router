@@ -1008,21 +1008,6 @@ impl VllmPDRouter {
 
         if !decode_response.status().is_success() {
             RouterMetrics::record_pd_decode_error(decode_http);
-            // Only the router has the transfer metadata for this internal POST.
-            // Handle the redirect here so the caller cannot replay a partial turn.
-            if !self.use_discovery
-                && path == TOKEN_IN_GENERATE_PATH
-                && matches!(
-                    decode_response.status(),
-                    StatusCode::TEMPORARY_REDIRECT | StatusCode::PERMANENT_REDIRECT
-                )
-            {
-                return Ok((
-                    StatusCode::BAD_GATEWAY,
-                    "Decode worker redirected the token request; configure its final URL",
-                )
-                    .into_response());
-            }
         }
 
         // Routed-experts merging requires buffering both responses; refuse
@@ -2001,14 +1986,6 @@ impl VllmPDRouter {
         decode_request_builder =
             dp_utils::add_dp_rank_header(decode_request_builder, decode_dp_rank);
 
-        // A token-in turn can rebuild its body for a whole-turn retry. Give HTTP
-        // a one-shot body with the same exact length so it can release the JSON
-        // after upload instead of retaining it for 307/308 replay during decode.
-        let decode_body = if path == TOKEN_IN_GENERATE_PATH {
-            reqwest::Body::wrap(reqwest::Body::from(decode_body))
-        } else {
-            reqwest::Body::from(decode_body)
-        };
         let decode_response = match otel_http::send_client_request(
             decode_request_builder.body(decode_body),
             headers,
@@ -2607,38 +2584,6 @@ impl RouterTrait for VllmPDRouter {
         .await
     }
 
-    async fn route_inference_generate_owned(
-        &self,
-        headers: Option<&HeaderMap>,
-        mut body: crate::protocols::spec::InferenceGenerateRequest,
-        model_id: Option<&str>,
-        run_id: Option<&str>,
-    ) -> Response {
-        if self.use_discovery || body.other.contains_key(TOKEN_IDS_FIELD) {
-            return self
-                .route_inference_generate(headers, &body, model_id, run_id)
-                .await;
-        }
-        // Preserve the field position for RequestWithTokenIds while serializing only metadata.
-        let ids = std::mem::take(&mut body.token_ids);
-        let request = match serde_json::to_value(body) {
-            Ok(request) => request,
-            Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Serialization error: {e}"),
-                )
-                    .into_response()
-            }
-        };
-        let turn = TurnRequest {
-            request,
-            token_ids: Some(Arc::new(TokenIds::I32(ids))),
-        };
-        self.route_direct_request(headers, TOKEN_IN_GENERATE_PATH, turn, run_id)
-            .await
-    }
-
     // Override OpenAI-compatible routes for vLLM two-stage processing
     async fn route_chat(
         &self,
@@ -3104,167 +3049,161 @@ impl RouterTrait for VllmPDRouter {
             method, path
         );
 
+        // Body is already a serde_json::Value, use it directly
+        let request_json = body;
+
         if self.use_discovery {
-            self.process_vllm_request(body, path, headers, run_id).await
-        } else {
-            self.route_direct_request(headers, path, TurnRequest::new(body), run_id)
+            // Discovery mode - use vLLM-specific two-stage processing
+            self.process_vllm_request(request_json, path, headers, run_id)
                 .await
-        }
-    }
-}
+        } else {
+            // Direct URL mode - use worker registry, filtered by availability
+            let all_prefill = self.pd_router.worker_registry.get_prefill_workers();
+            let prefill_workers: Vec<Arc<dyn Worker>> = all_prefill
+                .iter()
+                .filter(|w| w.is_available())
+                .cloned()
+                .collect();
+            let all_decode = self.pd_router.worker_registry.get_decode_workers();
+            let decode_workers: Vec<Arc<dyn Worker>> = all_decode
+                .iter()
+                .filter(|w| w.is_available())
+                .cloned()
+                .collect();
 
-impl VllmPDRouter {
-    async fn route_direct_request(
-        &self,
-        headers: Option<&HeaderMap>,
-        path: &str,
-        turn_request: TurnRequest,
-        run_id: Option<&str>,
-    ) -> Response {
-        // Direct URL mode - use worker registry, filtered by availability
-        let all_prefill = self.pd_router.worker_registry.get_prefill_workers();
-        let prefill_workers: Vec<Arc<dyn Worker>> = all_prefill
-            .iter()
-            .filter(|w| w.is_available())
-            .cloned()
-            .collect();
-        let all_decode = self.pd_router.worker_registry.get_decode_workers();
-        let decode_workers: Vec<Arc<dyn Worker>> = all_decode
-            .iter()
-            .filter(|w| w.is_available())
-            .cloned()
-            .collect();
-
-        if prefill_workers.is_empty() || decode_workers.is_empty() {
-            RouterMetrics::record_pd_error("server_selection");
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                format!(
-                    "No available workers: {} prefill, {} decode",
-                    prefill_workers.len(),
-                    decode_workers.len()
-                ),
-            )
-                .into_response();
-        }
-
-        // Select workers using policy with headers for consistent hash
-        let request_headers: Option<HashMap<String, String>> = headers.map(|h| {
-            h.iter()
-                .filter_map(|(name, value)| {
-                    value
-                        .to_str()
-                        .ok()
-                        .map(|v| (name.as_str().to_lowercase(), v.to_string()))
-                })
-                .collect()
-        });
-
-        let prefill_policy = self.policy_registry.get_prefill_policy();
-        let decode_policy = self.policy_registry.get_decode_policy();
-
-        // The serialized request is only an input to worker selection and the
-        // session lookup. When a session header settles both (the header is
-        // looked up before the body) and neither policy reads the text
-        // itself, it is not built at all; otherwise it lives in this block
-        // only, not for the whole turn.
-        let (prefill_idx, decode_idx, bidirectional) = {
-            let text_unused = request_headers
-                .as_ref()
-                .is_some_and(crate::policies::has_session_header)
-                && !Self::policy_reads_request_text(prefill_policy.as_ref())
-                && !Self::policy_reads_request_text(decode_policy.as_ref());
-            let request_text = if text_unused {
-                None
-            } else {
-                serde_json::to_string(&turn_request.with_token_ids(&turn_request.request)).ok()
-            };
-            let request_str = request_text.as_deref();
-
-            let prefill_idx = prefill_policy.select_worker_with_headers(
-                &prefill_workers,
-                request_str,
-                request_headers.as_ref(),
-            );
-            let decode_idx = match prefill_idx {
-                Some(_) => decode_policy.select_worker_with_headers(
-                    &decode_workers,
-                    request_str,
-                    request_headers.as_ref(),
-                ),
-                None => None,
-            };
-            let bidirectional = match (prefill_idx, decode_idx) {
-                (Some(_), Some(_)) => self.bidirectional_turn(
-                    path,
-                    &turn_request,
-                    request_str,
-                    request_headers.as_ref(),
-                ),
-                _ => None,
-            };
-            (prefill_idx, decode_idx, bidirectional)
-        };
-
-        let prefill_idx = match prefill_idx {
-            Some(idx) => idx,
-            None => {
+            if prefill_workers.is_empty() || decode_workers.is_empty() {
                 RouterMetrics::record_pd_error("server_selection");
                 return (
                     StatusCode::SERVICE_UNAVAILABLE,
-                    "Prefill policy failed to select a worker".to_string(),
+                    format!(
+                        "No available workers: {} prefill, {} decode",
+                        prefill_workers.len(),
+                        decode_workers.len()
+                    ),
                 )
                     .into_response();
             }
-        };
 
-        let decode_idx = match decode_idx {
-            Some(idx) => idx,
-            None => {
-                RouterMetrics::record_pd_error("server_selection");
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "Decode policy failed to select a worker".to_string(),
-                )
-                    .into_response();
-            }
-        };
+            // Select workers using policy with headers for consistent hash
+            let request_headers: Option<HashMap<String, String>> = headers.map(|h| {
+                h.iter()
+                    .filter_map(|(name, value)| {
+                        value
+                            .to_str()
+                            .ok()
+                            .map(|v| (name.as_str().to_lowercase(), v.to_string()))
+                    })
+                    .collect()
+            });
 
-        let prefill_worker = &prefill_workers[prefill_idx];
-        let decode_worker = &decode_workers[decode_idx];
+            let prefill_policy = self.policy_registry.get_prefill_policy();
+            let decode_policy = self.policy_registry.get_decode_policy();
 
-        debug!(
-            "Transparent proxy: prefill={}, decode={}",
-            prefill_worker.url(),
-            decode_worker.url()
-        );
+            // The serialized request is only an input to worker selection and the
+            // session lookup. When a session header settles both (the header is
+            // looked up before the body) and neither policy reads the text
+            // itself, it is not built at all; otherwise it lives in this block
+            // only, not for the whole turn.
+            let (prefill_idx, decode_idx, turn_request, bidirectional) = {
+                let text_unused = request_headers
+                    .as_ref()
+                    .is_some_and(crate::policies::has_session_header)
+                    && !Self::policy_reads_request_text(prefill_policy.as_ref())
+                    && !Self::policy_reads_request_text(decode_policy.as_ref());
+                let request_text = if text_unused {
+                    None
+                } else {
+                    serde_json::to_string(&request_json).ok()
+                };
+                let request_str = request_text.as_deref();
 
-        // Execute two-stage processing
-        match self
-            .run_direct_turn(
-                turn_request,
-                prefill_worker.clone(),
-                decode_worker.clone(),
-                path,
-                headers,
-                run_id,
-                bidirectional,
-            )
-            .await
-        {
-            Ok(response) => response,
-            Err(e) => {
-                error!(
-                    "Transparent proxy request failed: prefill={}, decode={}, error={}",
-                    prefill_worker.url(),
-                    decode_worker.url(),
-                    e
+                let prefill_idx = prefill_policy.select_worker_with_headers(
+                    &prefill_workers,
+                    request_str,
+                    request_headers.as_ref(),
                 );
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Transparent proxy request failed: {}", e),
+                let decode_idx = match prefill_idx {
+                    Some(_) => decode_policy.select_worker_with_headers(
+                        &decode_workers,
+                        request_str,
+                        request_headers.as_ref(),
+                    ),
+                    None => None,
+                };
+                // From here on the request is held without its token ids.
+                let turn_request = TurnRequest::new(request_json);
+                let bidirectional = match (prefill_idx, decode_idx) {
+                    (Some(_), Some(_)) => self.bidirectional_turn(
+                        path,
+                        &turn_request,
+                        request_str,
+                        request_headers.as_ref(),
+                    ),
+                    _ => None,
+                };
+                (prefill_idx, decode_idx, turn_request, bidirectional)
+            };
+
+            let prefill_idx = match prefill_idx {
+                Some(idx) => idx,
+                None => {
+                    RouterMetrics::record_pd_error("server_selection");
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "Prefill policy failed to select a worker".to_string(),
+                    )
+                        .into_response();
+                }
+            };
+
+            let decode_idx = match decode_idx {
+                Some(idx) => idx,
+                None => {
+                    RouterMetrics::record_pd_error("server_selection");
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "Decode policy failed to select a worker".to_string(),
+                    )
+                        .into_response();
+                }
+            };
+
+            let prefill_worker = &prefill_workers[prefill_idx];
+            let decode_worker = &decode_workers[decode_idx];
+
+            debug!(
+                "Transparent proxy: prefill={}, decode={}",
+                prefill_worker.url(),
+                decode_worker.url()
+            );
+
+            // Execute two-stage processing
+            match self
+                .run_direct_turn(
+                    turn_request,
+                    prefill_worker.clone(),
+                    decode_worker.clone(),
+                    path,
+                    headers,
+                    run_id,
+                    bidirectional,
                 )
-                    .into_response()
+                .await
+            {
+                Ok(response) => response,
+                Err(e) => {
+                    error!(
+                        "Transparent proxy request failed: prefill={}, decode={}, error={}",
+                        prefill_worker.url(),
+                        decode_worker.url(),
+                        e
+                    );
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Transparent proxy request failed: {}", e),
+                    )
+                        .into_response()
+                }
             }
         }
     }
@@ -3641,7 +3580,6 @@ mod tests {
     /// Injected upstream failure for the mock servers.
     #[derive(Clone, Copy)]
     enum MockFailure {
-        Redirect(StatusCode),
         Status(u16),
         NonJson,
     }
@@ -3650,9 +3588,6 @@ mod tests {
 
     fn mock_failure_response(failure: MockFailure) -> Response {
         match failure {
-            MockFailure::Redirect(status) => {
-                (status, [(http::header::LOCATION, TOKEN_IN_GENERATE_PATH)]).into_response()
-            }
             MockFailure::Status(code) => (
                 StatusCode::from_u16(code).unwrap(),
                 axum::Json(json!({"error": {"message": format!("mock {}", code)}})),
@@ -4102,25 +4037,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn token_decode_does_not_replay_or_forward_worker_redirects() {
-        let mock = BidirMock::start().await;
-        let router = mock.router(true, 2).await;
-        for status in [
-            StatusCode::TEMPORARY_REDIRECT,
-            StatusCode::PERMANENT_REDIRECT,
-        ] {
-            mock.fail_decode(&[MockFailure::Redirect(status)]);
-            let response = router
-                .route_inference_generate_owned(None, wire_request(&[42]), None, None)
-                .await;
-            assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
-            assert!(!response.headers().contains_key(http::header::LOCATION));
-        }
-        assert_eq!(mock.prefill_params().len(), 2);
-        assert_eq!(mock.decode_params().len(), 2);
-    }
-
-    #[tokio::test]
     async fn test_turn_retry_runs_fresh_prefill_without_handle() {
         let mock = BidirMock::start().await;
         let router = mock.router(true, 2).await;
@@ -4531,7 +4447,7 @@ mod tests {
         // Turn 1 through the typed route (as the HTTP handler calls it).
         let turn1 = wire_request(&[5, 0, 151643, 77, 2147483647, 9]);
         let response = router
-            .route_inference_generate_owned(Some(&headers), turn1.clone(), None, None)
+            .route_inference_generate(Some(&headers), &turn1, None, None)
             .await;
         assert_eq!(response.status(), StatusCode::OK);
         // Turn 2 extends turn 1 with its completion (decode call 1) and new tokens,
@@ -4592,7 +4508,7 @@ mod tests {
         let headers = session_headers("s1");
         let turn1 = wire_request(&[11, 12, 13]);
         let response = router
-            .route_inference_generate_owned(Some(&headers), turn1.clone(), None, None)
+            .route_inference_generate(Some(&headers), &turn1, None, None)
             .await;
         assert_eq!(response.status(), StatusCode::OK);
 
@@ -4602,7 +4518,7 @@ mod tests {
         mock.decode_breaks.store(1, Ordering::SeqCst);
         let turn2 = wire_request(&[11, 12, 13, 1001, 2001, 14]);
         let response = router
-            .route_inference_generate_owned(Some(&headers), turn2.clone(), None, None)
+            .route_inference_generate(Some(&headers), &turn2, None, None)
             .await;
         assert_eq!(response.status(), StatusCode::OK);
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -4633,7 +4549,7 @@ mod tests {
         // The handle of the successful attempt serves the next turn.
         let turn3 = wire_request(&[11, 12, 13, 1001, 2001, 14, 1002, 2002, 15]);
         let response = router
-            .route_inference_generate_owned(Some(&headers), turn3.clone(), None, None)
+            .route_inference_generate(Some(&headers), &turn3, None, None)
             .await;
         assert_eq!(response.status(), StatusCode::OK);
         assert_same_bytes(
@@ -4689,7 +4605,7 @@ mod tests {
         for turn in 0..8 {
             let headers = session_headers(&format!("warmup-{}", turn));
             let response = router
-                .route_inference_generate_owned(Some(&headers), request(turn), None, None)
+                .route_inference_generate(Some(&headers), &request(turn), None, None)
                 .await;
             assert_eq!(response.status(), StatusCode::OK);
         }
@@ -4704,8 +4620,9 @@ mod tests {
             let body = request(turn);
             tasks.push(tokio::spawn(async move {
                 let headers = session_headers(&format!("session-{}", turn));
+                // The HTTP handler owns the typed body for the whole turn.
                 router
-                    .route_inference_generate_owned(Some(&headers), body, None, None)
+                    .route_inference_generate(Some(&headers), &body, None, None)
                     .await
                     .status()
             }));
