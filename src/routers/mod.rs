@@ -81,18 +81,6 @@ pub trait RouterTrait: Send + Sync + Debug + WorkerManagement {
         run_id: Option<&str>,
     ) -> Response;
 
-    /// Consume a token-in request so P/D can reuse its prompt allocation.
-    async fn route_inference_generate_owned(
-        &self,
-        headers: Option<&HeaderMap>,
-        body: InferenceGenerateRequest,
-        model_id: Option<&str>,
-        run_id: Option<&str>,
-    ) -> Response {
-        self.route_inference_generate(headers, &body, model_id, run_id)
-            .await
-    }
-
     /// Route a chat completion request
     async fn route_chat(
         &self,

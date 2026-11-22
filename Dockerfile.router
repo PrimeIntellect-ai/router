@@ -6,7 +6,6 @@ RUN rustup toolchain install nightly && rustup default nightly
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
-COPY vendor/hyper ./vendor/hyper
 
 RUN cargo build --release --bin vllm-router
 
@@ -19,8 +18,6 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /build/target/release/vllm-router /usr/local/bin/vllm-router
-
-COPY --from=builder /build/vendor/hyper/LICENSE /usr/share/doc/vllm-router/hyper-LICENSE
 
 ENTRYPOINT ["vllm-router"]
 CMD ["--host", "0.0.0.0", "--port", "8080"]

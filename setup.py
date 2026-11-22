@@ -18,6 +18,5 @@ if not no_rust:
 
 setup(
     rust_extensions=rust_extensions,
-    data_files=[("share/licenses/vllm-router/hyper", ["vendor/hyper/LICENSE"])],
     zip_safe=False,
 )
