@@ -125,3 +125,7 @@ codegen-units = 1
 [profile.dev-opt]
 inherits = "dev"
 opt-level = 1
+
+[patch.crates-io]
+# Hyper 1.8.1 with the HTTP/1 server idle read-buffer fix.
+hyper = { path = "vendor/hyper" }
